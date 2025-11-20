@@ -6,8 +6,7 @@
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 
 // Gemini API Configuration
-#define GEMINI_API_KEY "AIzaSyDV0Qa53W3S9-jC7xsi0jtgm7DsVRF64Kk"
-#define GEMINI_WS_HOST "generativelanguage.googleapis.com"
+#define GEMINI_API_KEY "YOUR_GEMINI_API_KEY_HERE"  // Add your API key from Google Cloud Console#define GEMINI_WS_HOST "generativelanguage.googleapis.com"
 #define GEMINI_WS_PORT 443
 #define GEMINI_MODEL "models/gemini-2.5-pro-exp-11-05"
 

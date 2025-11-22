@@ -1,0 +1,273 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "PlatformIO Upload",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"run",
+				"--target",
+				"upload",
+				"--environment",
+				"esp32-s3-devkitc-1"
+			],
+			"problemMatcher": [
+				"$platformio"
+			]
+		},
+		{
+			"label": "PlatformIO Upload",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"run",
+				"--target",
+				"upload",
+				"--environment",
+				"esp32-s3-devkitc-1"
+			],
+			"problemMatcher": [
+				"$platformio"
+			]
+		},
+		{
+			"label": "PlatformIO Upload",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"run",
+				"--target",
+				"upload",
+				"--environment",
+				"esp32-s3-devkitc-1"
+			],
+			"problemMatcher": [
+				"$platformio"
+			]
+		},
+		{
+			"label": "PlatformIO Upload",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"run",
+				"--target",
+				"upload",
+				"--environment",
+				"esp32-s3-devkitc-1"
+			],
+			"problemMatcher": [
+				"$platformio"
+			]
+		},
+		{
+			"label": "PlatformIO Clean",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"run",
+				"--target",
+				"clean"
+			],
+			"problemMatcher": [
+				"$platformio"
+			]
+		},
+		{
+			"label": "PlatformIO Upload",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"run",
+				"--target",
+				"upload",
+				"--environment",
+				"esp32-s3-devkitc-1"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$platformio"
+			]
+		},
+		{
+			"label": "PlatformIO Upload",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"run",
+				"--target",
+				"upload",
+				"--environment",
+				"esp32-s3-devkitc-1"
+			],
+			"problemMatcher": [
+				"$platformio"
+			]
+		},
+		{
+			"label": "PlatformIO Upload",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"run",
+				"--target",
+				"upload",
+				"--environment",
+				"esp32-s3-devkitc-1"
+			],
+			"problemMatcher": [
+				"$platformio"
+			]
+		},
+		{
+			"label": "PlatformIO Upload",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"run",
+				"--target",
+				"upload",
+				"--environment",
+				"esp32-s3-devkitc-1"
+			],
+			"problemMatcher": [
+				"$platformio"
+			]
+		},
+		{
+			"label": "PlatformIO Upload",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"run",
+				"--target",
+				"upload",
+				"--environment",
+				"esp32-s3-devkitc-1"
+			],
+			"problemMatcher": [
+				"$platformio"
+			]
+		},
+		{
+			"label": "PlatformIO Upload",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"run",
+				"--target",
+				"upload",
+				"--environment",
+				"esp32-s3-devkitc-1"
+			],
+			"problemMatcher": [
+				"$platformio"
+			]
+		},
+		{
+			"label": "PlatformIO Upload",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"run",
+				"--target",
+				"upload",
+				"--environment",
+				"esp32-s3-devkitc-1"
+			],
+			"problemMatcher": [
+				"$platformio"
+			]
+		},
+		{
+			"label": "PlatformIO Upload",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"run",
+				"--target",
+				"upload",
+				"--environment",
+				"esp32-s3-devkitc-1"
+			],
+			"problemMatcher": [
+				"$platformio"
+			]
+		},
+		{
+			"label": "PlatformIO Upload",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"run",
+				"--target",
+				"upload",
+				"--environment",
+				"esp32-s3-devkitc-1"
+			],
+			"problemMatcher": [
+				"$platformio"
+			]
+		},
+		{
+			"label": "PlatformIO Upload",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"run",
+				"--target",
+				"upload",
+				"--environment",
+				"esp32-s3-devkitc-1"
+			],
+			"problemMatcher": [
+				"$platformio"
+			]
+		},
+		{
+			"label": "PlatformIO Upload",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"run",
+				"--target",
+				"upload",
+				"--environment",
+				"esp32-s3-devkitc-1"
+			],
+			"problemMatcher": [
+				"$platformio"
+			]
+		},
+		{
+			"label": "PlatformIO Upload",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"run",
+				"--target",
+				"upload",
+				"--environment",
+				"esp32-s3-devkitc-1"
+			],
+			"problemMatcher": [
+				"$platformio"
+			]
+		},
+		{
+			"label": "PlatformIO: Upload",
+			"type": "shell",
+			"command": "platformio.exe run --target upload --environment esp32-s3-devkitc-1",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "PlatformIO: Upload",
+			"type": "shell",
+			"command": "platformio.exe run --target upload --environment esp32-s3-devkitc-1",
+			"isBackground": false,
+			"group": "build"
+		}
+	]
+}

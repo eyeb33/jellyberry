@@ -24,8 +24,17 @@ bool isPlayingResponse = false;
 bool responseInterrupted = false;  // Flag to ignore audio after interrupt
 uint32_t recordingStartTime = 0;
 uint32_t lastVoiceActivityTime = 0;
+uint32_t lastAudioChunkTime = 0;  // Track when we last received audio
 bool firstAudioChunk = true;
-float volumeMultiplier = 1.0f;  // Volume control (0.0 to 2.0)
+float volumeMultiplier = 0.25f;  // Volume control (25% for testing)
+int32_t currentAudioLevel = 0;  // Current audio amplitude for VU meter
+float smoothedAudioLevel = 0.0f;  // Smoothed audio level for stable VU meter
+
+// Audio level delay buffer for LED sync (compensates for I2S buffer latency)
+#define AUDIO_DELAY_BUFFER_SIZE 6  // ~180ms delay to match I2S playback buffer
+int audioLevelBuffer[AUDIO_DELAY_BUFFER_SIZE] = {0};
+int audioBufferIndex = 0;
+
 TaskHandle_t websocketTaskHandle = NULL;
 TaskHandle_t ledTaskHandle = NULL;
 TaskHandle_t audioTaskHandle = NULL;
@@ -72,6 +81,7 @@ void setup() {
     Serial.write("LED_INIT_START\r\n", 16);
     FastLED.addLeds<LED_CHIPSET, LED_DATA_PIN, LED_COLOR_ORDER>(leds, NUM_LEDS);
     FastLED.setBrightness(LED_BRIGHTNESS);
+    FastLED.setDither(0);  // Disable dithering to prevent faint colors
     FastLED.clear();
     fill_solid(leds, NUM_LEDS, CHSV(160, 255, 100));
     FastLED.show();
@@ -240,6 +250,11 @@ void loop() {
             isPlayingResponse = false;
             responseInterrupted = true;  // Flag to ignore remaining audio chunks
             firstAudioChunk = true;  // Reset for next playback
+            
+            // Don't send turnComplete - just ignore remaining audio locally
+            // This keeps Gemini connection alive for the next question
+            
+            // Start new recording
             recordingActive = true;
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
@@ -278,11 +293,21 @@ void loop() {
         currentLEDMode = LED_PROCESSING;
         Serial.println("⏹️  Recording stopped - Silence detected");
     }
-
+    
+    // Auto-return to IDLE when playback finishes (no audio chunks for 2 seconds)
+    // Longer timeout to handle natural pauses in speech
+    if (isPlayingResponse && (millis() - lastAudioChunkTime) > 2000) {
+        isPlayingResponse = false;
+        // Clear LEDs before switching mode
+        fill_solid(leds, NUM_LEDS, CRGB::Black);
+        FastLED.show();
+        delay(50);  // Brief delay to ensure clean transition
+        currentLEDMode = LED_IDLE;
+        Serial.println("✓ Audio playback complete - switching to IDLE");
+    }
+    
     delay(10);
-}
-
-// ============== I2S INITIALIZATION ==============
+}// ============== I2S INITIALIZATION ==============
 bool initI2SMic() {
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
@@ -380,6 +405,9 @@ void audioTask(void * parameter) {
                     }
                     int32_t avgAmplitude = sum / OPUS_FRAME_SIZE;
                     
+                    // Update current audio level for LED VU meter
+                    currentAudioLevel = avgAmplitude;
+                    
                     // VAD check
                     bool hasVoice = detectVoiceActivity(inputBuffer, OPUS_FRAME_SIZE);
                     
@@ -404,41 +432,32 @@ void audioTask(void * parameter) {
             vTaskDelay(100 / portTICK_PERIOD_MS);
         }
         
-        // Playback audio from queue
-        AudioChunk chunk;
-        if (xQueueReceive(audioOutputQueue, &chunk, 10) == pdTRUE) {
-            if (!isPlayingResponse) {
-                isPlayingResponse = true;
-                currentLEDMode = LED_AUDIO_REACTIVE;
-                Serial.println("🔊 Playing response...");
-            }
-            
-            // Decode Opus
-            int16_t decodedBuffer[OPUS_FRAME_SIZE * 4];
-            int decodedSamples = opus_decode(decoder, chunk.data, chunk.length, decodedBuffer, OPUS_FRAME_SIZE * 4, 0);
-            
-            if (decodedSamples > 0) {
-                // Convert mono to stereo for speaker
-                int16_t stereoBuffer[OPUS_FRAME_SIZE * 8];
-                for (int i = 0; i < decodedSamples; i++) {
-                    stereoBuffer[i * 2] = decodedBuffer[i];
-                    stereoBuffer[i * 2 + 1] = decodedBuffer[i];
-                }
-                
-                size_t bytes_written;
-                i2s_write(I2S_NUM_1, stereoBuffer, decodedSamples * 4, &bytes_written, portMAX_DELAY);
-            } else {
-                Serial.printf("✗ Opus decode error: %d\n", decodedSamples);
-            }
-        } else if (isPlayingResponse) {
-            // No more audio in queue
-            isPlayingResponse = false;
-            currentLEDMode = LED_IDLE;
-            Serial.println("✓ Playback complete");
-        }
-        
         vTaskDelay(1 / portTICK_PERIOD_MS);
     }
+}
+
+// ============== AUDIO FEEDBACK ==============
+void playVolumeChime() {
+    // Play a brief 1kHz tone at the current volume level
+    const int sampleRate = 24000;
+    const int durationMs = 100;  // Short 100ms beep
+    const int numSamples = (sampleRate * durationMs) / 1000;
+    const float frequency = 1000.0f;  // 1kHz tone
+    
+    static int16_t toneBuffer[4800];  // 100ms at 24kHz stereo (2400 samples * 2 channels)
+    
+    for (int i = 0; i < numSamples; i++) {
+        // Generate sine wave
+        float t = (float)i / sampleRate;
+        int16_t sample = (int16_t)(sin(2.0f * PI * frequency * t) * 8000 * volumeMultiplier);
+        
+        // Stereo output
+        toneBuffer[i * 2] = sample;
+        toneBuffer[i * 2 + 1] = sample;
+    }
+    
+    size_t bytes_written;
+    i2s_write(I2S_NUM_1, toneBuffer, numSamples * 4, &bytes_written, portMAX_DELAY);
 }
 
 // ============== WEBSOCKET HANDLERS ==============
@@ -513,7 +532,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             {
                 // Ignore audio if response was interrupted
                 if (responseInterrupted) {
-                    // Silently discard remaining audio chunks
+                    Serial.println("🚫 Discarding audio chunk (response was interrupted)");
                     break;
                 }
                 
@@ -524,8 +543,19 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     recordingActive = false;  // Ensure recording is stopped
                     currentLEDMode = LED_AUDIO_REACTIVE;
                     firstAudioChunk = true;
+                    // Clear all LEDs immediately when starting playback
+                    fill_solid(leds, NUM_LEDS, CRGB::Black);
+                    FastLED.show();
+                    // Clear delay buffer for clean LED sync
+                    for (int i = 0; i < AUDIO_DELAY_BUFFER_SIZE; i++) {
+                        audioLevelBuffer[i] = 0;
+                    }
+                    audioBufferIndex = 0;
                     Serial.println("🔊 Starting audio playback...");
                 }
+                
+                // Update last audio chunk time
+                lastAudioChunkTime = millis();
                 
                 // Debug first chunk
                 if (firstAudioChunk) {
@@ -539,6 +569,26 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 
                 int16_t* samples = (int16_t*)payload;
                 int numSamples = length / 2;
+                
+                // Calculate amplitude for VU meter
+                int32_t sum = 0;
+                for (int i = 0; i < numSamples; i++) {
+                    sum += abs(samples[i]);
+                }
+                int instantLevel = sum / numSamples;
+                
+                // Add to delay buffer and get delayed value for LED sync
+                audioLevelBuffer[audioBufferIndex] = instantLevel;
+                audioBufferIndex = (audioBufferIndex + 1) % AUDIO_DELAY_BUFFER_SIZE;
+                currentAudioLevel = audioLevelBuffer[audioBufferIndex];  // Use delayed value for LEDs
+                
+                // Debug audio level periodically
+                static uint32_t lastLevelDebug = 0;
+                if (millis() - lastLevelDebug > 1000) {
+                    Serial.printf("[PLAYBACK] avgAmp=%d, smoothed=%.0f, mode=%d, volume=%.2f\n", 
+                                  currentAudioLevel, smoothedAudioLevel, currentLEDMode, volumeMultiplier);
+                    lastLevelDebug = millis();
+                }
                 
                 // Convert mono to stereo using static buffer (no malloc delay)
                 static int16_t stereoBuffer[1024];  // Max 512 samples = 1024 bytes input
@@ -601,10 +651,14 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
     // Handle turn complete
     if (doc["type"].is<const char*>() && doc["type"] == "turnComplete") {
         Serial.println("✓ Turn complete");
-        isPlayingResponse = false;
-        recordingActive = false;  // Ensure recording is stopped
-        responseInterrupted = false;  // Clear interrupt flag
-        currentLEDMode = LED_IDLE;
+        // Don't change LED mode here - let the audio finish playing naturally
+        // isPlayingResponse will be set to false when audio actually stops
+        
+        // Clear interrupt flag - old turn is done, ready for new response
+        if (responseInterrupted) {
+            Serial.println("✅ Old turn complete, cleared interrupt flag");
+            responseInterrupted = false;
+        }
         return;
     }
     
@@ -617,12 +671,23 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
             String direction = doc["args"]["direction"].as<String>();
             if (direction == "up") {
                 volumeMultiplier = min(2.0f, volumeMultiplier + 0.2f);
-                Serial.printf("🔊 Volume up: %.1f\n", volumeMultiplier);
+                Serial.printf("🔊 Volume up: %.0f%%\n", volumeMultiplier * 100);
             } else if (direction == "down") {
                 volumeMultiplier = max(0.1f, volumeMultiplier - 0.2f);
-                Serial.printf("🔉 Volume down: %.1f\n", volumeMultiplier);
+                Serial.printf("🔉 Volume down: %.0f%%\n", volumeMultiplier * 100);
             }
+            // Play a brief chime at the new volume
+            playVolumeChime();
+            
+        } else if (funcName == "set_volume_percent") {
+            int percent = doc["args"]["percent"].as<int>();
+            volumeMultiplier = constrain(percent / 100.0f, 0.1f, 2.0f);
+            Serial.printf("🔊 Volume set: %d%%\n", percent);
+            
+            // Play a brief chime at the new volume
+            playVolumeChime();
         }
+        
         return;
     }
     
@@ -644,6 +709,15 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
 void updateLEDs() {
     static uint8_t hue = 0;
     static uint8_t brightness = 100;
+    
+    // Smooth the audio level with exponential moving average
+    const float smoothing = 0.15f;  // Lower = more smoothing (was 0.3)
+    smoothedAudioLevel = smoothedAudioLevel * (1.0f - smoothing) + currentAudioLevel * smoothing;
+    
+    // Decay smoothed level slowly when no new audio to prevent flickering
+    if (currentAudioLevel == 0) {
+        smoothedAudioLevel *= 0.95f;  // Gentle decay
+    }
 
     switch(currentLEDMode) {
         case LED_BOOT:
@@ -652,18 +726,53 @@ void updateLEDs() {
             break;
             
         case LED_IDLE:
-            brightness = constrain(50 + (int)(30 * sin(millis() / 2000.0)), 0, 255);
-            fill_solid(leds, NUM_LEDS, CHSV(160, 200, brightness));
+            // Jellyfish-inspired pulse animation - wave travels up with fade trail
+            {
+                float t = (millis() % 3000) / 3000.0;  // 3 second cycle
+                // Create wave position (travels from LED 0 to LED 8)
+                float wavePos = t * (NUM_LEDS + 3);  // +3 for smooth exit
+                
+                for (int i = 0; i < NUM_LEDS; i++) {
+                    // Calculate distance from wave center
+                    float distance = wavePos - i;
+                    
+                    if (distance >= 0 && distance < 4) {
+                        // Active wave (bright blue with trail)
+                        float waveBrightness = (1.0 - (distance / 4.0)) * 255;
+                        leds[i] = CHSV(160, 200, (uint8_t)waveBrightness);
+                    } else {
+                        // Fade trail (dims gradually)
+                        uint8_t currentBrightness = leds[i].getLuma();
+                        if (currentBrightness > 30) {
+                            leds[i].fadeToBlackBy(25);  // Gentle fade
+                        } else {
+                            leds[i] = CHSV(160, 200, 30);  // Minimum ambient glow
+                        }
+                    }
+                }
+            }
             break;
             
         case LED_RECORDING:
-            // Red chase effect during recording
-            FastLED.clear();
+            // VU meter during recording - green to yellow to red
             {
-                int ledIndex = (millis() / 100) % NUM_LEDS;
-                leds[ledIndex] = CRGB::Red;
-                if (ledIndex > 0) leds[ledIndex - 1] = CRGB(50, 0, 0);
-                if (ledIndex < NUM_LEDS - 1) leds[ledIndex + 1] = CRGB(50, 0, 0);
+                // Map audio level to LED count (0-9 LEDs)
+                // Typical range: 0-5000 (after 16x gain), map to 0-9 LEDs
+                int numLEDs = map(constrain((int)smoothedAudioLevel, 0, 5000), 0, 5000, 0, NUM_LEDS);
+                for (int i = 0; i < NUM_LEDS; i++) {
+                    if (i < numLEDs) {
+                        // Universal VU meter gradient
+                        if (i < NUM_LEDS * 0.6) {
+                            leds[i] = CRGB::Green;  // 0-60% = green (safe)
+                        } else if (i < NUM_LEDS * 0.85) {
+                            leds[i] = CRGB::Yellow;  // 60-85% = yellow (approaching limit)
+                        } else {
+                            leds[i] = CRGB::Red;  // 85-100% = red (near max)
+                        }
+                    } else {
+                        leds[i] = CRGB::Black;  // Turn off unused LEDs
+                    }
+                }
             }
             break;
             
@@ -675,8 +784,28 @@ void updateLEDs() {
             break;
             
         case LED_AUDIO_REACTIVE:
-            brightness = constrain(100 + (int)(50 * sin(millis() / 100.0)), 0, 255);
-            fill_solid(leds, NUM_LEDS, CHSV(96, 200, brightness));
+            // VU meter during playback - same green to yellow to red
+            {
+                // Map audio level to LED count (0-9 LEDs)
+                // Playback audio range: 0-3000, map to 0-9 LEDs
+                int numLEDs = map(constrain((int)smoothedAudioLevel, 0, 3000), 0, 3000, 0, NUM_LEDS);
+                
+                // Set ALL LEDs explicitly - no partial updates
+                for (int i = 0; i < NUM_LEDS; i++) {
+                    if (i < numLEDs) {
+                        // Universal VU meter gradient (same as recording)
+                        if (i < NUM_LEDS * 0.6) {
+                            leds[i] = CRGB(0, 255, 0);  // Pure green
+                        } else if (i < NUM_LEDS * 0.85) {
+                            leds[i] = CRGB(255, 255, 0);  // Pure yellow
+                        } else {
+                            leds[i] = CRGB(255, 0, 0);  // Pure red
+                        }
+                    } else {
+                        leds[i] = CRGB(0, 0, 0);  // Pure black (completely off)
+                    }
+                }
+            }
             break;
             
         case LED_CONNECTED:
@@ -702,6 +831,6 @@ void ledTask(void * parameter) {
     while(1) {
         updateLEDs();
         FastLED.show();
-        vTaskDelay(50 / portTICK_PERIOD_MS);
+        vTaskDelay(30 / portTICK_PERIOD_MS);  // 33Hz update rate - matches audio chunk timing better
     }
 }

@@ -8,6 +8,8 @@ interface ClientConnection {
   socket: WebSocket;
   geminiSocket: WebSocket | null;
   deviceId: string;
+  lastFunctionResult?: any;
+  pendingFunctionCallId?: string;
 }
 
 const connections = new Map<string, ClientConnection>();
@@ -44,6 +46,17 @@ Deno.serve({ port: 8000 }, (req) => {
         // Setup message - establish Gemini connection
         if (data.type === "setup" || (!connection.geminiSocket && typeof event.data === "string")) {
           await connectToGemini(connection);
+          return;
+        }
+        
+        // Handle function response from ESP32 - forward to Gemini
+        if (data.type === "functionResponse") {
+          console.log(`[${deviceId}] Function response: ${data.name} =`, data.result);
+          if (connection.geminiSocket && connection.geminiSocket.readyState === WebSocket.OPEN) {
+            // Note: We'll handle this in the Gemini message handler instead
+            // Store it temporarily for the next function call roundtrip
+            connection.lastFunctionResult = data;
+          }
           return;
         }
         
@@ -113,23 +126,7 @@ async function connectToGemini(connection: ClientConnection) {
               }
             }
           },
-          tools: [{
-            functionDeclarations: [{
-              name: "set_volume",
-              description: "Adjust the speaker volume up or down",
-              parameters: {
-                type: "object",
-                properties: {
-                  direction: {
-                    type: "string",
-                    enum: ["up", "down"],
-                    description: "Direction to adjust volume"
-                  }
-                },
-                required: ["direction"]
-              }
-            }]
-          }]
+          tools: []
         }
       };
       

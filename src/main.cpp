@@ -52,8 +52,17 @@ struct AudioChunk {
     size_t length;
 };
 
-enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR };
+enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE };
 LEDMode currentLEDMode = LED_BOOT;
+
+// Tide visualization state
+struct TideState {
+    String state;  // "flooding" or "ebbing"
+    float waterLevel;  // 0.0 to 1.0
+    int nextChangeMinutes;
+    uint32_t displayStartTime;
+    bool active;
+} tideState = {"", 0.0, 0, 0, false};
 
 // ============== FORWARD DECLARATIONS ==============
 void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length);
@@ -168,6 +177,10 @@ void setup() {
 
     // Connect WiFi
     WiFi.mode(WIFI_STA);
+    delay(100);  // Small delay for stability
+    Serial.println();  // Clean line break
+    Serial.printf("Attempting WiFi connection to SSID: %s\n", WIFI_SSID);
+    Serial.printf("Password length: %d characters\n", strlen(WIFI_PASSWORD));
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     Serial.print("Connecting to WiFi");
     int attempts = 0;
@@ -266,6 +279,7 @@ void loop() {
         // Start recording on rising edge (when not already playing)
         else if (startTouch && !startPressed && !recordingActive && !isPlayingResponse) {
             responseInterrupted = false;  // Clear interrupt flag for new conversation
+            tideState.active = false;  // Clear tide display for new interaction
             recordingActive = true;
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
@@ -302,8 +316,17 @@ void loop() {
         fill_solid(leds, NUM_LEDS, CRGB::Black);
         FastLED.show();
         delay(50);  // Brief delay to ensure clean transition
-        currentLEDMode = LED_IDLE;
-        Serial.println("✓ Audio playback complete - switching to IDLE");
+        
+        // If we have tide data waiting, display it now
+        if (tideState.active) {
+            currentLEDMode = LED_TIDE;
+            tideState.displayStartTime = millis();
+            Serial.printf("✓ Audio playback complete - switching to TIDE display (state=%s, level=%.2f)\n", 
+                         tideState.state.c_str(), tideState.waterLevel);
+        } else {
+            currentLEDMode = LED_IDLE;
+            Serial.println("✓ Audio playback complete - switching to IDLE");
+        }
     }
     
     delay(10);
@@ -543,6 +566,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     recordingActive = false;  // Ensure recording is stopped
                     currentLEDMode = LED_AUDIO_REACTIVE;
                     firstAudioChunk = true;
+                    responseInterrupted = false;  // Clear interrupt flag for new response
                     // Clear all LEDs immediately when starting playback
                     fill_solid(leds, NUM_LEDS, CRGB::Black);
                     FastLED.show();
@@ -691,6 +715,22 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
         return;
     }
     
+    // Handle tide data from server
+    if (doc["type"].is<const char*>() && doc["type"] == "tideData") {
+        Serial.println("🌊 Received tide data - storing for display after speech");
+        tideState.state = doc["state"].as<String>();
+        tideState.waterLevel = doc["waterLevel"].as<float>();
+        tideState.nextChangeMinutes = doc["nextChangeMinutes"].as<int>();
+        tideState.active = true;
+        // Don't switch LED mode yet - let it display after audio finishes
+        
+        Serial.printf("🌊 Tide: %s, water level: %.1f%%, next change in %d minutes\n",
+                      tideState.state.c_str(), 
+                      tideState.waterLevel * 100,
+                      tideState.nextChangeMinutes);
+        return;
+    }
+    
     // Handle text responses
     if (doc["type"].is<const char*>() && doc["type"] == "text") {
         Serial.printf("📝 Text: %s\n", doc["text"].as<const char*>());
@@ -805,6 +845,44 @@ void updateLEDs() {
                         leds[i] = CRGB(0, 0, 0);  // Pure black (completely off)
                     }
                 }
+            }
+            break;
+            
+        case LED_TIDE:
+            // Tide visualization: water level represented by LED count
+            // Blue = flooding (incoming), Red = ebbing (outgoing)
+            // Stays active until next user interaction
+            {
+                // Debug: log mode switch
+                static uint32_t lastDebugLog = 0;
+                if (millis() - lastDebugLog > 5000) {
+                    Serial.printf("🌊 LED_TIDE active: state=%s, level=%.2f, mode=%d\n", 
+                                 tideState.state.c_str(), tideState.waterLevel, currentLEDMode);
+                    lastDebugLog = millis();
+                }
+                
+                // Calculate number of LEDs to light based on water level (0.0 to 1.0)
+                int numLEDs = max(1, (int)(tideState.waterLevel * NUM_LEDS));
+                
+                // Choose color based on tide state
+                CRGB tideColor = tideState.state == "flooding" ? CRGB(0, 100, 255) : CRGB(255, 50, 0);
+                
+                // Add gentle wave animation
+                float wave = sin((millis() / 1000.0) * 2.0) * 0.3 + 0.7; // 0.4 to 1.0
+                
+                for (int i = 0; i < NUM_LEDS; i++) {
+                    if (i < numLEDs) {
+                        // Apply wave brightness modulation
+                        uint8_t r = (uint8_t)(tideColor.r * wave);
+                        uint8_t g = (uint8_t)(tideColor.g * wave);
+                        uint8_t b = (uint8_t)(tideColor.b * wave);
+                        leds[i] = CRGB(r, g, b);
+                    } else {
+                        leds[i] = CRGB(0, 0, 0);
+                    }
+                }
+                
+                // No timeout - stays until next interaction
             }
             break;
             

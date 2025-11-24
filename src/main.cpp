@@ -7,6 +7,7 @@
 #include <driver/i2s.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <time.h>
 #include "Config.h"
 
 // Opus codec
@@ -53,7 +54,7 @@ struct AudioChunk {
     size_t length;
 };
 
-enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE };
+enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER };
 LEDMode currentLEDMode = LED_BOOT;
 
 // Tide visualization state
@@ -64,6 +65,13 @@ struct TideState {
     uint32_t displayStartTime;
     bool active;
 } tideState = {"", 0.0, 0, 0, false};
+
+// Timer visualization state
+struct TimerState {
+    int totalSeconds;
+    uint32_t startTime;
+    bool active;
+} timerState = {0, 0, false};
 
 // ============== FORWARD DECLARATIONS ==============
 void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length);
@@ -194,6 +202,10 @@ void setup() {
         Serial.println("\n✓ WiFi connected");
         Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
         Serial.printf("Signal: %d dBm\n", WiFi.RSSI());
+        
+        // Configure NTP time sync (GMT timezone)
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        Serial.println("⏰ NTP time sync configured");
     } else {
         Serial.println("\n✗ WiFi connection failed");
         currentLEDMode = LED_ERROR;
@@ -231,48 +243,21 @@ void setup() {
 // ============== MAIN LOOP ==============
 void loop() {
     static uint32_t lastPrint = 0;
-    static uint32_t lastTouchDebug = 0;
     
     if (millis() - lastPrint > 5000) {
         Serial.write("LOOP_TICK\r\n", 11);
         lastPrint = millis();
     }
     
-    // Debug touch pad states every 2 seconds
-    if (millis() - lastTouchDebug > 2000) {
-        int startRaw = digitalRead(TOUCH_PAD_START_PIN);
-        int stopRaw = digitalRead(TOUCH_PAD_STOP_PIN);
-        Serial.printf("Touch: START=%d, STOP=%d, Recording=%d, LEDMode=%d\n", 
-                      startRaw, stopRaw, recordingActive, currentLEDMode);
-        
-        // Add voltage reading for diagnostics
-        if (startRaw == LOW && stopRaw == LOW) {
-            Serial.println("⚠️  Both pads LOW - check connections or try touching");
-        }
-        lastTouchDebug = millis();
-    }
-    
     // Poll touch pads with debouncing
     static bool startPressed = false;
     static bool stopPressed = false;
     static uint32_t lastDebounceTime = 0;
-    const uint32_t debounceDelay = 10;  // Reduced to 10ms - TTP223 has hardware debounce
+    const uint32_t debounceDelay = 10;  // 10ms - TTP223 has hardware debounce
     
     if ((millis() - lastDebounceTime) > debounceDelay) {
         bool startTouch = digitalRead(TOUCH_PAD_START_PIN) == HIGH;
         bool stopTouch = digitalRead(TOUCH_PAD_STOP_PIN) == HIGH;
-        
-        // Debug: Log touch state changes
-        static bool lastStartTouch = false;
-        static bool lastStopTouch = false;
-        if (startTouch != lastStartTouch) {
-            Serial.printf("🔘 START pad: %d → %d\n", lastStartTouch, startTouch);
-            lastStartTouch = startTouch;
-        }
-        if (stopTouch != lastStopTouch) {
-            Serial.printf("🔘 STOP pad: %d → %d\n", lastStopTouch, stopTouch);
-            lastStopTouch = stopTouch;
-        }
         
         // Interrupt feature: START button during playback stops audio and starts recording
         // Only treat as interrupt if turn is NOT complete (still actively speaking)
@@ -337,8 +322,11 @@ void loop() {
         FastLED.show();
         delay(50);  // Brief delay to ensure clean transition
         
-        // If we have tide data waiting, display it now
-        if (tideState.active) {
+        // Priority: Timer > Tide > Idle
+        if (timerState.active) {
+            currentLEDMode = LED_TIMER;
+            Serial.println("✓ Audio playback complete - switching to TIMER display");
+        } else if (tideState.active) {
             currentLEDMode = LED_TIDE;
             tideState.displayStartTime = millis();
             Serial.printf("✓ Audio playback complete - switching to TIDE display (state=%s, level=%.2f)\n", 
@@ -754,6 +742,46 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
         return;
     }
     
+    // Handle timer set from server
+    if (doc["type"].is<const char*>() && doc["type"] == "timerSet") {
+        Serial.println("⏱️  Timer set - starting countdown");
+        timerState.totalSeconds = doc["durationSeconds"].as<int>();
+        timerState.startTime = millis();
+        timerState.active = true;
+        
+        Serial.printf("⏱️  Timer: %d seconds (%d minutes)\n",
+                      timerState.totalSeconds,
+                      timerState.totalSeconds / 60);
+        return;
+    }
+    
+    // Handle timer cancelled
+    if (doc["type"].is<const char*>() && doc["type"] == "timerCancelled") {
+        Serial.println("⏱️  Timer cancelled");
+        timerState.active = false;
+        if (currentLEDMode == LED_TIMER) {
+            currentLEDMode = LED_IDLE;
+        }
+        return;
+    }
+    
+    // Handle timer expired
+    if (doc["type"].is<const char*>() && doc["type"] == "timerExpired") {
+        Serial.println("⏰ Timer expired!");
+        timerState.active = false;
+        // Flash LEDs for completion
+        for (int i = 0; i < 3; i++) {
+            fill_solid(leds, NUM_LEDS, CRGB::Green);
+            FastLED.show();
+            delay(200);
+            fill_solid(leds, NUM_LEDS, CRGB::Black);
+            FastLED.show();
+            delay(200);
+        }
+        currentLEDMode = LED_IDLE;
+        return;
+    }
+    
     // Handle text responses
     if (doc["type"].is<const char*>() && doc["type"] == "text") {
         Serial.printf("📝 Text: %s\n", doc["text"].as<const char*>());
@@ -906,6 +934,62 @@ void updateLEDs() {
                 }
                 
                 // No timeout - stays until next interaction
+            }
+            break;
+            
+        case LED_TIMER:
+            // Timer countdown visualization
+            // Show progress as LEDs fade away
+            {
+                if (timerState.active) {
+                    uint32_t elapsed = (millis() - timerState.startTime) / 1000;
+                    int remaining = timerState.totalSeconds - elapsed;
+                    
+                    if (remaining <= 0) {
+                        // Timer finished - clear LEDs
+                        fill_solid(leds, NUM_LEDS, CRGB::Black);
+                    } else {
+                        // Calculate how many LEDs to show based on remaining time
+                        float progress = (float)remaining / (float)timerState.totalSeconds;
+                        float exactLEDs = progress * NUM_LEDS;
+                        int numLEDs = (int)exactLEDs;  // Full brightness LEDs
+                        float fractionalPart = exactLEDs - numLEDs;  // For fade-out LED
+                        
+                        // Color transitions: Green -> Yellow -> Orange -> Red as time runs out
+                        uint8_t hue;
+                        if (progress > 0.66) {
+                            hue = 96;  // Green
+                        } else if (progress > 0.33) {
+                            hue = 64;  // Yellow
+                        } else if (progress > 0.15) {
+                            hue = 32;  // Orange
+                        } else {
+                            hue = 0;   // Red (urgent)
+                        }
+                        
+                        // Pulse effect when timer is low
+                        uint8_t baseBrightness = 255;
+                        if (progress < 0.15) {
+                            baseBrightness = 128 + (uint8_t)(127 * sin(millis() / 200.0));
+                        }
+                        
+                        for (int i = 0; i < NUM_LEDS; i++) {
+                            if (i < numLEDs) {
+                                // Full brightness LEDs
+                                leds[i] = CHSV(hue, 255, baseBrightness);
+                            } else if (i == numLEDs && fractionalPart > 0) {
+                                // Fading LED - gradually dims as time runs out
+                                uint8_t fadeBrightness = (uint8_t)(baseBrightness * fractionalPart);
+                                leds[i] = CHSV(hue, 255, fadeBrightness);
+                            } else {
+                                leds[i] = CRGB::Black;
+                            }
+                        }
+                    }
+                } else {
+                    // Timer not active
+                    fill_solid(leds, NUM_LEDS, CRGB::Black);
+                }
             }
             break;
             

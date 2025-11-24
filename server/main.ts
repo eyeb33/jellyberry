@@ -17,6 +17,15 @@ const CACHE_DURATION_MS = 60 * 60 * 1000; // 1 hour - set to 0 for testing
 // Debug: Check if API key is loaded
 console.log(`[DEBUG] GEMINI_API_KEY loaded: ${GEMINI_API_KEY ? "YES (" + GEMINI_API_KEY.substring(0, 10) + "...)" : "NO - EMPTY!"}`);
 
+// Timer state for each device
+interface TimerState {
+  endTime: number;  // Unix timestamp when timer expires
+  durationSeconds: number;
+  intervalId?: number;
+}
+
+const deviceTimers = new Map<string, TimerState>();
+
 interface ClientConnection {
   socket: WebSocket;
   geminiSocket: WebSocket | null;
@@ -163,6 +172,165 @@ async function getTideStatus() {
   };
 }
 
+// Get current time and date in UK timezone
+function getCurrentTime() {
+  const now = new Date();
+  
+  // Format for UK timezone (GMT/BST auto-handled)
+  const timeOptions: Intl.DateTimeFormatOptions = {
+    timeZone: 'Europe/London',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  };
+  
+  const dateOptions: Intl.DateTimeFormatOptions = {
+    timeZone: 'Europe/London',
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric'
+  };
+  
+  const timeString = now.toLocaleTimeString('en-GB', timeOptions);
+  const dateString = now.toLocaleDateString('en-GB', dateOptions);
+  const dayOfWeek = now.toLocaleDateString('en-GB', { timeZone: 'Europe/London', weekday: 'long' });
+  
+  return {
+    success: true,
+    time: timeString,
+    date: dateString,
+    dayOfWeek: dayOfWeek,
+    timestamp: now.toISOString()
+  };
+}
+
+// Set a timer
+function setTimer(deviceId: string, durationMinutes: number) {
+  const durationSeconds = Math.round(durationMinutes * 60);
+  const endTime = Date.now() + (durationSeconds * 1000);
+  
+  // Clear any existing timer
+  const existing = deviceTimers.get(deviceId);
+  if (existing?.intervalId) {
+    clearInterval(existing.intervalId);
+  }
+  
+  // Set up new timer
+  const timerState: TimerState = {
+    endTime,
+    durationSeconds
+  };
+  
+  // Check timer completion every second
+  timerState.intervalId = setInterval(() => {
+    const remaining = Math.round((timerState.endTime - Date.now()) / 1000);
+    
+    if (remaining <= 0) {
+      // Timer expired
+      console.log(`[${deviceId}] ⏰ Timer expired!`);
+      clearInterval(timerState.intervalId);
+      deviceTimers.delete(deviceId);
+      
+      // Send notification to ESP32
+      const connection = connections.get(deviceId);
+      if (connection?.socket.readyState === WebSocket.OPEN) {
+        connection.socket.send(JSON.stringify({
+          type: "timerExpired",
+          message: "Your timer is complete"
+        }));
+        
+        // Send text message to Gemini to trigger spoken notification
+        if (connection.geminiSocket?.readyState === WebSocket.OPEN) {
+          const notification = {
+            clientContent: {
+              turns: [{
+                role: "user",
+                parts: [{
+                  text: "SYSTEM: Timer has expired. Please notify the user that their timer is complete."
+                }]
+              }],
+              turnComplete: true
+            }
+          };
+          console.log(`[${deviceId}] Sending timer expiry notification to Gemini`);
+          connection.geminiSocket.send(JSON.stringify(notification));
+        }
+      }
+    } else if (remaining % 60 === 0 && remaining > 0) {
+      // Send progress update every minute
+      const connection = connections.get(deviceId);
+      if (connection?.socket.readyState === WebSocket.OPEN) {
+        connection.socket.send(JSON.stringify({
+          type: "timerUpdate",
+          secondsRemaining: remaining
+        }));
+      }
+    }
+  }, 1000);
+  
+  deviceTimers.set(deviceId, timerState);
+  
+  console.log(`[${deviceId}] ⏱️  Timer set for ${durationMinutes} minutes (${durationSeconds}s)`);
+  
+  return {
+    success: true,
+    durationMinutes,
+    durationSeconds,
+    expiresAt: new Date(endTime).toLocaleTimeString('en-GB')
+  };
+}
+
+// Check timer status
+function checkTimer(deviceId: string) {
+  const timer = deviceTimers.get(deviceId);
+  
+  if (!timer) {
+    return {
+      success: false,
+      active: false,
+      message: "No timer is currently running"
+    };
+  }
+  
+  const remaining = Math.max(0, Math.round((timer.endTime - Date.now()) / 1000));
+  const minutes = Math.floor(remaining / 60);
+  const seconds = remaining % 60;
+  
+  return {
+    success: true,
+    active: true,
+    secondsRemaining: remaining,
+    minutesRemaining: minutes,
+    displayTime: `${minutes}:${seconds.toString().padStart(2, '0')}`
+  };
+}
+
+// Cancel timer
+function cancelTimer(deviceId: string) {
+  const timer = deviceTimers.get(deviceId);
+  
+  if (!timer) {
+    return {
+      success: false,
+      message: "No timer is currently running"
+    };
+  }
+  
+  if (timer.intervalId) {
+    clearInterval(timer.intervalId);
+  }
+  deviceTimers.delete(deviceId);
+  
+  console.log(`[${deviceId}] ⏱️  Timer cancelled`);
+  
+  return {
+    success: true,
+    message: "Timer cancelled"
+  };
+}
+
 // Handle ESP32 device WebSocket connections
 Deno.serve({ port: 8000 }, (req) => {
   const url = new URL(req.url);
@@ -276,9 +444,51 @@ async function connectToGemini(connection: ClientConnection) {
             }
           },
           tools: [{
-            functionDeclarations: [{
+            functionDeclarations: [
+            {
               name: "get_tide_status",
-              description: "Get the current tide status for Brighton, UK including whether the tide is coming in (flooding) or going out (ebbing), the water level, and when the next tide change will occur. Use this when the user asks about tides, tide times, or the sea.",
+              description: "Get the current tide status for Brighton, UK. ONLY use this when the user specifically asks about tides, the sea, or water levels. Do not call this for general time/date questions.",
+              parameters: {
+                type: "OBJECT",
+                properties: {},
+                required: []
+              }
+            },
+            {
+              name: "get_current_time",
+              description: "Get the current time, date, and day of the week in UK timezone. ONLY use this when the user specifically asks about time, date, or day. Do not call this when asking about tides.",
+              parameters: {
+                type: "OBJECT",
+                properties: {},
+                required: []
+              }
+            },
+            {
+              name: "set_timer",
+              description: "Set a countdown timer for a specified duration. Use when user says 'set a timer', 'timer for X minutes', etc.",
+              parameters: {
+                type: "OBJECT",
+                properties: {
+                  duration_minutes: {
+                    type: "NUMBER",
+                    description: "Duration in minutes (can be fractional, e.g., 1.5 for 90 seconds)"
+                  }
+                },
+                required: ["duration_minutes"]
+              }
+            },
+            {
+              name: "check_timer",
+              description: "Check how much time is remaining on the current timer. Use when user asks 'how much time left', 'check timer', etc.",
+              parameters: {
+                type: "OBJECT",
+                properties: {},
+                required: []
+              }
+            },
+            {
+              name: "cancel_timer",
+              description: "Cancel the current running timer. Use when user says 'cancel timer', 'stop timer', etc.",
               parameters: {
                 type: "OBJECT",
                 properties: {},
@@ -349,6 +559,31 @@ async function connectToGemini(connection: ClientConnection) {
                 }));
                 console.log(`[${connection.deviceId}] Sent tide data to ESP32: ${functionResult.state}, level: ${functionResult.waterLevel.toFixed(2)}`);
               }
+            } else if (funcName === "get_current_time") {
+              functionResult = getCurrentTime();
+              console.log(`[${connection.deviceId}] Current time: ${functionResult.time} on ${functionResult.date}`);
+            } else if (funcName === "set_timer") {
+              const durationMinutes = funcArgs.duration_minutes || 0;
+              functionResult = setTimer(connection.deviceId, durationMinutes);
+              
+              // Send timer data to ESP32
+              if (functionResult.success) {
+                connection.socket.send(JSON.stringify({
+                  type: "timerSet",
+                  durationSeconds: functionResult.durationSeconds
+                }));
+              }
+            } else if (funcName === "check_timer") {
+              functionResult = checkTimer(connection.deviceId);
+            } else if (funcName === "cancel_timer") {
+              functionResult = cancelTimer(connection.deviceId);
+              
+              // Notify ESP32
+              if (functionResult.success) {
+                connection.socket.send(JSON.stringify({
+                  type: "timerCancelled"
+                }));
+              }
             }
             
             // Send function response back to Gemini
@@ -391,6 +626,31 @@ async function connectToGemini(connection: ClientConnection) {
                     nextChangeMinutes: functionResult.nextChangeMinutes
                   }));
                   console.log(`[${connection.deviceId}] Sent tide data to ESP32: ${functionResult.state}, level: ${functionResult.waterLevel.toFixed(2)}`);
+                }
+              } else if (funcName === "get_current_time") {
+                functionResult = getCurrentTime();
+                console.log(`[${connection.deviceId}] Current time: ${functionResult.time} on ${functionResult.date}`);
+              } else if (funcName === "set_timer") {
+                const durationMinutes = funcArgs.duration_minutes || 0;
+                functionResult = setTimer(connection.deviceId, durationMinutes);
+                
+                // Send timer data to ESP32
+                if (functionResult.success) {
+                  connection.socket.send(JSON.stringify({
+                    type: "timerSet",
+                    durationSeconds: functionResult.durationSeconds
+                  }));
+                }
+              } else if (funcName === "check_timer") {
+                functionResult = checkTimer(connection.deviceId);
+              } else if (funcName === "cancel_timer") {
+                functionResult = cancelTimer(connection.deviceId);
+                
+                // Notify ESP32
+                if (functionResult.success) {
+                  connection.socket.send(JSON.stringify({
+                    type: "timerCancelled"
+                  }));
                 }
               }
               

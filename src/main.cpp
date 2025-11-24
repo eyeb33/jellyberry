@@ -21,6 +21,7 @@ CRGB leds[NUM_LEDS];
 bool isWebSocketConnected = false;
 bool recordingActive = false;
 bool isPlayingResponse = false;
+bool turnComplete = false;  // Track when Gemini has finished its turn
 bool responseInterrupted = false;  // Flag to ignore audio after interrupt
 uint32_t recordingStartTime = 0;
 uint32_t lastVoiceActivityTime = 0;
@@ -239,11 +240,15 @@ void loop() {
     
     // Debug touch pad states every 2 seconds
     if (millis() - lastTouchDebug > 2000) {
+        int startRaw = digitalRead(TOUCH_PAD_START_PIN);
+        int stopRaw = digitalRead(TOUCH_PAD_STOP_PIN);
         Serial.printf("Touch: START=%d, STOP=%d, Recording=%d, LEDMode=%d\n", 
-                      digitalRead(TOUCH_PAD_START_PIN), 
-                      digitalRead(TOUCH_PAD_STOP_PIN),
-                      recordingActive,
-                      currentLEDMode);
+                      startRaw, stopRaw, recordingActive, currentLEDMode);
+        
+        // Add voltage reading for diagnostics
+        if (startRaw == LOW && stopRaw == LOW) {
+            Serial.println("⚠️  Both pads LOW - check connections or try touching");
+        }
         lastTouchDebug = millis();
     }
     
@@ -251,14 +256,27 @@ void loop() {
     static bool startPressed = false;
     static bool stopPressed = false;
     static uint32_t lastDebounceTime = 0;
-    const uint32_t debounceDelay = 50;
+    const uint32_t debounceDelay = 10;  // Reduced to 10ms - TTP223 has hardware debounce
     
     if ((millis() - lastDebounceTime) > debounceDelay) {
         bool startTouch = digitalRead(TOUCH_PAD_START_PIN) == HIGH;
         bool stopTouch = digitalRead(TOUCH_PAD_STOP_PIN) == HIGH;
         
+        // Debug: Log touch state changes
+        static bool lastStartTouch = false;
+        static bool lastStopTouch = false;
+        if (startTouch != lastStartTouch) {
+            Serial.printf("🔘 START pad: %d → %d\n", lastStartTouch, startTouch);
+            lastStartTouch = startTouch;
+        }
+        if (stopTouch != lastStopTouch) {
+            Serial.printf("🔘 STOP pad: %d → %d\n", lastStopTouch, stopTouch);
+            lastStopTouch = stopTouch;
+        }
+        
         // Interrupt feature: START button during playback stops audio and starts recording
-        if (startTouch && !startPressed && isPlayingResponse) {
+        // Only treat as interrupt if turn is NOT complete (still actively speaking)
+        if (startTouch && !startPressed && isPlayingResponse && !turnComplete) {
             Serial.println("⏸️  Interrupted response - starting new recording");
             isPlayingResponse = false;
             responseInterrupted = true;  // Flag to ignore remaining audio chunks
@@ -276,10 +294,12 @@ void loop() {
             i2s_zero_dma_buffer(I2S_NUM_1);
             Serial.printf("🎤 Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
         }
-        // Start recording on rising edge (when not already playing)
-        else if (startTouch && !startPressed && !recordingActive && !isPlayingResponse) {
+        // Start recording on rising edge
+        // Allow if: not recording AND (not playing OR turn is complete)
+        else if (startTouch && !startPressed && !recordingActive && (!isPlayingResponse || turnComplete)) {
             responseInterrupted = false;  // Clear interrupt flag for new conversation
             tideState.active = false;  // Clear tide display for new interaction
+            isPlayingResponse = false;  // Force stop playback if turn is complete
             recordingActive = true;
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
@@ -563,10 +583,12 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 // Play immediately with minimal processing
                 if (!isPlayingResponse) {
                     isPlayingResponse = true;
+                    turnComplete = false;  // New turn starting
                     recordingActive = false;  // Ensure recording is stopped
                     currentLEDMode = LED_AUDIO_REACTIVE;
                     firstAudioChunk = true;
-                    responseInterrupted = false;  // Clear interrupt flag for new response
+                    // NOTE: Don't clear responseInterrupted here! Only clear it on turnComplete
+                    // to prevent buffered chunks from interrupted response playing through
                     // Clear all LEDs immediately when starting playback
                     fill_solid(leds, NUM_LEDS, CRGB::Black);
                     FastLED.show();
@@ -675,6 +697,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
     // Handle turn complete
     if (doc["type"].is<const char*>() && doc["type"] == "turnComplete") {
         Serial.println("✓ Turn complete");
+        turnComplete = true;  // Mark turn as finished
         // Don't change LED mode here - let the audio finish playing naturally
         // isPlayingResponse will be set to false when audio actually stops
         

@@ -461,7 +461,17 @@ async function connectToGemini(connection: ClientConnection) {
     connection.geminiSocket.onclose = (event) => {
       console.log(`[${connection.deviceId}] Gemini connection closed - code: ${event.code}, reason: "${event.reason}", wasClean: ${event.wasClean}`);
       connection.geminiSocket = null;
-      // Don't auto-reconnect immediately - wait for next user message
+      
+      // Auto-reconnect after 1 second if ESP32 is still connected
+      if (connections.has(connection.deviceId)) {
+        console.log(`[${connection.deviceId}] Scheduling Gemini reconnection in 1s...`);
+        setTimeout(() => {
+          if (connections.has(connection.deviceId) && !connection.geminiSocket) {
+            console.log(`[${connection.deviceId}] Auto-reconnecting to Gemini...`);
+            connectToGemini(connection);
+          }
+        }, 1000);
+      }
     };
     
     connection.geminiSocket.onerror = (error) => {

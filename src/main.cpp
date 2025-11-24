@@ -33,7 +33,7 @@ int32_t currentAudioLevel = 0;  // Current audio amplitude for VU meter
 float smoothedAudioLevel = 0.0f;  // Smoothed audio level for stable VU meter
 
 // Audio level delay buffer for LED sync (compensates for I2S buffer latency)
-#define AUDIO_DELAY_BUFFER_SIZE 6  // ~180ms delay to match I2S playback buffer
+#define AUDIO_DELAY_BUFFER_SIZE 10  // ~300ms delay to match I2S playback buffer + speaker latency
 int audioLevelBuffer[AUDIO_DELAY_BUFFER_SIZE] = {0};
 int audioBufferIndex = 0;
 
@@ -54,7 +54,7 @@ struct AudioChunk {
     size_t length;
 };
 
-enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER };
+enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON };
 LEDMode currentLEDMode = LED_BOOT;
 
 // Tide visualization state
@@ -72,6 +72,15 @@ struct TimerState {
     uint32_t startTime;
     bool active;
 } timerState = {0, 0, false};
+
+// Moon phase visualization state
+struct MoonState {
+    String phaseName;
+    int illumination;  // 0-100%
+    float moonAge;
+    uint32_t displayStartTime;
+    bool active;
+} moonState = {"", 0, 0.0, 0, false};
 
 // ============== FORWARD DECLARATIONS ==============
 void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length);
@@ -322,10 +331,14 @@ void loop() {
         FastLED.show();
         delay(50);  // Brief delay to ensure clean transition
         
-        // Priority: Timer > Tide > Idle
+        // Priority: Timer > Moon > Tide > Idle
         if (timerState.active) {
             currentLEDMode = LED_TIMER;
             Serial.println("✓ Audio playback complete - switching to TIMER display");
+        } else if (moonState.active) {
+            currentLEDMode = LED_MOON;
+            moonState.displayStartTime = millis();
+            Serial.println("✓ Audio playback complete - switching to MOON display");
         } else if (tideState.active) {
             currentLEDMode = LED_TIDE;
             tideState.displayStartTime = millis();
@@ -782,6 +795,19 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
         return;
     }
     
+    // Handle moon data
+    if (doc["type"].is<const char*>() && doc["type"] == "moonData") {
+        moonState.phaseName = doc["phaseName"].as<String>();
+        moonState.illumination = doc["illumination"].as<int>();
+        moonState.moonAge = doc["moonAge"].as<float>();
+        moonState.displayStartTime = millis();
+        moonState.active = true;
+        currentLEDMode = LED_MOON;
+        Serial.printf("🌙 Moon: %s (%d%% illuminated, %.1f days old)\n", 
+                      moonState.phaseName.c_str(), moonState.illumination, moonState.moonAge);
+        return;
+    }
+    
     // Handle text responses
     if (doc["type"].is<const char*>() && doc["type"] == "text") {
         Serial.printf("📝 Text: %s\n", doc["text"].as<const char*>());
@@ -805,9 +831,13 @@ void updateLEDs() {
     const float smoothing = 0.15f;  // Lower = more smoothing (was 0.3)
     smoothedAudioLevel = smoothedAudioLevel * (1.0f - smoothing) + currentAudioLevel * smoothing;
     
-    // Decay smoothed level slowly when no new audio to prevent flickering
+    // Faster decay when no audio to prevent LEDs lingering after speech ends
     if (currentAudioLevel == 0) {
-        smoothedAudioLevel *= 0.95f;  // Gentle decay
+        smoothedAudioLevel *= 0.85f;  // Faster decay (was 0.95)
+        // Force to zero when very low to prevent lingering
+        if (smoothedAudioLevel < 50) {
+            smoothedAudioLevel = 0;
+        }
     }
 
     switch(currentLEDMode) {
@@ -988,6 +1018,47 @@ void updateLEDs() {
                     }
                 } else {
                     // Timer not active
+                    fill_solid(leds, NUM_LEDS, CRGB::Black);
+                }
+            }
+            break;
+            
+        case LED_MOON:
+            // Moon phase visualization - brightness based on illumination
+            {
+                if (moonState.active) {
+                    // Soft blue-white color (low saturation for pale moon glow)
+                    uint8_t moonHue = 160;  // Blue-cyan
+                    uint8_t moonSat = 80;   // Low saturation for pale white-blue
+                    
+                    // Map illumination (0-100%) to brightness
+                    uint8_t brightness = map(moonState.illumination, 0, 100, 20, 255);
+                    
+                    // Gentle pulse effect (slower for moon)
+                    float pulse = 0.85 + 0.15 * sin(millis() / 1500.0);
+                    brightness = (uint8_t)(brightness * pulse);
+                    
+                    // Number of LEDs lit based on illumination phase
+                    int numLEDs = map(moonState.illumination, 0, 100, 1, NUM_LEDS);
+                    
+                    for (int i = 0; i < NUM_LEDS; i++) {
+                        if (i < numLEDs) {
+                            // Gradient fade from center
+                            float fadePosition = (float)i / numLEDs;
+                            uint8_t ledBrightness = (uint8_t)(brightness * (1.0 - fadePosition * 0.3));
+                            leds[i] = CHSV(moonHue, moonSat, ledBrightness);
+                        } else {
+                            leds[i] = CRGB::Black;
+                        }
+                    }
+                    
+                    // Auto-return to IDLE after 20 seconds
+                    if (millis() - moonState.displayStartTime > 20000) {
+                        moonState.active = false;
+                        currentLEDMode = LED_IDLE;
+                        Serial.println("🌙 Moon display timeout - returning to IDLE");
+                    }
+                } else {
                     fill_solid(leds, NUM_LEDS, CRGB::Black);
                 }
             }

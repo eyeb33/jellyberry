@@ -14,6 +14,11 @@ let tideDataCache: any = null;
 let tideDataTimestamp = 0;
 const CACHE_DURATION_MS = 60 * 60 * 1000; // 1 hour - set to 0 for testing
 
+// Weather data caching (30 minute cache)
+let weatherDataCache: any = null;
+let weatherDataTimestamp = 0;
+const WEATHER_CACHE_DURATION_MS = 30 * 60 * 1000; // 30 minutes
+
 // Debug: Check if API key is loaded
 console.log(`[DEBUG] GEMINI_API_KEY loaded: ${GEMINI_API_KEY ? "YES (" + GEMINI_API_KEY.substring(0, 10) + "...)" : "NO - EMPTY!"}`);
 
@@ -331,6 +336,294 @@ function cancelTimer(deviceId: string) {
   };
 }
 
+// Fetch weather data from Open-Meteo API
+async function fetchWeatherData() {
+  const now = Date.now();
+  
+  // Return cached data if still valid
+  if (weatherDataCache && (now - weatherDataTimestamp) < WEATHER_CACHE_DURATION_MS) {
+    console.log("🌤️  Using cached weather data");
+    return weatherDataCache;
+  }
+  
+  try {
+    // Using Brighton coordinates (same as tide data)
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${BRIGHTON_LAT}&longitude=${BRIGHTON_LNG}&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,rain,weather_code,wind_speed_10m&hourly=temperature_2m,precipitation_probability,weather_code&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,weather_code&timezone=Europe/London&forecast_days=3`;
+    
+    const response = await fetch(url);
+    
+    if (!response.ok) {
+      throw new Error(`Open-Meteo API returned ${response.status}`);
+    }
+    
+    const data = await response.json();
+    
+    // Cache the result
+    weatherDataCache = data;
+    weatherDataTimestamp = now;
+    
+    console.log("🌤️  Weather data fetched from Open-Meteo");
+    return data;
+    
+  } catch (error) {
+    console.error("❌ Error fetching weather data:", error);
+    
+    // Return cached data if available, even if expired
+    if (weatherDataCache) {
+      console.log("⚠️  Using expired weather cache due to fetch error");
+      return weatherDataCache;
+    }
+    
+    throw error;
+  }
+}
+
+// Weather code to description mapping (WMO codes)
+function getWeatherDescription(code: number): string {
+  const weatherCodes: Record<number, string> = {
+    0: "clear sky",
+    1: "mainly clear",
+    2: "partly cloudy",
+    3: "overcast",
+    45: "foggy",
+    48: "depositing rime fog",
+    51: "light drizzle",
+    53: "moderate drizzle",
+    55: "dense drizzle",
+    61: "slight rain",
+    63: "moderate rain",
+    65: "heavy rain",
+    71: "slight snow",
+    73: "moderate snow",
+    75: "heavy snow",
+    77: "snow grains",
+    80: "slight rain showers",
+    81: "moderate rain showers",
+    82: "violent rain showers",
+    85: "slight snow showers",
+    86: "heavy snow showers",
+    95: "thunderstorm",
+    96: "thunderstorm with slight hail",
+    99: "thunderstorm with heavy hail"
+  };
+  
+  return weatherCodes[code] || "unknown conditions";
+}
+
+// Get weather forecast
+function getWeather(deviceId: string, timeframe: string = "current") {
+  try {
+    const data = weatherDataCache;
+    
+    if (!data) {
+      return {
+        success: false,
+        error: "Weather data not available. Please try again in a moment."
+      };
+    }
+    
+    const current = data.current;
+    const hourly = data.hourly;
+    const daily = data.daily;
+    
+    // Build response based on timeframe
+    if (timeframe === "current") {
+      const temp = Math.round(current.temperature_2m);
+      const feelsLike = Math.round(current.apparent_temperature);
+      const condition = getWeatherDescription(current.weather_code);
+      const humidity = current.relative_humidity_2m;
+      const windSpeed = Math.round(current.wind_speed_10m);
+      const isRaining = current.precipitation > 0;
+      
+      return {
+        success: true,
+        timeframe: "current",
+        temperature: temp,
+        feelsLike: feelsLike,
+        condition: condition,
+        humidity: humidity,
+        windSpeed: windSpeed,
+        isRaining: isRaining,
+        summary: `It's currently ${temp}°C and ${condition}. Feels like ${feelsLike}°C. Wind ${windSpeed} km/h.${isRaining ? " It's raining right now." : ""}`
+      };
+    }
+    
+    if (timeframe === "hourly") {
+      // Next 12 hours forecast
+      const nextHours = [];
+      for (let i = 0; i < 12; i++) {
+        nextHours.push({
+          hour: hourly.time[i].split('T')[1].substring(0, 5),
+          temperature: Math.round(hourly.temperature_2m[i]),
+          precipitation: hourly.precipitation_probability[i],
+          condition: getWeatherDescription(hourly.weather_code[i])
+        });
+      }
+      
+      return {
+        success: true,
+        timeframe: "hourly",
+        forecast: nextHours,
+        summary: `Over the next 12 hours: temperatures from ${Math.round(hourly.temperature_2m[0])}°C to ${Math.round(hourly.temperature_2m[11])}°C. ${hourly.precipitation_probability[0] > 50 ? "Rain is likely." : "Rain is unlikely."}`
+      };
+    }
+    
+    if (timeframe === "today") {
+      const maxTemp = Math.round(daily.temperature_2m_max[0]);
+      const minTemp = Math.round(daily.temperature_2m_min[0]);
+      const condition = getWeatherDescription(daily.weather_code[0]);
+      const rainChance = daily.precipitation_probability_max[0];
+      
+      return {
+        success: true,
+        timeframe: "today",
+        maxTemp: maxTemp,
+        minTemp: minTemp,
+        condition: condition,
+        rainChance: rainChance,
+        summary: `Today: high of ${maxTemp}°C, low of ${minTemp}°C. ${condition}. ${rainChance}% chance of rain.`
+      };
+    }
+    
+    if (timeframe === "tomorrow") {
+      const maxTemp = Math.round(daily.temperature_2m_max[1]);
+      const minTemp = Math.round(daily.temperature_2m_min[1]);
+      const condition = getWeatherDescription(daily.weather_code[1]);
+      const rainChance = daily.precipitation_probability_max[1];
+      
+      return {
+        success: true,
+        timeframe: "tomorrow",
+        maxTemp: maxTemp,
+        minTemp: minTemp,
+        condition: condition,
+        rainChance: rainChance,
+        summary: `Tomorrow: high of ${maxTemp}°C, low of ${minTemp}°C. ${condition}. ${rainChance}% chance of rain.`
+      };
+    }
+    
+    if (timeframe === "week") {
+      const weekSummary = [];
+      for (let i = 0; i < 3; i++) {
+        const day = i === 0 ? "Today" : i === 1 ? "Tomorrow" : "Day after";
+        weekSummary.push({
+          day: day,
+          maxTemp: Math.round(daily.temperature_2m_max[i]),
+          minTemp: Math.round(daily.temperature_2m_min[i]),
+          condition: getWeatherDescription(daily.weather_code[i]),
+          rainChance: daily.precipitation_probability_max[i]
+        });
+      }
+      
+      return {
+        success: true,
+        timeframe: "week",
+        forecast: weekSummary,
+        summary: `3-day forecast: ${weekSummary.map(d => `${d.day} ${d.maxTemp}°C`).join(", ")}.`
+      };
+    }
+    
+    return {
+      success: false,
+      error: "Invalid timeframe requested"
+    };
+    
+  } catch (error) {
+    console.error("❌ Error getting weather:", error);
+    return {
+      success: false,
+      error: "Failed to retrieve weather data"
+    };
+  }
+}
+
+// Calculate moon phase using astronomical algorithm
+function getMoonPhase() {
+  try {
+    const now = new Date();
+    
+    // Known new moon reference: January 6, 2000, 18:14 UTC
+    const knownNewMoon = new Date(Date.UTC(2000, 0, 6, 18, 14, 0));
+    const lunarCycle = 29.530588853; // Average lunar cycle in days
+    
+    // Calculate days since known new moon
+    const daysSinceNewMoon = (now.getTime() - knownNewMoon.getTime()) / (1000 * 60 * 60 * 24);
+    
+    // Calculate current position in lunar cycle (0-1)
+    const cyclePosition = (daysSinceNewMoon % lunarCycle) / lunarCycle;
+    
+    // Calculate illumination (0-1, where 0.5 is full moon)
+    const illumination = (1 - Math.cos(cyclePosition * 2 * Math.PI)) / 2;
+    
+    // Calculate moon age (days since last new moon)
+    const moonAge = daysSinceNewMoon % lunarCycle;
+    
+    // Determine phase name based on cycle position
+    let phaseName = "";
+    let phaseEmoji = "";
+    
+    if (cyclePosition < 0.033 || cyclePosition >= 0.967) {
+      phaseName = "New Moon";
+      phaseEmoji = "🌑";
+    } else if (cyclePosition < 0.216) {
+      phaseName = "Waxing Crescent";
+      phaseEmoji = "🌒";
+    } else if (cyclePosition < 0.283) {
+      phaseName = "First Quarter";
+      phaseEmoji = "🌓";
+    } else if (cyclePosition < 0.466) {
+      phaseName = "Waxing Gibbous";
+      phaseEmoji = "🌔";
+    } else if (cyclePosition < 0.533) {
+      phaseName = "Full Moon";
+      phaseEmoji = "🌕";
+    } else if (cyclePosition < 0.716) {
+      phaseName = "Waning Gibbous";
+      phaseEmoji = "🌖";
+    } else if (cyclePosition < 0.783) {
+      phaseName = "Last Quarter";
+      phaseEmoji = "🌗";
+    } else {
+      phaseName = "Waning Crescent";
+      phaseEmoji = "🌘";
+    }
+    
+    // Calculate days until next full moon
+    let daysToFullMoon;
+    if (cyclePosition < 0.5) {
+      daysToFullMoon = (0.5 - cyclePosition) * lunarCycle;
+    } else {
+      daysToFullMoon = (1.5 - cyclePosition) * lunarCycle;
+    }
+    
+    // Calculate days until next new moon
+    const daysToNewMoon = (1 - cyclePosition) * lunarCycle;
+    
+    return {
+      success: true,
+      phaseName: phaseName,
+      phaseEmoji: phaseEmoji,
+      illumination: Math.round(illumination * 100), // Percentage 0-100
+      moonAge: Math.round(moonAge * 10) / 10, // Days with 1 decimal
+      cyclePosition: Math.round(cyclePosition * 1000) / 1000, // 0-1 with 3 decimals
+      daysToFullMoon: Math.round(daysToFullMoon * 10) / 10,
+      daysToNewMoon: Math.round(daysToNewMoon * 10) / 10,
+      summary: `The moon is currently in the ${phaseName} phase ${phaseEmoji}. It is ${Math.round(illumination * 100)}% illuminated and is ${Math.round(moonAge)} days old in this lunar cycle.`
+    };
+    
+  } catch (error) {
+    console.error("❌ Error calculating moon phase:", error);
+    return {
+      success: false,
+      error: "Failed to calculate moon phase"
+    };
+  }
+}
+
+// Initial weather data fetch
+console.log("🌤️  Fetching initial weather data...");
+fetchWeatherData().catch(err => console.error("❌ Failed to fetch initial weather data:", err));
+
 // Handle ESP32 device WebSocket connections
 Deno.serve({ port: 8000 }, (req) => {
   const url = new URL(req.url);
@@ -494,6 +787,30 @@ async function connectToGemini(connection: ClientConnection) {
                 properties: {},
                 required: []
               }
+            },
+            {
+              name: "get_weather_forecast",
+              description: "Get weather forecast information. ONLY use this when the user specifically asks about weather, temperature, rain, or forecast. Do not call this for unrelated questions.",
+              parameters: {
+                type: "OBJECT",
+                properties: {
+                  timeframe: {
+                    type: "STRING",
+                    description: "The timeframe for the forecast",
+                    enum: ["current", "hourly", "today", "tomorrow", "week"]
+                  }
+                },
+                required: ["timeframe"]
+              }
+            },
+            {
+              name: "get_moon_phase",
+              description: "Get the current moon phase information. ONLY use this when the user specifically asks about the moon, moon phase, or lunar cycle. Do not call this for unrelated questions.",
+              parameters: {
+                type: "OBJECT",
+                properties: {},
+                required: []
+              }
             }]
           }]
         }
@@ -584,6 +901,29 @@ async function connectToGemini(connection: ClientConnection) {
                   type: "timerCancelled"
                 }));
               }
+            } else if (funcName === "get_weather_forecast") {
+              const timeframe = funcArgs.timeframe || "current";
+              
+              // Fetch fresh weather data on first call
+              if (!weatherDataCache) {
+                await fetchWeatherData();
+              }
+              
+              functionResult = getWeather(connection.deviceId, timeframe);
+              console.log(`[${connection.deviceId}] Weather (${timeframe}): ${functionResult.summary || functionResult.error}`);
+            } else if (funcName === "get_moon_phase") {
+              functionResult = getMoonPhase();
+              console.log(`[${connection.deviceId}] Moon phase: ${functionResult.phaseName} ${functionResult.phaseEmoji} (${functionResult.illumination}% illuminated)`);
+              
+              // Send moon data to ESP32 for LED visualization
+              if (functionResult.success) {
+                connection.socket.send(JSON.stringify({
+                  type: "moonData",
+                  phaseName: functionResult.phaseName,
+                  illumination: functionResult.illumination,
+                  moonAge: functionResult.moonAge
+                }));
+              }
             }
             
             // Send function response back to Gemini
@@ -650,6 +990,29 @@ async function connectToGemini(connection: ClientConnection) {
                 if (functionResult.success) {
                   connection.socket.send(JSON.stringify({
                     type: "timerCancelled"
+                  }));
+                }
+              } else if (funcName === "get_weather_forecast") {
+                const timeframe = funcArgs.timeframe || "current";
+                
+                // Fetch fresh weather data on first call
+                if (!weatherDataCache) {
+                  await fetchWeatherData();
+                }
+                
+                functionResult = getWeather(connection.deviceId, timeframe);
+                console.log(`[${connection.deviceId}] Weather (${timeframe}): ${functionResult.summary || functionResult.error}`);
+              } else if (funcName === "get_moon_phase") {
+                functionResult = getMoonPhase();
+                console.log(`[${connection.deviceId}] Moon phase: ${functionResult.phaseName} ${functionResult.phaseEmoji} (${functionResult.illumination}% illuminated)`);
+                
+                // Send moon data to ESP32 for LED visualization
+                if (functionResult.success) {
+                  connection.socket.send(JSON.stringify({
+                    type: "moonData",
+                    phaseName: functionResult.phaseName,
+                    illumination: functionResult.illumination,
+                    moonAge: functionResult.moonAge
                   }));
                 }
               }

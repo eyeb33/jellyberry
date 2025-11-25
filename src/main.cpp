@@ -26,6 +26,7 @@ bool turnComplete = false;  // Track when Gemini has finished its turn
 bool responseInterrupted = false;  // Flag to ignore audio after interrupt
 bool waitingForGreeting = false;  // Flag to skip timeout when waiting for startup greeting
 bool shutdownSoundPlayed = false;  // Flag to prevent repeated shutdown sounds during reconnection
+bool firstConnection = true;  // Track if this is the first connection (cold boot)
 uint32_t recordingStartTime = 0;
 uint32_t lastVoiceActivityTime = 0;
 uint32_t lastAudioChunkTime = 0;  // Track when we last received audio
@@ -56,8 +57,9 @@ struct AudioChunk {
     size_t length;
 };
 
-enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON };
+enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU };
 LEDMode currentLEDMode = LED_BOOT;
+bool ambientVUMode = false;  // Toggle for ambient sound VU meter mode
 
 // Tide visualization state
 struct TideState {
@@ -279,6 +281,18 @@ void loop() {
         bool startTouch = digitalRead(TOUCH_PAD_START_PIN) == HIGH;
         bool stopTouch = digitalRead(TOUCH_PAD_STOP_PIN) == HIGH;
         
+        // STOP button: Toggle ambient VU meter mode (only when idle)
+        if (stopTouch && !stopPressed && !recordingActive && !isPlayingResponse) {
+            ambientVUMode = !ambientVUMode;
+            if (ambientVUMode) {
+                Serial.println("🎵 Ambient VU meter mode enabled");
+                currentLEDMode = LED_AMBIENT_VU;
+            } else {
+                Serial.println("🎵 Ambient VU meter mode disabled");
+                currentLEDMode = LED_IDLE;
+            }
+        }
+        
         // Interrupt feature: START button during playback stops audio and starts recording
         // Only treat as interrupt if turn is NOT complete (still actively speaking)
         if (startTouch && !startPressed && isPlayingResponse && !turnComplete) {
@@ -305,6 +319,11 @@ void loop() {
             responseInterrupted = false;  // Clear interrupt flag for new conversation
             tideState.active = false;  // Clear tide display for new interaction
             isPlayingResponse = false;  // Force stop playback if turn is complete
+            // Exit ambient VU mode when starting recording
+            if (ambientVUMode) {
+                ambientVUMode = false;
+                Serial.println("🎵 Ambient VU meter mode disabled (recording started)");
+            }
             recordingActive = true;
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
@@ -314,6 +333,8 @@ void loop() {
         startPressed = startTouch;
         
         // Stop recording on rising edge or timeout
+        // Note: STOP button only stops recording if we're actively recording
+        // Otherwise it toggles ambient VU mode (handled above)
         if ((stopTouch && !stopPressed && recordingActive) || 
             (recordingActive && (millis() - recordingStartTime) > MAX_RECORDING_DURATION_MS)) {
             recordingActive = false;
@@ -343,7 +364,7 @@ void loop() {
         FastLED.show();
         delay(50);  // Brief delay to ensure clean transition
         
-        // Priority: Timer > Moon > Tide > Idle
+        // Priority: Timer > Moon > Tide > Ambient VU > Idle
         if (timerState.active) {
             currentLEDMode = LED_TIMER;
             Serial.println("✓ Audio playback complete - switching to TIMER display");
@@ -356,6 +377,9 @@ void loop() {
             tideState.displayStartTime = millis();
             Serial.printf("✓ Audio playback complete - switching to TIDE display (state=%s, level=%.2f)\n", 
                          tideState.state.c_str(), tideState.waterLevel);
+        } else if (ambientVUMode) {
+            currentLEDMode = LED_AMBIENT_VU;
+            Serial.println("✓ Audio playback complete - returning to AMBIENT VU mode");
         } else {
             currentLEDMode = LED_IDLE;
             Serial.println("✓ Audio playback complete - switching to IDLE");
@@ -635,19 +659,21 @@ void sendAudioChunk(uint8_t* data, size_t length) {
 void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     switch(type) {
         case WStype_CONNECTED:
-            Serial.println("✓ WebSocket Connected to Edge Server!");
-            isWebSocketConnected = true;
-            shutdownSoundPlayed = false;  // Reset flag on successful connection
-            currentLEDMode = LED_CONNECTED;
-            
-            // Edge server handles Gemini setup automatically
-            Serial.println("✓ Waiting for 'ready' message from server");
-            
-            // Show connection on LEDs
-            fill_solid(leds, NUM_LEDS, CRGB::Green);
-            FastLED.show();
-            delay(500);
-            currentLEDMode = LED_IDLE;
+            {
+                Serial.println("✓ WebSocket Connected to Edge Server!");
+                isWebSocketConnected = true;
+                shutdownSoundPlayed = false;  // Reset flag on successful connection
+                currentLEDMode = LED_CONNECTED;
+                
+                // Edge server handles Gemini setup automatically
+                Serial.println("✓ Waiting for 'ready' message from server");
+                
+                // Show connection on LEDs
+                fill_solid(leds, NUM_LEDS, CRGB::Green);
+                FastLED.show();
+                delay(500);
+                currentLEDMode = LED_IDLE;
+            }
             break;
             
         case WStype_TEXT:
@@ -786,12 +812,19 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
     // Handle setup complete message
     if (doc["type"].is<const char*>() && doc["type"] == "setupComplete") {
         Serial.println("📦 Setup complete");
-        // Prepare to receive greeting audio from Gemini
-        currentLEDMode = LED_AUDIO_REACTIVE;
-        isPlayingResponse = true;
-        waitingForGreeting = true;  // Skip timeout until first audio chunk arrives
-        lastAudioChunkTime = millis();
-        Serial.println("🎤 Ready for startup greeting...");
+        
+        // Only play greeting on first connection (cold boot), not on reconnections
+        if (firstConnection) {
+            firstConnection = false;  // Clear flag after first connection
+            // Prepare to receive greeting audio from Gemini
+            currentLEDMode = LED_AUDIO_REACTIVE;
+            isPlayingResponse = true;
+            waitingForGreeting = true;  // Skip timeout until first audio chunk arrives
+            lastAudioChunkTime = millis();
+            Serial.println("🎤 Ready for startup greeting...");
+        } else {
+            Serial.println("🔄 Reconnected - skipping greeting");
+        }
         return;
     }
     
@@ -1007,6 +1040,88 @@ void updateLEDs() {
             hue = (millis() / 10) % 256;
             for (int i = 0; i < NUM_LEDS; i++) {
                 leds[i] = CHSV(hue + (i * 28), 255, 255);  // 28 = 256/9 for even spread
+            }
+            break;
+            
+        case LED_AMBIENT_VU:
+            // Ambient sound VU meter - uses microphone to visualize external sounds
+            // Read microphone continuously and display real-time VU meter
+            {
+                static int16_t ambientBuffer[640];  // 40ms at 16kHz (640 samples)
+                size_t bytes_read = 0;
+                
+                // Read from microphone
+                if (i2s_read(I2S_NUM_0, ambientBuffer, sizeof(ambientBuffer), &bytes_read, 0) == ESP_OK) {
+                    size_t samples_read = bytes_read / sizeof(int16_t);
+                    
+                    // Calculate RMS amplitude
+                    int64_t sum = 0;
+                    for (size_t i = 0; i < samples_read; i++) {
+                        int32_t sample = ambientBuffer[i];
+                        sum += (int64_t)sample * sample;
+                    }
+                    float rms = sqrt(sum / samples_read);
+                    
+                    // Auto-gain control with peak limiting
+                    static float autoGain = 25.0f;  // Start with high gain for ambient sounds
+                    static float peakRMS = 100.0f;  // Track peak levels
+                    static uint32_t lastGainAdjust = 0;
+                    
+                    // Update peak tracker (decay slowly)
+                    peakRMS = peakRMS * 0.995f + rms * 0.005f;
+                    if (rms > peakRMS) peakRMS = rms;
+                    
+                    // Adjust gain based on recent peak levels (every 50ms for faster response)
+                    if (millis() - lastGainAdjust > 50) {
+                        // Target peak around 800-1500 for good range
+                        if (peakRMS < 150 && autoGain < 50.0f) {
+                            autoGain *= 1.15f;  // Increase gain faster for quiet sounds
+                        } else if (peakRMS > 2500 && autoGain > 3.0f) {
+                            autoGain *= 0.85f;  // Decrease gain for loud sounds
+                        }
+                        lastGainAdjust = millis();
+                    }
+                    
+                    // Apply auto-gain
+                    float gainedRMS = rms * autoGain;
+                    
+                    // Soft compression: reduce peaks above threshold
+                    if (gainedRMS > 1500) {
+                        // Logarithmic compression for peaks
+                        gainedRMS = 1500 + (gainedRMS - 1500) * 0.3f;
+                    }
+                    
+                    // Smooth the value for more stable display and better visibility of sustained sounds
+                    static float smoothedRMS = 0.0f;
+                    smoothedRMS = smoothedRMS * 0.80f + gainedRMS * 0.20f;  // 80/20 for more smoothing
+                    
+                    // Map to LED count - lower threshold for better verse visibility
+                    // Adjusted range: 150-1600 (was 200-1600)
+                    int numLEDs = map(constrain((int)smoothedRMS, 150, 1600), 150, 1600, 0, NUM_LEDS);
+                    
+                    // Debug output every 2 seconds
+                    static uint32_t lastDebug = 0;
+                    if (millis() - lastDebug > 2000) {
+                        Serial.printf("🎵 VU: raw=%.0f gain=%.1f gained=%.0f smooth=%.0f LEDs=%d\n", 
+                                     rms, autoGain, gainedRMS, smoothedRMS, numLEDs);
+                        lastDebug = millis();
+                    }
+                    
+                    // VU meter gradient (green to yellow to red)
+                    for (int i = 0; i < NUM_LEDS; i++) {
+                        if (i < numLEDs) {
+                            if (i < NUM_LEDS * 0.6) {
+                                leds[i] = CRGB(0, 255, 0);  // Pure green
+                            } else if (i < NUM_LEDS * 0.85) {
+                                leds[i] = CRGB(255, 255, 0);  // Pure yellow
+                            } else {
+                                leds[i] = CRGB(255, 0, 0);  // Pure red
+                            }
+                        } else {
+                            leds[i] = CRGB(0, 0, 0);  // Off
+                        }
+                    }
+                }
             }
             break;
             

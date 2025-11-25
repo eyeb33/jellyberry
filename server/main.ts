@@ -1,6 +1,7 @@
 // Deno Edge Server for Jellyberry - WebSocket Proxy to Gemini Live API
 // Deploy to Deno Deploy: deno deploy --project=jellyberry-server main.ts
 
+// @ts-ignore - Deno types are available at runtime
 const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY") || "";
 const GEMINI_WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
@@ -18,6 +19,9 @@ const CACHE_DURATION_MS = 60 * 60 * 1000; // 1 hour - set to 0 for testing
 let weatherDataCache: any = null;
 let weatherDataTimestamp = 0;
 const WEATHER_CACHE_DURATION_MS = 30 * 60 * 1000; // 30 minutes
+
+// Track which devices have received their first boot greeting
+const deviceFirstBoot = new Map<string, boolean>();
 
 // Debug: Check if API key is loaded
 console.log(`[DEBUG] GEMINI_API_KEY loaded: ${GEMINI_API_KEY ? "YES (" + GEMINI_API_KEY.substring(0, 10) + "...)" : "NO - EMPTY!"}`);
@@ -850,12 +854,18 @@ async function connectToGemini(connection: ClientConnection) {
         
         // Handle setup complete
         if (json.setupComplete) {
-          console.log(`[${connection.deviceId}] Setup complete`);
+          // Check if this is the first boot for this device
+          const isFirstBoot = !deviceFirstBoot.has(connection.deviceId);
+          if (isFirstBoot) {
+            deviceFirstBoot.set(connection.deviceId, true);
+          }
+          
+          console.log(`[${connection.deviceId}] Setup complete (firstBoot: ${isFirstBoot})`);
           connection.socket.send(JSON.stringify({ type: "setupComplete" }));
           
           // Send contextual greeting to Gemini after a short delay
-          // This gives the device time to settle into idle mode after boot
-          if (connection.geminiSocket) {
+          // Only on first boot, not on reconnections
+          if (connection.geminiSocket && isFirstBoot) {
             setTimeout(() => {
               // Check socket is still open
               if (!connection.geminiSocket || connection.geminiSocket.readyState !== WebSocket.OPEN) {

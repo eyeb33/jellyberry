@@ -24,6 +24,8 @@ bool recordingActive = false;
 bool isPlayingResponse = false;
 bool turnComplete = false;  // Track when Gemini has finished its turn
 bool responseInterrupted = false;  // Flag to ignore audio after interrupt
+bool waitingForGreeting = false;  // Flag to skip timeout when waiting for startup greeting
+bool shutdownSoundPlayed = false;  // Flag to prevent repeated shutdown sounds during reconnection
 uint32_t recordingStartTime = 0;
 uint32_t lastVoiceActivityTime = 0;
 uint32_t lastAudioChunkTime = 0;  // Track when we last received audio
@@ -33,7 +35,7 @@ int32_t currentAudioLevel = 0;  // Current audio amplitude for VU meter
 float smoothedAudioLevel = 0.0f;  // Smoothed audio level for stable VU meter
 
 // Audio level delay buffer for LED sync (compensates for I2S buffer latency)
-#define AUDIO_DELAY_BUFFER_SIZE 10  // ~300ms delay to match I2S playback buffer + speaker latency
+#define AUDIO_DELAY_BUFFER_SIZE 12  // ~360ms delay to match I2S playback buffer + speaker latency
 int audioLevelBuffer[AUDIO_DELAY_BUFFER_SIZE] = {0};
 int audioBufferIndex = 0;
 
@@ -93,6 +95,8 @@ bool initI2SSpeaker();
 void handleWebSocketMessage(uint8_t* payload, size_t length);
 bool detectVoiceActivity(int16_t* samples, size_t count);
 void sendAudioChunk(uint8_t* data, size_t length);
+void playStartupSound();
+void playShutdownSound();
 
 // ============== SETUP ==============
 void setup() {
@@ -244,6 +248,10 @@ void setup() {
     xTaskCreatePinnedToCore(audioTask, "Audio", 32768, NULL, 2, &audioTaskHandle, CORE_1);  // Increased to 32KB for Opus + buffers
     Serial.println("✓ Tasks created on dual cores");
 
+    // Play startup sound
+    Serial.println("🔊 Playing startup sound...");
+    playStartupSound();
+    
     currentLEDMode = LED_IDLE;
     Serial.printf("=== Initialization Complete ===  [LEDMode set to %d]\n", currentLEDMode);
     Serial.println("Touch START pad to begin recording");
@@ -258,13 +266,16 @@ void loop() {
         lastPrint = millis();
     }
     
+    // Ignore touch pads for first 5 seconds after boot to avoid false triggers
+    static const uint32_t bootIgnoreTime = 5000;
+    
     // Poll touch pads with debouncing
     static bool startPressed = false;
     static bool stopPressed = false;
     static uint32_t lastDebounceTime = 0;
     const uint32_t debounceDelay = 10;  // 10ms - TTP223 has hardware debounce
     
-    if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (millis() > bootIgnoreTime && (millis() - lastDebounceTime) > debounceDelay) {
         bool startTouch = digitalRead(TOUCH_PAD_START_PIN) == HIGH;
         bool stopTouch = digitalRead(TOUCH_PAD_STOP_PIN) == HIGH;
         
@@ -324,7 +335,8 @@ void loop() {
     
     // Auto-return to IDLE when playback finishes (no audio chunks for 2 seconds)
     // Longer timeout to handle natural pauses in speech
-    if (isPlayingResponse && (millis() - lastAudioChunkTime) > 2000) {
+    // Skip timeout check when waiting for startup greeting
+    if (isPlayingResponse && !waitingForGreeting && (millis() - lastAudioChunkTime) > 2000) {
         isPlayingResponse = false;
         // Clear LEDs before switching mode
         fill_solid(leds, NUM_LEDS, CRGB::Black);
@@ -481,6 +493,76 @@ void audioTask(void * parameter) {
 }
 
 // ============== AUDIO FEEDBACK ==============
+void playStartupSound() {
+    // Play a pleasant ascending melody on startup
+    const int sampleRate = 24000;
+    const int noteDuration = 120;  // 120ms per note
+    const int numSamples = (sampleRate * noteDuration) / 1000;
+    
+    // Musical notes: C5, E5, G5, C6 (major chord arpeggio)
+    const float frequencies[] = {523.25f, 659.25f, 783.99f, 1046.50f};
+    const int numNotes = 4;
+    
+    static int16_t toneBuffer[5760];  // 120ms at 24kHz stereo (2880 samples * 2 channels)
+    
+    for (int note = 0; note < numNotes; note++) {
+        for (int i = 0; i < numSamples; i++) {
+            // Generate sine wave with fade-in/fade-out envelope
+            float t = (float)i / sampleRate;
+            float envelope = 1.0f;
+            if (i < numSamples / 10) {
+                envelope = (float)i / (numSamples / 10);  // Fade in
+            } else if (i > numSamples * 9 / 10) {
+                envelope = (float)(numSamples - i) / (numSamples / 10);  // Fade out
+            }
+            
+            int16_t sample = (int16_t)(sin(2.0f * PI * frequencies[note] * t) * 6000 * envelope * volumeMultiplier);
+            
+            // Stereo output
+            toneBuffer[i * 2] = sample;
+            toneBuffer[i * 2 + 1] = sample;
+        }
+        
+        size_t bytes_written;
+        i2s_write(I2S_NUM_1, toneBuffer, numSamples * 4, &bytes_written, portMAX_DELAY);
+    }
+}
+
+void playShutdownSound() {
+    // Play a descending melody on disconnect (reverse of startup)
+    const int sampleRate = 24000;
+    const int noteDuration = 120;  // 120ms per note
+    const int numSamples = (sampleRate * noteDuration) / 1000;
+    
+    // Musical notes: C6, G5, E5, C5 (descending - reverse of startup)
+    const float frequencies[] = {1046.50f, 783.99f, 659.25f, 523.25f};
+    const int numNotes = 4;
+    
+    static int16_t toneBuffer[5760];  // 120ms at 24kHz stereo (2880 samples * 2 channels)
+    
+    for (int note = 0; note < numNotes; note++) {
+        for (int i = 0; i < numSamples; i++) {
+            // Generate sine wave with fade-in/fade-out envelope
+            float t = (float)i / sampleRate;
+            float envelope = 1.0f;
+            if (i < numSamples / 10) {
+                envelope = (float)i / (numSamples / 10);  // Fade in
+            } else if (i > numSamples * 9 / 10) {
+                envelope = (float)(numSamples - i) / (numSamples / 10);  // Fade out
+            }
+            
+            int16_t sample = (int16_t)(sin(2.0f * PI * frequencies[note] * t) * 6000 * envelope * volumeMultiplier);
+            
+            // Stereo output
+            toneBuffer[i * 2] = sample;
+            toneBuffer[i * 2 + 1] = sample;
+        }
+        
+        size_t bytes_written;
+        i2s_write(I2S_NUM_1, toneBuffer, numSamples * 4, &bytes_written, portMAX_DELAY);
+    }
+}
+
 void playVolumeChime() {
     // Play a brief 1kHz tone at the current volume level
     const int sampleRate = 24000;
@@ -555,6 +637,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
         case WStype_CONNECTED:
             Serial.println("✓ WebSocket Connected to Edge Server!");
             isWebSocketConnected = true;
+            shutdownSoundPlayed = false;  // Reset flag on successful connection
             currentLEDMode = LED_CONNECTED;
             
             // Edge server handles Gemini setup automatically
@@ -603,6 +686,12 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 
                 // Update last audio chunk time
                 lastAudioChunkTime = millis();
+                
+                // Clear greeting flag on first audio chunk
+                if (waitingForGreeting) {
+                    waitingForGreeting = false;
+                    Serial.println("👋 Startup greeting received!");
+                }
                 
                 // Debug first chunk
                 if (firstAudioChunk) {
@@ -658,6 +747,11 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
         case WStype_DISCONNECTED:
             Serial.println("✗ WebSocket Disconnected");
             isWebSocketConnected = false;
+            // Play shutdown sound only once per disconnect session
+            if (!shutdownSoundPlayed) {
+                playShutdownSound();
+                shutdownSoundPlayed = true;
+            }
             // Don't set error mode - this is expected during reconnection attempts
             if (currentLEDMode == LED_CONNECTED) {
                 currentLEDMode = LED_IDLE;
@@ -692,6 +786,12 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
     // Handle setup complete message
     if (doc["type"].is<const char*>() && doc["type"] == "setupComplete") {
         Serial.println("📦 Setup complete");
+        // Prepare to receive greeting audio from Gemini
+        currentLEDMode = LED_AUDIO_REACTIVE;
+        isPlayingResponse = true;
+        waitingForGreeting = true;  // Skip timeout until first audio chunk arrives
+        lastAudioChunkTime = millis();
+        Serial.println("🎤 Ready for startup greeting...");
         return;
     }
     

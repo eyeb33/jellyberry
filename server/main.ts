@@ -648,6 +648,9 @@ Deno.serve({ port: 8000 }, (req) => {
     
     connections.set(deviceId, connection);
     
+    // Connect to Gemini immediately when device connects
+    connectToGemini(connection);
+    
     // Handle messages from ESP32
     socket.onmessage = async (event) => {
       try {
@@ -849,6 +852,42 @@ async function connectToGemini(connection: ClientConnection) {
         if (json.setupComplete) {
           console.log(`[${connection.deviceId}] Setup complete`);
           connection.socket.send(JSON.stringify({ type: "setupComplete" }));
+          
+          // Send contextual greeting to Gemini after a short delay
+          // This gives the device time to settle into idle mode after boot
+          if (connection.geminiSocket) {
+            setTimeout(() => {
+              // Check socket is still open
+              if (!connection.geminiSocket || connection.geminiSocket.readyState !== WebSocket.OPEN) {
+                console.log(`[${connection.deviceId}] Gemini socket closed, skipping greeting`);
+                return;
+              }
+              
+              const now = new Date();
+              const hour = now.getHours();
+              let greeting = "Good morning";
+              if (hour >= 12 && hour < 17) {
+                greeting = "Good afternoon";
+              } else if (hour >= 17) {
+                greeting = "Good evening";
+              }
+              
+              const greetingMessage = {
+                clientContent: {
+                  turns: [{
+                    role: "user",
+                    parts: [{
+                      text: `SYSTEM: Device just started up. Please greet the user with a brief, friendly message. Say something like "${greeting}, Jellyberry is now online" but keep it natural and concise (one short sentence).`
+                    }]
+                  }],
+                  turnComplete: true
+                }
+              };
+              
+              console.log(`[${connection.deviceId}] Sending startup greeting request to Gemini`);
+              connection.geminiSocket.send(JSON.stringify(greetingMessage));
+            }, 2000); // 2 second delay to let device settle
+          }
           return;
         }
         

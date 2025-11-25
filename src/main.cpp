@@ -761,6 +761,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
         timerState.totalSeconds = doc["durationSeconds"].as<int>();
         timerState.startTime = millis();
         timerState.active = true;
+        currentLEDMode = LED_TIMER;  // Switch to timer display immediately
         
         Serial.printf("⏱️  Timer: %d seconds (%d minutes)\n",
                       timerState.totalSeconds,
@@ -791,7 +792,12 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
             FastLED.show();
             delay(200);
         }
-        currentLEDMode = LED_IDLE;
+        // Brief delay to allow first audio chunk to arrive, then switch to playback mode
+        delay(300);
+        currentLEDMode = LED_AUDIO_REACTIVE;
+        isPlayingResponse = true;
+        lastAudioChunkTime = millis();  // Reset audio timeout
+        Serial.println("✓ Ready for audio notification from Gemini...");
         return;
     }
     

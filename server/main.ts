@@ -1,3 +1,5 @@
+import "https://deno.land/std@0.204.0/dotenv/load.ts";
+
 // Deno Edge Server for Jellyberry - WebSocket Proxy to Gemini Live API
 // Deploy to Deno Deploy: deno deploy --project=jellyberry-server main.ts
 

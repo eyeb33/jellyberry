@@ -241,7 +241,7 @@ void setup() {
     
     webSocket.onEvent(onWebSocketEvent);
     webSocket.setReconnectInterval(WS_RECONNECT_INTERVAL);
-    webSocket.enableHeartbeat(15000, 3000, 2);  // Ping every 15s, timeout 3s, 2 retries
+    webSocket.enableHeartbeat(20000, 5000, 3);  // Ping every 20s, timeout 5s, 3 retries (more resilient)
     Serial.println("✓ WebSocket initialized with keepalive");
 
     // Start FreeRTOS tasks
@@ -262,10 +262,20 @@ void setup() {
 // ============== MAIN LOOP ==============
 void loop() {
     static uint32_t lastPrint = 0;
+    static uint32_t lastWiFiCheck = 0;
     
     if (millis() - lastPrint > 5000) {
         Serial.write("LOOP_TICK\r\n", 11);
         lastPrint = millis();
+    }
+    
+    // Monitor WiFi signal strength every 30 seconds
+    if (millis() - lastWiFiCheck > 30000) {
+        int32_t rssi = WiFi.RSSI();
+        if (rssi < -80) {
+            Serial.printf("[WiFi] WEAK SIGNAL: %d dBm (may cause disconnects)\n", rssi);
+        }
+        lastWiFiCheck = millis();
     }
     
     // Ignore touch pads for first 5 seconds after boot to avoid false triggers
@@ -293,31 +303,30 @@ void loop() {
             }
         }
         
-        // Interrupt feature: START button during playback stops audio and starts recording
-        // Only treat as interrupt if turn is NOT complete (still actively speaking)
-        if (startTouch && !startPressed && isPlayingResponse && !turnComplete) {
+        // Interrupt feature: START button during active playback stops audio and starts recording
+        // Only interrupt if we've received audio recently (within 500ms) and turn is not complete
+        if (startTouch && !startPressed && isPlayingResponse && !turnComplete && 
+            (millis() - lastAudioChunkTime) < 500) {
             Serial.println("⏸️  Interrupted response - starting new recording");
             isPlayingResponse = false;
             responseInterrupted = true;  // Flag to ignore remaining audio chunks
             firstAudioChunk = true;  // Reset for next playback
+            // Clear I2S speaker buffer to stop audio immediately
+            i2s_zero_dma_buffer(I2S_NUM_1);
             
-            // Don't send turnComplete - just ignore remaining audio locally
-            // This keeps Gemini connection alive for the next question
-            
-            // Start new recording
             recordingActive = true;
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
             currentLEDMode = LED_RECORDING;
-            // Clear I2S speaker buffer to stop audio immediately
-            i2s_zero_dma_buffer(I2S_NUM_1);
             Serial.printf("🎤 Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
         }
-        // Start recording on rising edge
-        // Allow if: not recording AND (not playing OR turn is complete)
-        else if (startTouch && !startPressed && !recordingActive && (!isPlayingResponse || turnComplete)) {
+        // Start recording on rising edge (normal case - not interrupting)
+        // Allow if: not recording AND not currently playing
+        else if (startTouch && !startPressed && !recordingActive && !isPlayingResponse) {
             responseInterrupted = false;  // Clear interrupt flag for new conversation
             tideState.active = false;  // Clear tide display for new interaction
+            moonState.active = false;  // Clear moon display for new interaction
+            timerState.active = false;  // Clear timer for new interaction
             isPlayingResponse = false;  // Force stop playback if turn is complete
             // Exit ambient VU mode when starting recording
             if (ambientVUMode) {
@@ -332,15 +341,12 @@ void loop() {
         }
         startPressed = startTouch;
         
-        // Stop recording on rising edge or timeout
-        // Note: STOP button only stops recording if we're actively recording
-        // Otherwise it toggles ambient VU mode (handled above)
-        if ((stopTouch && !stopPressed && recordingActive) || 
-            (recordingActive && (millis() - recordingStartTime) > MAX_RECORDING_DURATION_MS)) {
+        // Stop recording only on timeout (manual stop removed - rely on VAD)
+        if (recordingActive && (millis() - recordingStartTime) > MAX_RECORDING_DURATION_MS) {
             recordingActive = false;
             currentLEDMode = LED_PROCESSING;
             uint32_t duration = millis() - recordingStartTime;
-            Serial.printf("⏹️  Recording stopped - Duration: %dms (START=%d, STOP=%d)\n", duration, startTouch, stopTouch);
+            Serial.printf("⏹️  Recording stopped - Duration: %dms (max duration reached)\n", duration);
         }
         stopPressed = stopTouch;
         
@@ -355,9 +361,7 @@ void loop() {
     }
     
     // Auto-return to IDLE when playback finishes (no audio chunks for 2 seconds)
-    // Longer timeout to handle natural pauses in speech
-    // Skip timeout check when waiting for startup greeting
-    if (isPlayingResponse && !waitingForGreeting && (millis() - lastAudioChunkTime) > 2000) {
+    if (isPlayingResponse && (millis() - lastAudioChunkTime) > 2000) {
         isPlayingResponse = false;
         // Clear LEDs before switching mode
         fill_solid(leds, NUM_LEDS, CRGB::Black);
@@ -656,11 +660,15 @@ void sendAudioChunk(uint8_t* data, size_t length) {
     webSocket.sendTXT(output);
 }
 
+// Track WebSocket stats
+static uint32_t disconnectCount = 0;
+static uint32_t lastDisconnectTime = 0;
+
 void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     switch(type) {
         case WStype_CONNECTED:
             {
-                Serial.println("✓ WebSocket Connected to Edge Server!");
+                Serial.printf("✓ WebSocket Connected to Edge Server! (disconnect count: %d)\n", disconnectCount);
                 isWebSocketConnected = true;
                 shutdownSoundPlayed = false;  // Reset flag on successful connection
                 currentLEDMode = LED_CONNECTED;
@@ -771,7 +779,10 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             break;
             
         case WStype_DISCONNECTED:
-            Serial.println("✗ WebSocket Disconnected");
+            disconnectCount++;
+            lastDisconnectTime = millis();
+            Serial.printf("✗ WebSocket Disconnected (#%d) - isPlaying=%d, recording=%d, uptime=%lus\n",
+                         disconnectCount, isPlayingResponse, recordingActive, millis()/1000);
             isWebSocketConnected = false;
             // Play shutdown sound only once per disconnect session
             if (!shutdownSoundPlayed) {
@@ -811,20 +822,8 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
     
     // Handle setup complete message
     if (doc["type"].is<const char*>() && doc["type"] == "setupComplete") {
-        Serial.println("📦 Setup complete");
-        
-        // Only play greeting on first connection (cold boot), not on reconnections
-        if (firstConnection) {
-            firstConnection = false;  // Clear flag after first connection
-            // Prepare to receive greeting audio from Gemini
-            currentLEDMode = LED_AUDIO_REACTIVE;
-            isPlayingResponse = true;
-            waitingForGreeting = true;  // Skip timeout until first audio chunk arrives
-            lastAudioChunkTime = millis();
-            Serial.println("🎤 Ready for startup greeting...");
-        } else {
-            Serial.println("🔄 Reconnected - skipping greeting");
-        }
+        Serial.println("📦 Setup complete - ready for interaction");
+        // Greeting feature removed for simplicity - ready immediately
         return;
     }
     
@@ -1050,6 +1049,9 @@ void updateLEDs() {
                 static int16_t ambientBuffer[640];  // 40ms at 16kHz (640 samples)
                 size_t bytes_read = 0;
                 
+                // Clear all LEDs first to ensure clean state
+                fill_solid(leds, NUM_LEDS, CRGB::Black);
+                
                 // Read from microphone
                 if (i2s_read(I2S_NUM_0, ambientBuffer, sizeof(ambientBuffer), &bytes_read, 0) == ESP_OK) {
                     size_t samples_read = bytes_read / sizeof(int16_t);
@@ -1128,23 +1130,22 @@ void updateLEDs() {
         case LED_AUDIO_REACTIVE:
             // VU meter during playback - same green to yellow to red
             {
-                // Map audio level to LED count (0-9 LEDs)
-                // Playback audio range: 0-3000, map to 0-9 LEDs
+                // Clear all LEDs first
+                fill_solid(leds, NUM_LEDS, CRGB::Black);
+                
+                // Map audio level to LED count (0-144 LEDs)
+                // Playback audio range: 0-3000, map to 0-144 LEDs
                 int numLEDs = map(constrain((int)smoothedAudioLevel, 0, 3000), 0, 3000, 0, NUM_LEDS);
                 
-                // Set ALL LEDs explicitly - no partial updates
-                for (int i = 0; i < NUM_LEDS; i++) {
-                    if (i < numLEDs) {
-                        // Universal VU meter gradient (same as recording)
-                        if (i < NUM_LEDS * 0.6) {
-                            leds[i] = CRGB(0, 255, 0);  // Pure green
-                        } else if (i < NUM_LEDS * 0.85) {
-                            leds[i] = CRGB(255, 255, 0);  // Pure yellow
-                        } else {
-                            leds[i] = CRGB(255, 0, 0);  // Pure red
-                        }
+                // Set LEDs up to numLEDs with gradient
+                for (int i = 0; i < numLEDs; i++) {
+                    // Universal VU meter gradient (same as recording)
+                    if (i < NUM_LEDS * 0.6) {
+                        leds[i] = CRGB(0, 255, 0);  // Pure green
+                    } else if (i < NUM_LEDS * 0.85) {
+                        leds[i] = CRGB(255, 255, 0);  // Pure yellow
                     } else {
-                        leds[i] = CRGB(0, 0, 0);  // Pure black (completely off)
+                        leds[i] = CRGB(255, 0, 0);  // Pure red
                     }
                 }
             }

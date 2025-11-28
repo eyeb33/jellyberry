@@ -22,6 +22,7 @@ CRGB leds[NUM_LEDS];
 bool isWebSocketConnected = false;
 bool recordingActive = false;
 bool isPlayingResponse = false;
+bool isPlayingAmbient = false;  // Track ambient sound playback separately
 bool turnComplete = false;  // Track when Gemini has finished its turn
 bool responseInterrupted = false;  // Flag to ignore audio after interrupt
 bool waitingForGreeting = false;  // Flag to skip timeout when waiting for startup greeting
@@ -30,6 +31,9 @@ bool firstConnection = true;  // Track if this is the first connection (cold boo
 uint32_t recordingStartTime = 0;
 uint32_t lastVoiceActivityTime = 0;
 uint32_t lastAudioChunkTime = 0;  // Track when we last received audio
+uint32_t processingStartTime = 0;  // Track when PROCESSING mode started
+uint32_t lastWebSocketSendTime = 0;  // Track last successful send
+uint32_t webSocketSendFailures = 0;  // Count send failures
 bool firstAudioChunk = true;
 float volumeMultiplier = 0.25f;  // Volume control (25% for testing)
 int32_t currentAudioLevel = 0;  // Current audio amplitude for VU meter
@@ -57,7 +61,7 @@ struct AudioChunk {
     size_t length;
 };
 
-enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU };
+enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU, LED_AMBIENT_RAIN, LED_AMBIENT_OCEAN, LED_AMBIENT_RAINFOREST };
 LEDMode currentLEDMode = LED_BOOT;
 bool ambientVUMode = false;  // Toggle for ambient sound VU meter mode
 
@@ -86,6 +90,15 @@ struct MoonState {
     bool active;
 } moonState = {"", 0, 0.0, 0, false};
 
+// Ambient sound state
+struct AmbientSound {
+    String name;  // "rain", "ocean", "rainforest"
+    bool active;
+    uint16_t sequence;  // Increments each time we request a new sound
+    uint16_t discardedCount;  // Count discarded chunks to reduce log spam
+    uint32_t drainUntil;  // Timestamp until which we silently drain stale packets
+} ambientSound = {"", false, 0, 0, 0};
+
 // ============== FORWARD DECLARATIONS ==============
 void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length);
 void websocketTask(void * parameter);
@@ -99,6 +112,42 @@ bool detectVoiceActivity(int16_t* samples, size_t count);
 void sendAudioChunk(uint8_t* data, size_t length);
 void playStartupSound();
 void playShutdownSound();
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
+
+// ============== WIFI EVENT HANDLER ==============
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+    switch(event) {
+        case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+            Serial.println("[WiFi] Connected to AP");
+            break;
+            
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            Serial.printf("[WiFi] Got IP: %s\n", WiFi.localIP().toString().c_str());
+            break;
+            
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+            {
+                uint8_t reason = info.wifi_sta_disconnected.reason;
+                Serial.printf("[WiFi] Disconnected - Reason: %d\n", reason);
+                
+                // Common disconnect reasons that indicate auth/connection issues:
+                // 2 = AUTH_EXPIRE, 15 = 4WAY_HANDSHAKE_TIMEOUT
+                // 39 = BEACON_TIMEOUT, 202 = AUTH_FAIL
+                if (reason == 2 || reason == 15 || reason == 39 || reason == 202) {
+                    Serial.println("[WiFi] Auth/handshake issue detected - forcing reconnect");
+                    delay(1000);  // Brief delay before retry
+                }
+            }
+            break;
+            
+        case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+            Serial.println("[WiFi] Lost IP address");
+            break;
+            
+        default:
+            break;
+    }
+}
 
 // ============== SETUP ==============
 void setup() {
@@ -199,30 +248,70 @@ void setup() {
                   digitalRead(TOUCH_PAD_START_PIN), 
                   digitalRead(TOUCH_PAD_STOP_PIN));
 
-    // Connect WiFi
+    // Connect WiFi with safeguards for cold boot issues
+    Serial.println();  // Clean line break
+    Serial.println("Configuring WiFi...");
+    
+    // Register WiFi event handler for diagnostics and recovery
+    WiFi.onEvent(onWiFiEvent);
+    
+    // Clear any stale WiFi state from previous sessions
+    WiFi.disconnect(true);  // true = erase stored credentials
+    delay(500);  // Give time for disconnect to complete
+    
+    // Configure WiFi settings to prevent cold boot issues
+    WiFi.persistent(false);  // Don't save WiFi config to flash (prevents corruption)
+    WiFi.setAutoReconnect(true);  // Enable auto-reconnect on disconnect
+    WiFi.setSleep(false);  // Disable WiFi power saving (improves stability)
+    
+    // Configure TCP keepalive to detect connection issues faster
+    // This helps keep WebSocket connection alive during audio streaming
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);  // Max power for stability
     WiFi.mode(WIFI_STA);
     delay(100);  // Small delay for stability
-    Serial.println();  // Clean line break
+    
+    // Attempt WiFi connection with retry logic
     Serial.printf("Attempting WiFi connection to SSID: %s\n", WIFI_SSID);
     Serial.printf("Password length: %d characters\n", strlen(WIFI_PASSWORD));
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    Serial.print("Connecting to WiFi");
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-        delay(500);
-        Serial.print(".");
-        attempts++;
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\n✓ WiFi connected");
-        Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
-        Serial.printf("Signal: %d dBm\n", WiFi.RSSI());
+    
+    int retryCount = 0;
+    const int maxRetries = 3;
+    bool connected = false;
+    
+    while (!connected && retryCount < maxRetries) {
+        if (retryCount > 0) {
+            Serial.printf("\nRetry attempt %d/%d\n", retryCount + 1, maxRetries);
+            WiFi.disconnect();
+            delay(1000 * retryCount);  // Exponential backoff: 1s, 2s, 3s
+        }
         
-        // Configure NTP time sync (GMT timezone)
-        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-        Serial.println("⏰ NTP time sync configured");
-    } else {
-        Serial.println("\n✗ WiFi connection failed");
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        Serial.print("Connecting to WiFi");
+        
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+            delay(500);
+            Serial.print(".");
+            attempts++;
+        }
+        
+        if (WiFi.status() == WL_CONNECTED) {
+            connected = true;
+            Serial.println("\n✓ WiFi connected");
+            Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+            Serial.printf("Signal: %d dBm\n", WiFi.RSSI());
+            
+            // Configure NTP time sync (GMT timezone)
+            configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+            Serial.println("⏰ NTP time sync configured");
+        } else {
+            retryCount++;
+            Serial.printf("\n✗ Connection attempt failed (status: %d)\n", WiFi.status());
+        }
+    }
+    
+    if (!connected) {
+        Serial.println("✗ WiFi connection failed after all retries");
         currentLEDMode = LED_ERROR;
         return;
     }
@@ -241,11 +330,12 @@ void setup() {
     
     webSocket.onEvent(onWebSocketEvent);
     webSocket.setReconnectInterval(WS_RECONNECT_INTERVAL);
-    webSocket.enableHeartbeat(20000, 5000, 3);  // Ping every 20s, timeout 5s, 3 retries (more resilient)
+    webSocket.enableHeartbeat(15000, 3000, 2);  // Ping every 15s, timeout 3s, 2 retries (faster detection)
     Serial.println("✓ WebSocket initialized with keepalive");
 
     // Start FreeRTOS tasks
-    xTaskCreatePinnedToCore(websocketTask, "WebSocket", 8192, NULL, 1, &websocketTaskHandle, CORE_1);
+    // WebSocket needs high priority (3) and larger stack for heavy audio streaming
+    xTaskCreatePinnedToCore(websocketTask, "WebSocket", 16384, NULL, 3, &websocketTaskHandle, CORE_1);  // Increased from 8KB to 16KB
     xTaskCreatePinnedToCore(ledTask, "LEDs", 4096, NULL, 0, &ledTaskHandle, CORE_0);
     xTaskCreatePinnedToCore(audioTask, "Audio", 32768, NULL, 2, &audioTaskHandle, CORE_1);  // Increased to 32KB for Opus + buffers
     Serial.println("✓ Tasks created on dual cores");
@@ -291,15 +381,108 @@ void loop() {
         bool startTouch = digitalRead(TOUCH_PAD_START_PIN) == HIGH;
         bool stopTouch = digitalRead(TOUCH_PAD_STOP_PIN) == HIGH;
         
-        // STOP button: Toggle ambient VU meter mode (only when idle)
-        if (stopTouch && !stopPressed && !recordingActive && !isPlayingResponse) {
-            ambientVUMode = !ambientVUMode;
-            if (ambientVUMode) {
-                Serial.println("🎵 Ambient VU meter mode enabled");
+        // STOP button: Cycle through ambient modes
+        // IDLE → AMBIENT_VU → RAIN → OCEAN → RAINFOREST → IDLE
+        // Allow during ambient modes, block only during Gemini responses (non-ambient)
+        if (stopTouch && !stopPressed && !recordingActive && 
+            !(isPlayingResponse && !isPlayingAmbient)) {
+            // Stop any current ambient playback
+            if (isPlayingAmbient) {
+                isPlayingResponse = false;  // Clear playback flag
+                // Clear I2S buffer to stop audio immediately
+                i2s_zero_dma_buffer(I2S_NUM_1);
+            }
+            
+            // Clear any active display states (moon, tide, timer)
+            moonState.active = false;
+            tideState.active = false;
+            timerState.active = false;
+            
+            // Cycle to next mode
+            if (currentLEDMode == LED_IDLE || currentLEDMode == LED_MOON || 
+                currentLEDMode == LED_TIDE || currentLEDMode == LED_TIMER) {
                 currentLEDMode = LED_AMBIENT_VU;
-            } else {
-                Serial.println("🎵 Ambient VU meter mode disabled");
+                ambientVUMode = true;
+                ambientSound.sequence++;  // Increment for mode change
+                Serial.println("🎵 Ambient VU meter mode enabled");
+            } else if (currentLEDMode == LED_AMBIENT_VU) {
+                currentLEDMode = LED_AMBIENT_RAIN;
+                ambientVUMode = false;
+                ambientSound.name = "rain";
+                ambientSound.active = true;
+                ambientSound.sequence++;
+                isPlayingAmbient = true;
+                isPlayingResponse = false;
+                firstAudioChunk = true;
+                lastAudioChunkTime = millis();  // Initialize timing
+                Serial.printf("🌧️  Rain ambient sound mode (seq %d)\n", ambientSound.sequence);
+                // Brief delay to let server cancel previous stream
+                delay(200);
+                // Request rain sounds from server
+                JsonDocument ambientDoc;
+                ambientDoc["action"] = "requestAmbient";
+                ambientDoc["sound"] = "rain";
+                ambientDoc["sequence"] = ambientSound.sequence;
+                String ambientMsg;
+                serializeJson(ambientDoc, ambientMsg);
+                webSocket.sendTXT(ambientMsg);
+            } else if (currentLEDMode == LED_AMBIENT_RAIN) {
+                currentLEDMode = LED_AMBIENT_OCEAN;
+                ambientSound.name = "ocean";
+                ambientSound.active = true;
+                ambientSound.sequence++;
+                isPlayingAmbient = true;
+                isPlayingResponse = false;
+                firstAudioChunk = true;
+                lastAudioChunkTime = millis();  // Initialize timing
+                Serial.printf("🌊 Ocean ambient sound mode (seq %d)\n", ambientSound.sequence);
+                // Request ocean sounds from server
+                JsonDocument ambientDoc;
+                ambientDoc["action"] = "requestAmbient";
+                ambientDoc["sound"] = "ocean";
+                ambientDoc["sequence"] = ambientSound.sequence;
+                String ambientMsg;
+                serializeJson(ambientDoc, ambientMsg);
+                webSocket.sendTXT(ambientMsg);
+            } else if (currentLEDMode == LED_AMBIENT_OCEAN) {
+                currentLEDMode = LED_AMBIENT_RAINFOREST;
+                ambientSound.name = "rainforest";
+                ambientSound.active = true;
+                ambientSound.sequence++;
+                isPlayingAmbient = true;
+                isPlayingResponse = false;
+                firstAudioChunk = true;
+                lastAudioChunkTime = millis();  // Initialize timing
+                Serial.printf("🌿 Rainforest ambient sound mode (seq %d)\n", ambientSound.sequence);
+                // Request rainforest sounds from server
+                JsonDocument ambientDoc;
+                ambientDoc["action"] = "requestAmbient";
+                ambientDoc["sound"] = "rainforest";
+                ambientDoc["sequence"] = ambientSound.sequence;
+                String ambientMsg;
+                serializeJson(ambientDoc, ambientMsg);
+                webSocket.sendTXT(ambientMsg);
+            } else if (currentLEDMode == LED_AMBIENT_RAINFOREST) {
+                // Stop ambient and return to IDLE
+                Serial.println("⏹️  Ambient mode stopped - draining buffered chunks for 2s...");
+                
+                // Clear ambient state
+                isPlayingAmbient = false;
+                isPlayingResponse = false;
+                ambientSound.active = false;
+                ambientSound.name = "";
+                ambientSound.sequence++;  // Increment to invalidate in-flight chunks
                 currentLEDMode = LED_IDLE;
+                
+                // Send stop request to server
+                JsonDocument stopDoc;
+                stopDoc["action"] = "stopAmbient";
+                String stopMsg;
+                serializeJson(stopDoc, stopMsg);
+                webSocket.sendTXT(stopMsg);
+                
+                // Set 2-second drain period to discard buffered server chunks
+                ambientSound.drainUntil = millis() + 2000;
             }
         }
         
@@ -308,11 +491,9 @@ void loop() {
         if (startTouch && !startPressed && isPlayingResponse && !turnComplete && 
             (millis() - lastAudioChunkTime) < 500) {
             Serial.println("⏸️  Interrupted response - starting new recording");
-            isPlayingResponse = false;
             responseInterrupted = true;  // Flag to ignore remaining audio chunks
-            firstAudioChunk = true;  // Reset for next playback
-            // Clear I2S speaker buffer to stop audio immediately
-            i2s_zero_dma_buffer(I2S_NUM_1);
+            isPlayingResponse = false;
+            i2s_zero_dma_buffer(I2S_NUM_1);  // Stop audio immediately
             
             recordingActive = true;
             recordingStartTime = millis();
@@ -321,18 +502,26 @@ void loop() {
             Serial.printf("🎤 Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
         }
         // Start recording on rising edge (normal case - not interrupting)
-        // Allow if: not recording AND not currently playing
-        else if (startTouch && !startPressed && !recordingActive && !isPlayingResponse) {
-            responseInterrupted = false;  // Clear interrupt flag for new conversation
-            tideState.active = false;  // Clear tide display for new interaction
-            moonState.active = false;  // Clear moon display for new interaction
-            timerState.active = false;  // Clear timer for new interaction
-            isPlayingResponse = false;  // Force stop playback if turn is complete
-            // Exit ambient VU mode when starting recording
+        // Block if: recording active, playing response, OR in ambient sound mode
+        else if (startTouch && !startPressed && !recordingActive && !isPlayingResponse && !isPlayingAmbient) {
+            // Clear all previous state
+            responseInterrupted = false;
+            tideState.active = false;
+            moonState.active = false;
+            timerState.active = false;
+            
+            // CRITICAL: Cancel drain timer so Gemini responses can play
+            if (ambientSound.drainUntil > 0) {
+                Serial.println("✓ Cancelled drain timer - ready for new audio");
+                ambientSound.drainUntil = 0;
+            }
+            
+            // Exit ambient VU mode
             if (ambientVUMode) {
                 ambientVUMode = false;
-                Serial.println("🎵 Ambient VU meter mode disabled (recording started)");
+                Serial.println("🎵 Ambient VU meter mode disabled");
             }
+            
             recordingActive = true;
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
@@ -344,7 +533,11 @@ void loop() {
         // Stop recording only on timeout (manual stop removed - rely on VAD)
         if (recordingActive && (millis() - recordingStartTime) > MAX_RECORDING_DURATION_MS) {
             recordingActive = false;
-            currentLEDMode = LED_PROCESSING;
+            // Don't change LED mode if ambient sound is already active
+            if (!ambientSound.active) {
+                currentLEDMode = LED_PROCESSING;
+                processingStartTime = millis();
+            }
             uint32_t duration = millis() - recordingStartTime;
             Serial.printf("⏹️  Recording stopped - Duration: %dms (max duration reached)\n", duration);
         }
@@ -356,17 +549,25 @@ void loop() {
     // Auto-stop on silence (VAD)
     if (recordingActive && (millis() - lastVoiceActivityTime) > VAD_SILENCE_MS) {
         recordingActive = false;
-        currentLEDMode = LED_PROCESSING;
+        // Don't change LED mode if ambient sound is already active
+        if (!ambientSound.active) {
+            currentLEDMode = LED_PROCESSING;
+            processingStartTime = millis();
+        }
         Serial.println("⏹️  Recording stopped - Silence detected");
     }
     
-    // Auto-return to IDLE when playback finishes (no audio chunks for 2 seconds)
-    if (isPlayingResponse && (millis() - lastAudioChunkTime) > 2000) {
+    // Timeout PROCESSING mode if no response after 10 seconds
+    if (currentLEDMode == LED_PROCESSING && processingStartTime > 0 && (millis() - processingStartTime) > 10000) {
+        Serial.println("⚠️  Processing timeout - no response received, returning to IDLE");
+        currentLEDMode = LED_IDLE;
+    }
+    
+    // Auto-return to IDLE when Gemini playback finishes (no audio chunks for 2 seconds)
+    // NOTE: This should NOT trigger for ambient sounds - they may have gaps in streaming
+    if (isPlayingResponse && !isPlayingAmbient && (millis() - lastAudioChunkTime) > 2000) {
         isPlayingResponse = false;
-        // Clear LEDs before switching mode
-        fill_solid(leds, NUM_LEDS, CRGB::Black);
-        FastLED.show();
-        delay(50);  // Brief delay to ensure clean transition
+        Serial.println("⏹️  Audio playback complete (2s timeout)");
         
         // Priority: Timer > Moon > Tide > Ambient VU > Idle
         if (timerState.active) {
@@ -388,6 +589,20 @@ void loop() {
             currentLEDMode = LED_IDLE;
             Serial.println("✓ Audio playback complete - switching to IDLE");
         }
+    }
+    
+    // Check for ambient sound streaming completion
+    // When stream ends, return to IDLE mode (no looping)
+    if (isPlayingAmbient && ambientSound.active && !firstAudioChunk && 
+        (millis() - lastAudioChunkTime) > 7000) {
+        Serial.printf("✓ Ambient sound completed: %s - returning to IDLE\n", ambientSound.name.c_str());
+        
+        // Return to IDLE mode
+        currentLEDMode = LED_IDLE;
+        isPlayingAmbient = false;
+        isPlayingResponse = false;
+        ambientSound.active = false;
+        ambientSound.name = "";
     }
     
     delay(10);
@@ -627,6 +842,18 @@ void sendAudioChunk(uint8_t* data, size_t length) {
         return;
     }
     
+    // Check if we're sending too fast (> 100 chunks/sec = connection issues)
+    static uint32_t sendRateCheck = 0;
+    static uint32_t sendsSinceCheck = 0;
+    sendsSinceCheck++;
+    if (millis() - sendRateCheck >= 1000) {
+        if (sendsSinceCheck > 100) {
+            Serial.printf("[WS WARNING] High send rate: %u chunks/sec\n", sendsSinceCheck);
+        }
+        sendsSinceCheck = 0;
+        sendRateCheck = millis();
+    }
+    
     chunkCount++;
     if (chunkCount % 50 == 0) {
         Serial.printf("[WS] Sent %d audio chunks\n", chunkCount);
@@ -657,10 +884,17 @@ void sendAudioChunk(uint8_t* data, size_t length) {
     
     String output;
     serializeJson(doc, output);
-    webSocket.sendTXT(output);
-}
-
-// Track WebSocket stats
+    
+    // Send to WebSocket
+    bool sendResult = webSocket.sendTXT(output);
+    
+    if (sendResult) {
+        lastWebSocketSendTime = millis();
+    } else {
+        webSocketSendFailures++;
+        Serial.printf("[WS ERROR] Send failed! Total failures: %u\n", webSocketSendFailures);
+    }
+}// Track WebSocket stats
 static uint32_t disconnectCount = 0;
 static uint32_t lastDisconnectTime = 0;
 
@@ -680,7 +914,40 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 fill_solid(leds, NUM_LEDS, CRGB::Green);
                 FastLED.show();
                 delay(500);
-                currentLEDMode = LED_IDLE;
+                
+                // Resume ambient mode if it was active before disconnect
+                if (ambientSound.active && !ambientSound.name.isEmpty()) {
+                    Serial.printf("▶️  Resuming ambient sound: %s (seq %d)\n", 
+                                 ambientSound.name.c_str(), ambientSound.sequence);
+                    
+                    // Restore LED mode based on ambient sound
+                    if (ambientSound.name == "rain") {
+                        currentLEDMode = LED_AMBIENT_RAIN;
+                    } else if (ambientSound.name == "ocean") {
+                        currentLEDMode = LED_AMBIENT_OCEAN;
+                    } else if (ambientSound.name == "rainforest") {
+                        currentLEDMode = LED_AMBIENT_RAINFOREST;
+                    }
+                    
+                    // Request the ambient sound again
+                    JsonDocument ambientDoc;
+                    ambientDoc["action"] = "requestAmbient";
+                    ambientDoc["sound"] = ambientSound.name;
+                    ambientDoc["sequence"] = ambientSound.sequence;
+                    String ambientMsg;
+                    serializeJson(ambientDoc, ambientMsg);
+                    webSocket.sendTXT(ambientMsg);
+                    
+                    isPlayingAmbient = true;
+                    firstAudioChunk = true;
+                    lastAudioChunkTime = millis();
+                } else if (ambientVUMode) {
+                    // Resume VU meter mode
+                    currentLEDMode = LED_AMBIENT_VU;
+                    Serial.println("▶️  Resuming VU meter mode");
+                } else {
+                    currentLEDMode = LED_IDLE;
+                }
             }
             break;
             
@@ -691,19 +958,81 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             
         case WStype_BIN:
             {
-                // Ignore audio if response was interrupted
-                if (responseInterrupted) {
+                // Drain mode: silently discard all packets for 2s after stopping ambient
+                if (ambientSound.drainUntil > 0 && millis() < ambientSound.drainUntil) {
+                    // Silently discard - no logging to prevent spam
+                    static uint32_t drainCount = 0;
+                    static uint32_t lastDrainLog = 0;
+                    drainCount++;
+                    if (millis() - lastDrainLog > 1000) {
+                        Serial.printf("🚰 Draining buffered chunks... (%u drained so far)\n", drainCount);
+                        lastDrainLog = millis();
+                    }
+                    break;  // Discard this packet
+                }
+                
+                // Clear drain timer once period expires
+                if (ambientSound.drainUntil > 0 && millis() >= ambientSound.drainUntil) {
+                    Serial.println("✓ Drain complete - ready for new audio");
+                    ambientSound.drainUntil = 0;
+                }
+                
+                // Check for ambient sequence headers to filter out stale chunks
+                if (length >= 2 && payload != nullptr) {
+                    uint16_t chunkSequence = payload[0] | (payload[1] << 8);
+                    
+                    // Ambient chunks have sequence numbers 1-100
+                    // Gemini audio has random high values (not in this range)
+                    if (chunkSequence >= 1 && chunkSequence <= 100) {
+                        // This is an ambient chunk
+                        if (ambientSound.active && chunkSequence == ambientSound.sequence) {
+                            // Valid ambient chunk - strip header
+                            payload += 2;
+                            length -= 2;
+                        } else {
+                            // Stale ambient chunk (wrong sequence or ambient not active)
+                            // Rate-limit logging to prevent spam (max 5/second)
+                            static uint32_t lastDiscardLog = 0;
+                            static uint32_t discardsSinceLog = 0;
+                            discardsSinceLog++;
+                            
+                            if (millis() - lastDiscardLog > 1000) {
+                                if (discardsSinceLog > 0) {
+                                    Serial.printf("🚫 Discarded %u stale chunks (seq %d, active=%d, expected=%d)\n", 
+                                                 discardsSinceLog, chunkSequence, ambientSound.active, ambientSound.sequence);
+                                }
+                                discardsSinceLog = 0;
+                                lastDiscardLog = millis();
+                            }
+                            break;  // Discard this chunk
+                        }
+                    }
+                    // else: Gemini audio (no sequence header) - continue to play
+                }
+                
+                // Ignore audio if response was interrupted (but not for ambient sounds)
+                if (responseInterrupted && !isPlayingAmbient) {
                     Serial.println("🚫 Discarding audio chunk (response was interrupted)");
                     break;
                 }
                 
                 // Raw PCM audio data from server (16-bit mono samples)
-                // Play immediately with minimal processing
+                // This handles BOTH Gemini responses and ambient sounds
                 if (!isPlayingResponse) {
                     isPlayingResponse = true;
-                    turnComplete = false;  // New turn starting
+                    
+                    // Only reset turn state for non-ambient audio
+                    if (!isPlayingAmbient) {
+                        turnComplete = false;  // New Gemini turn starting
+                    }
+                    
                     recordingActive = false;  // Ensure recording is stopped
-                    currentLEDMode = LED_AUDIO_REACTIVE;
+                    
+                    // Set LED mode (ambient sounds set their own mode in ambientStart)
+                    if (!ambientSound.active) {
+                        currentLEDMode = LED_AUDIO_REACTIVE;
+                    }
+                    
                     firstAudioChunk = true;
                     // NOTE: Don't clear responseInterrupted here! Only clear it on turnComplete
                     // to prevent buffered chunks from interrupted response playing through
@@ -715,7 +1044,12 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                         audioLevelBuffer[i] = 0;
                     }
                     audioBufferIndex = 0;
-                    Serial.println("🔊 Starting audio playback...");
+                    
+                    if (isPlayingAmbient) {
+                        Serial.printf("🔊 Starting ambient audio stream: %s\n", ambientSound.name.c_str());
+                    } else {
+                        Serial.println("🔊 Starting audio playback...");
+                    }
                 }
                 
                 // Update last audio chunk time
@@ -774,7 +1108,21 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 }
                 
                 size_t bytes_written;
-                i2s_write(I2S_NUM_1, stereoBuffer, numSamples * 4, &bytes_written, portMAX_DELAY);
+                
+                // Determine if we should play this audio
+                // Play if: (1) Not in ambient mode (Gemini audio), OR (2) In ambient mode AND actively playing
+                bool shouldPlay = !ambientSound.active || (ambientSound.active && isPlayingAmbient);
+                
+                if (shouldPlay) {
+                    esp_err_t result = i2s_write(I2S_NUM_1, stereoBuffer, numSamples * 4, &bytes_written, portMAX_DELAY);
+                    
+                    if (result != ESP_OK || bytes_written < numSamples * 4) {
+                        Serial.printf("[I2S WARNING] Write issue: result=%d, requested=%d, written=%d\n", 
+                                     result, numSamples * 4, bytes_written);
+                    }
+                } else {
+                    bytes_written = numSamples * 4;  // Pretend we wrote it
+                }
             }
             break;
             
@@ -784,6 +1132,15 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             Serial.printf("✗ WebSocket Disconnected (#%d) - isPlaying=%d, recording=%d, uptime=%lus\n",
                          disconnectCount, isPlayingResponse, recordingActive, millis()/1000);
             isWebSocketConnected = false;
+            
+            // Pause ambient playback but keep mode state for resume on reconnect
+            if (isPlayingAmbient || ambientSound.active) {
+                Serial.printf("⏸️  Pausing ambient sound due to disconnect: %s (will resume)\n", ambientSound.name.c_str());
+                isPlayingAmbient = false;
+                isPlayingResponse = false;
+                // Keep ambientSound.active and name to resume on reconnect
+            }
+            
             // Play shutdown sound only once per disconnect session
             if (!shutdownSoundPlayed) {
                 playShutdownSound();
@@ -929,6 +1286,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
         currentLEDMode = LED_AUDIO_REACTIVE;
         isPlayingResponse = true;
         lastAudioChunkTime = millis();  // Reset audio timeout
+        processingStartTime = 0;  // Clear processing timeout
         Serial.println("✓ Ready for audio notification from Gemini...");
         return;
     }
@@ -1286,6 +1644,70 @@ void updateLEDs() {
             }
             break;
             
+        case LED_AMBIENT_RAIN:
+            // Falling rain effect - random blue drops falling down
+            {
+                static uint32_t lastDrop = 0;
+                static uint8_t dropBrightness[144] = {0};  // Track drop brightness (max LEDs)
+                
+                // Fade all LEDs
+                for (int i = 0; i < NUM_LEDS; i++) {
+                    leds[i].fadeToBlackBy(40);
+                }
+                
+                // Add new drops randomly
+                if (millis() - lastDrop > 100) {
+                    if (random(100) < 30) {  // 30% chance each 100ms
+                        int pos = random(NUM_LEDS);
+                        dropBrightness[pos] = 255;
+                    }
+                    lastDrop = millis();
+                }
+                
+                // Render drops
+                for (int i = 0; i < NUM_LEDS; i++) {
+                    if (dropBrightness[i] > 0) {
+                        leds[i] = CHSV(160, 255, dropBrightness[i]);  // Blue
+                        dropBrightness[i] = dropBrightness[i] * 0.85;  // Fade out
+                    }
+                }
+            }
+            break;
+            
+        case LED_AMBIENT_OCEAN:
+            // Swelling ocean waves - blue wave that rises and falls
+            {
+                float wave = (sin(millis() / 2000.0) + 1.0) / 2.0;  // 0.0 to 1.0
+                int numLit = (int)(wave * NUM_LEDS);
+                
+                for (int i = 0; i < NUM_LEDS; i++) {
+                    if (i < numLit) {
+                        // Gradient from deep blue to cyan
+                        uint8_t hue = 160 + (i * 10 / NUM_LEDS);  // 160-170 range
+                        uint8_t brightness = 150 + (i * 105 / NUM_LEDS);  // Brighter at top
+                        leds[i] = CHSV(hue, 255, brightness);
+                    } else {
+                        leds[i] = CRGB::Black;
+                    }
+                }
+            }
+            break;
+            
+        case LED_AMBIENT_RAINFOREST:
+            // Pulsing green canopy - gentle breathing effect
+            {
+                float pulse = 0.6 + 0.4 * sin(millis() / 3000.0);  // 0.6 to 1.0
+                uint8_t brightness = (uint8_t)(200 * pulse);
+                
+                for (int i = 0; i < NUM_LEDS; i++) {
+                    // Green with slight variation per LED
+                    uint8_t hue = 96 + (i * 2);  // Green range 96-114
+                    uint8_t sat = 220 + (i * 3);  // Varying saturation
+                    leds[i] = CHSV(hue, sat, brightness);
+                }
+            }
+            break;
+            
         case LED_CONNECTED:
             fill_solid(leds, NUM_LEDS, CHSV(128, 255, LED_BRIGHTNESS));
             break;
@@ -1299,9 +1721,33 @@ void updateLEDs() {
 
 // ============== FREERTOS TASKS ==============
 void websocketTask(void * parameter) {
+    static uint32_t lastConnCheck = 0;
+    static uint32_t lastHealthLog = 0;
     while(1) {
         webSocket.loop();
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+        
+        // Health monitoring every 10s
+        if (millis() - lastHealthLog > 10000) {
+            int32_t rssi = WiFi.RSSI();
+            uint32_t timeSinceLastSend = millis() - lastWebSocketSendTime;
+            Serial.printf("[WS Health] Connected=%d, WiFi=%d dBm, LastSend=%us ago, Failures=%u\n",
+                         isWebSocketConnected, rssi, timeSinceLastSend/1000, webSocketSendFailures);
+            lastHealthLog = millis();
+        }
+        
+        // Monitor WiFi connection and log if disconnected
+        if (millis() - lastConnCheck > 10000) {  // Check every 10s
+            if (WiFi.status() != WL_CONNECTED) {
+                Serial.printf("[WebSocket Task] WiFi disconnected! Status: %d\n", WiFi.status());
+            } else if (!isWebSocketConnected) {
+                Serial.printf("[WebSocket Task] WebSocket not connected. WiFi RSSI: %d dBm\n", WiFi.RSSI());
+            }
+            lastConnCheck = millis();
+        }
+        
+        // Reduced delay from 10ms to 5ms for faster WebSocket processing
+        // This ensures keepalive pings are sent promptly even during heavy audio streaming
+        vTaskDelay(5 / portTICK_PERIOD_MS);
     }
 }
 

@@ -43,6 +43,7 @@ interface ClientConnection {
   deviceId: string;
   lastFunctionResult?: any;
   pendingFunctionCallId?: string;
+  ambientStreamCancel?: (() => void) | null;
 }
 
 const connections = new Map<string, ClientConnection>();
@@ -631,7 +632,11 @@ console.log("🌤️  Fetching initial weather data...");
 fetchWeatherData().catch(err => console.error("❌ Failed to fetch initial weather data:", err));
 
 // Handle ESP32 device WebSocket connections
-Deno.serve({ port: 8000 }, (req) => {
+Deno.serve({ 
+  port: 8000,
+  // Increase idle timeout to prevent disconnects during audio streaming
+  idleTimeout: 120  // 120 seconds (default is 30-60s)
+}, (req) => {
   const url = new URL(req.url);
   
   // Health check endpoint
@@ -668,6 +673,87 @@ Deno.serve({ port: 8000 }, (req) => {
           return;
         }
         
+        // Handle ambient sound requests from ESP32
+        if (data.action === "requestAmbient") {
+          const soundName = data.sound || "rain";
+          const sequence = data.sequence || 0;
+          console.log(`[${deviceId}] Ambient sound requested: ${soundName} (sequence ${sequence})`);
+          
+          // Cancel any existing ambient stream for this connection
+          if (connection.ambientStreamCancel) {
+            connection.ambientStreamCancel();
+            console.log(`[${deviceId}] ✗ Cancelled previous ambient stream`);
+          }
+          
+          const audioPath = `./audio/${soundName}.pcm`;
+          
+          try {
+            // Create cancellation flag for this stream
+            let cancelled = false;
+            connection.ambientStreamCancel = () => { cancelled = true; };
+            
+            // Read and stream the PCM file with sequence header
+            const audioData = await Deno.readFile(audioPath);
+            console.log(`[${deviceId}] ✓ Loaded ${soundName}.pcm (${audioData.byteLength} bytes)`);
+            
+            // Stream with flow control
+            const CHUNK_SIZE = 1024;
+            const CHUNKS_PER_BATCH = 5;
+            const BATCH_DELAY_MS = 100;
+            
+            let position = 0;
+            let chunksInBatch = 0;
+            
+            while (position < audioData.byteLength && connection.socket.readyState === WebSocket.OPEN && !cancelled) {
+              const chunk = audioData.slice(position, Math.min(position + CHUNK_SIZE, audioData.byteLength));
+              
+              // Prepend 2-byte sequence number to each chunk
+              const sequenceBytes = new Uint8Array(2);
+              sequenceBytes[0] = sequence & 0xFF;  // Low byte
+              sequenceBytes[1] = (sequence >> 8) & 0xFF;  // High byte
+              
+              const chunkWithSequence = new Uint8Array(sequenceBytes.length + chunk.length);
+              chunkWithSequence.set(sequenceBytes, 0);
+              chunkWithSequence.set(chunk, sequenceBytes.length);
+              
+              connection.socket.send(chunkWithSequence);
+              
+              position += CHUNK_SIZE;
+              chunksInBatch++;
+              
+              if (chunksInBatch >= CHUNKS_PER_BATCH) {
+                await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
+                chunksInBatch = 0;
+              }
+            }
+            
+            if (cancelled) {
+              console.log(`[${deviceId}] ✗ Stream cancelled: ${soundName}.pcm (sequence ${sequence})`);
+            } else {
+              console.log(`[${deviceId}] ✓ Streamed ${soundName}.pcm (sequence ${sequence})`);
+            }
+            
+            // Clear cancellation handler if this stream completed
+            if (connection.ambientStreamCancel === connection.ambientStreamCancel) {
+              connection.ambientStreamCancel = null;
+            }
+          } catch (error) {
+            console.error(`[${deviceId}] ❌ Error loading ambient sound:`, error);
+          }
+          return;
+        }
+        
+        // Handle stop ambient request from ESP32
+        if (data.action === "stopAmbient") {
+          console.log(`[${deviceId}] ⏹️  Stop ambient sound requested`);
+          if (connection.ambientStreamCancel) {
+            connection.ambientStreamCancel();
+            connection.ambientStreamCancel = null;
+            console.log(`[${deviceId}] ✓ Ambient stream stopped`);
+          }
+          return;
+        }
+        
         // Handle function response from ESP32 - forward to Gemini
         if (data.type === "functionResponse") {
           console.log(`[${deviceId}] Function response: ${data.name} =`, data.result);
@@ -700,6 +786,7 @@ Deno.serve({ port: 8000 }, (req) => {
     
     socket.onclose = () => {
       console.log(`[${deviceId}] Device disconnected`);
+      
       if (connection.geminiSocket) {
         connection.geminiSocket.close();
       }
@@ -1097,7 +1184,7 @@ async function connectToGemini(connection: ClientConnection) {
               // Send raw PCM in larger chunks (1024 bytes) with no delay
               const chunkSize = 1024;
               const numChunks = Math.ceil(pcmData.length / chunkSize);
-              console.log(`[${connection.deviceId}] → ESP32 PCM: ${pcmData.length} bytes in ${numChunks} chunks`);
+              console.log(`[${connection.deviceId}] 📤 ESP32 PCM: ${pcmData.length} bytes in ${numChunks} chunks`);
               
               for (let i = 0; i < pcmData.length; i += chunkSize) {
                 const chunk = pcmData.slice(i, Math.min(i + chunkSize, pcmData.length));
@@ -1136,6 +1223,7 @@ async function connectToGemini(connection: ClientConnection) {
       console.log(`[${connection.deviceId}] Gemini connection closed - code: ${event.code}, reason: "${event.reason}", wasClean: ${event.wasClean}`);
       connection.geminiSocket = null;
       
+      // Don't auto-reconnect if ambient sound is playing - we don't need Gemini for that
       // Auto-reconnect after 1 second if ESP32 is still connected
       if (connections.has(connection.deviceId)) {
         console.log(`[${connection.deviceId}] Scheduling Gemini reconnection in 1s...`);

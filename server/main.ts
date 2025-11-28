@@ -707,16 +707,19 @@ Deno.serve({
             while (position < audioData.byteLength && connection.socket.readyState === WebSocket.OPEN && !cancelled) {
               const chunk = audioData.slice(position, Math.min(position + CHUNK_SIZE, audioData.byteLength));
               
-              // Prepend 2-byte sequence number to each chunk
-              const sequenceBytes = new Uint8Array(2);
-              sequenceBytes[0] = sequence & 0xFF;  // Low byte
-              sequenceBytes[1] = (sequence >> 8) & 0xFF;  // High byte
+              // Prepend 4-byte magic header: [0xA5, 0x5A, sequence_low, sequence_high]
+              // Magic bytes 0xA5 0x5A prevent false positive detection from Gemini PCM audio
+              const header = new Uint8Array(4);
+              header[0] = 0xA5;  // Magic byte 1
+              header[1] = 0x5A;  // Magic byte 2
+              header[2] = sequence & 0xFF;  // Sequence low byte
+              header[3] = (sequence >> 8) & 0xFF;  // Sequence high byte
               
-              const chunkWithSequence = new Uint8Array(sequenceBytes.length + chunk.length);
-              chunkWithSequence.set(sequenceBytes, 0);
-              chunkWithSequence.set(chunk, sequenceBytes.length);
+              const chunkWithHeader = new Uint8Array(header.length + chunk.length);
+              chunkWithHeader.set(header, 0);
+              chunkWithHeader.set(chunk, header.length);
               
-              connection.socket.send(chunkWithSequence);
+              connection.socket.send(chunkWithHeader);
               
               position += CHUNK_SIZE;
               chunksInBatch++;

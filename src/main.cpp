@@ -977,38 +977,35 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     ambientSound.drainUntil = 0;
                 }
                 
-                // Check for ambient sequence headers to filter out stale chunks
-                if (length >= 2 && payload != nullptr) {
-                    uint16_t chunkSequence = payload[0] | (payload[1] << 8);
+                // Check for ambient magic header + sequence number
+                // Magic bytes 0xA5 0x5A are very unlikely to appear in PCM audio
+                if (length >= 4 && payload != nullptr && payload[0] == 0xA5 && payload[1] == 0x5A) {
+                    // This has ambient magic header - extract sequence number
+                    uint16_t chunkSequence = payload[2] | (payload[3] << 8);
                     
-                    // Ambient chunks have sequence numbers 1-100
-                    // Gemini audio has random high values (not in this range)
-                    if (chunkSequence >= 1 && chunkSequence <= 100) {
-                        // This is an ambient chunk
-                        if (ambientSound.active && chunkSequence == ambientSound.sequence) {
-                            // Valid ambient chunk - strip header
-                            payload += 2;
-                            length -= 2;
-                        } else {
-                            // Stale ambient chunk (wrong sequence or ambient not active)
-                            // Rate-limit logging to prevent spam (max 5/second)
-                            static uint32_t lastDiscardLog = 0;
-                            static uint32_t discardsSinceLog = 0;
-                            discardsSinceLog++;
-                            
-                            if (millis() - lastDiscardLog > 1000) {
-                                if (discardsSinceLog > 0) {
-                                    Serial.printf("🚫 Discarded %u stale chunks (seq %d, active=%d, expected=%d)\n", 
-                                                 discardsSinceLog, chunkSequence, ambientSound.active, ambientSound.sequence);
-                                }
-                                discardsSinceLog = 0;
-                                lastDiscardLog = millis();
+                    if (ambientSound.active && chunkSequence == ambientSound.sequence) {
+                        // Valid ambient chunk - strip magic header + sequence
+                        payload += 4;
+                        length -= 4;
+                    } else {
+                        // Stale ambient chunk (wrong sequence or ambient not active)
+                        // Rate-limit logging to prevent spam (max 1/second)
+                        static uint32_t lastDiscardLog = 0;
+                        static uint32_t discardsSinceLog = 0;
+                        discardsSinceLog++;
+                        
+                        if (millis() - lastDiscardLog > 1000) {
+                            if (discardsSinceLog > 0) {
+                                Serial.printf("🚫 Discarded %u stale ambient chunks (seq %d, active=%d, expected=%d)\n", 
+                                             discardsSinceLog, chunkSequence, ambientSound.active, ambientSound.sequence);
                             }
-                            break;  // Discard this chunk
+                            discardsSinceLog = 0;
+                            lastDiscardLog = millis();
                         }
+                        break;  // Discard this chunk
                     }
-                    // else: Gemini audio (no sequence header) - continue to play
                 }
+                // else: Gemini audio (no magic header) - continue to play
                 
                 // Ignore audio if response was interrupted (but not for ambient sounds)
                 if (responseInterrupted && !isPlayingAmbient) {

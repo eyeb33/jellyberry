@@ -8,6 +8,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <time.h>
+#include <lwip/sockets.h>
 #include "Config.h"
 
 // Opus codec
@@ -34,10 +35,14 @@ uint32_t lastAudioChunkTime = 0;  // Track when we last received audio
 uint32_t processingStartTime = 0;  // Track when PROCESSING mode started
 uint32_t lastWebSocketSendTime = 0;  // Track last successful send
 uint32_t webSocketSendFailures = 0;  // Count send failures
+uint32_t lastWiFiCheck = 0;  // Track WiFi health monitoring
+int32_t lastRSSI = 0;  // Track signal strength changes
 bool firstAudioChunk = true;
 float volumeMultiplier = 0.25f;  // Volume control (25% for testing)
 int32_t currentAudioLevel = 0;  // Current audio amplitude for VU meter
 float smoothedAudioLevel = 0.0f;  // Smoothed audio level for stable VU meter
+bool conversationMode = false;  // Track if we're in conversation window
+uint32_t conversationWindowStart = 0;  // Timestamp when conversation window opened
 
 // Audio level delay buffer for LED sync (compensates for I2S buffer latency)
 #define AUDIO_DELAY_BUFFER_SIZE 12  // ~360ms delay to match I2S playback buffer + speaker latency
@@ -61,7 +66,7 @@ struct AudioChunk {
     size_t length;
 };
 
-enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU, LED_AMBIENT_RAIN, LED_AMBIENT_OCEAN, LED_AMBIENT_RAINFOREST };
+enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU, LED_AMBIENT_RAIN, LED_AMBIENT_OCEAN, LED_AMBIENT_RAINFOREST, LED_CONVERSATION_WINDOW };
 LEDMode currentLEDMode = LED_BOOT;
 bool ambientVUMode = false;  // Toggle for ambient sound VU meter mode
 
@@ -330,8 +335,11 @@ void setup() {
     
     webSocket.onEvent(onWebSocketEvent);
     webSocket.setReconnectInterval(WS_RECONNECT_INTERVAL);
-    webSocket.enableHeartbeat(15000, 3000, 2);  // Ping every 15s, timeout 3s, 2 retries (faster detection)
+    webSocket.enableHeartbeat(10000, 3000, 2);  // Ping every 10s, timeout 3s, 2 retries (more aggressive keepalive)
     Serial.println("✓ WebSocket initialized with keepalive");
+    
+    // Note: TCP buffer sizes are controlled by lwIP configuration, not runtime changeable
+    Serial.println("✓ Using default TCP buffers (configured in sdkconfig)");
 
     // Start FreeRTOS tasks
     // WebSocket needs high priority (3) and larger stack for heavy audio streaming
@@ -569,25 +577,39 @@ void loop() {
         isPlayingResponse = false;
         Serial.println("⏹️  Audio playback complete (2s timeout)");
         
-        // Priority: Timer > Moon > Tide > Ambient VU > Idle
-        if (timerState.active) {
-            currentLEDMode = LED_TIMER;
-            Serial.println("✓ Audio playback complete - switching to TIMER display");
-        } else if (moonState.active) {
-            currentLEDMode = LED_MOON;
-            moonState.displayStartTime = millis();
-            Serial.println("✓ Audio playback complete - switching to MOON display");
-        } else if (tideState.active) {
-            currentLEDMode = LED_TIDE;
-            tideState.displayStartTime = millis();
-            Serial.printf("✓ Audio playback complete - switching to TIDE display (state=%s, level=%.2f)\n", 
-                         tideState.state.c_str(), tideState.waterLevel);
-        } else if (ambientVUMode) {
-            currentLEDMode = LED_AMBIENT_VU;
-            Serial.println("✓ Audio playback complete - returning to AMBIENT VU mode");
+        // Check if turn is complete - if so, open conversation window
+        if (turnComplete) {
+            // Start conversation window for follow-up questions
+            conversationMode = true;
+            conversationWindowStart = millis();
+            currentLEDMode = LED_CONVERSATION_WINDOW;
+            
+            // Clear any visualization states - conversation mode takes priority
+            moonState.active = false;
+            tideState.active = false;
+            
+            Serial.println("💬 Conversation window opened - speak anytime in next 10 seconds");
         } else {
-            currentLEDMode = LED_IDLE;
-            Serial.println("✓ Audio playback complete - switching to IDLE");
+            // Priority: Timer > Moon > Tide > Ambient VU > Idle
+            if (timerState.active) {
+                currentLEDMode = LED_TIMER;
+                Serial.println("✓ Audio playback complete - switching to TIMER display");
+            } else if (moonState.active) {
+                currentLEDMode = LED_MOON;
+                moonState.displayStartTime = millis();
+                Serial.println("✓ Audio playback complete - switching to MOON display");
+            } else if (tideState.active) {
+                currentLEDMode = LED_TIDE;
+                tideState.displayStartTime = millis();
+                Serial.printf("✓ Audio playback complete - switching to TIDE display (state=%s, level=%.2f)\n", 
+                             tideState.state.c_str(), tideState.waterLevel);
+            } else if (ambientVUMode) {
+                currentLEDMode = LED_AMBIENT_VU;
+                Serial.println("✓ Audio playback complete - returning to AMBIENT VU mode");
+            } else {
+                currentLEDMode = LED_IDLE;
+                Serial.println("✓ Audio playback complete - switching to IDLE");
+            }
         }
     }
     
@@ -603,6 +625,47 @@ void loop() {
         isPlayingResponse = false;
         ambientSound.active = false;
         ambientSound.name = "";
+    }
+    
+    // Conversation window monitoring
+    if (conversationMode && !isPlayingResponse && !recordingActive) {
+        uint32_t elapsed = millis() - conversationWindowStart;
+        
+        if (elapsed < CONVERSATION_WINDOW_MS) {
+            // Window is open - check for voice activity
+            static int16_t windowBuffer[320];  // 20ms at 16kHz for quick VAD check
+            size_t bytes_read = 0;
+            
+            esp_err_t result = i2s_read(I2S_NUM_0, windowBuffer, sizeof(windowBuffer), &bytes_read, 10);
+            
+            if (result == ESP_OK && bytes_read > 0) {
+                size_t samples_read = bytes_read / sizeof(int16_t);
+                
+                // Calculate amplitude
+                int32_t sum = 0;
+                for (size_t i = 0; i < samples_read; i++) {
+                    sum += abs(windowBuffer[i]);
+                }
+                int32_t avgAmplitude = sum / samples_read;
+                
+                // Use lower threshold during conversation window for faster response
+                if (samples_read > 0 && avgAmplitude > VAD_CONVERSATION_THRESHOLD) {
+                    // Voice detected! Start recording immediately
+                    Serial.println("🎤 Voice detected in conversation window - starting recording");
+                    conversationMode = false;  // Exit window mode
+                    recordingActive = true;
+                    recordingStartTime = millis();
+                    lastVoiceActivityTime = millis();
+                    currentLEDMode = LED_RECORDING;
+                    lastDebounceTime = millis();  // Reset debounce to prevent immediate stop
+                }
+            }
+        } else {
+            // Window expired with no voice - return to idle
+            Serial.println("💬 Conversation window expired - returning to IDLE");
+            conversationMode = false;
+            currentLEDMode = LED_IDLE;
+        }
     }
     
     delay(10);
@@ -1187,6 +1250,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
         turnComplete = true;  // Mark turn as finished
         // Don't change LED mode here - let the audio finish playing naturally
         // isPlayingResponse will be set to false when audio actually stops
+        // Conversation window will open after audio completes
         
         // Clear interrupt flag - old turn is done, ready for new response
         if (responseInterrupted) {
@@ -1705,6 +1769,43 @@ void updateLEDs() {
             }
             break;
             
+        case LED_CONVERSATION_WINDOW:
+            // Progress bar countdown - shows remaining conversation window time
+            {
+                if (conversationMode) {
+                    uint32_t elapsed = millis() - conversationWindowStart;
+                    uint32_t remaining = CONVERSATION_WINDOW_MS - elapsed;
+                    
+                    if (remaining > 0) {
+                        // Calculate number of LEDs to light based on remaining time
+                        float progress = (float)remaining / (float)CONVERSATION_WINDOW_MS;
+                        int numLEDs = (int)(progress * NUM_LEDS);
+                        
+                        // Pulse effect in final 3 seconds for urgency
+                        uint8_t brightness = 255;
+                        if (remaining < 3000) {
+                            float pulse = 0.5 + 0.5 * sin(millis() / 150.0);
+                            brightness = (uint8_t)(255 * pulse);
+                        }
+                        
+                        // Cyan color for conversation listening mode
+                        for (int i = 0; i < NUM_LEDS; i++) {
+                            if (i < numLEDs) {
+                                leds[i] = CHSV(160, 200, brightness);  // Cyan
+                            } else {
+                                leds[i] = CRGB::Black;
+                            }
+                        }
+                    } else {
+                        // Window expired - clear LEDs
+                        fill_solid(leds, NUM_LEDS, CRGB::Black);
+                    }
+                } else {
+                    fill_solid(leds, NUM_LEDS, CRGB::Black);
+                }
+            }
+            break;
+            
         case LED_CONNECTED:
             fill_solid(leds, NUM_LEDS, CHSV(128, 255, LED_BRIGHTNESS));
             break;
@@ -1723,21 +1824,35 @@ void websocketTask(void * parameter) {
     while(1) {
         webSocket.loop();
         
-        // Health monitoring every 10s
-        if (millis() - lastHealthLog > 10000) {
+        // Health monitoring every 5s (more frequent for weak signal detection)
+        if (millis() - lastHealthLog > 5000) {
             int32_t rssi = WiFi.RSSI();
             uint32_t timeSinceLastSend = millis() - lastWebSocketSendTime;
+            
+            // Warn if signal is degrading rapidly
+            if (lastRSSI != 0 && (lastRSSI - rssi) > 10) {
+                Serial.printf("⚠️  WiFi signal dropped %d dBm! (%d → %d)\n", lastRSSI - rssi, lastRSSI, rssi);
+            }
+            
             Serial.printf("[WS Health] Connected=%d, WiFi=%d dBm, LastSend=%us ago, Failures=%u\n",
                          isWebSocketConnected, rssi, timeSinceLastSend/1000, webSocketSendFailures);
+            lastRSSI = rssi;
             lastHealthLog = millis();
+            
+            // Attempt to reconnect WiFi if signal is very poor but still connected
+            if (rssi < -80 && WiFi.status() == WL_CONNECTED) {
+                Serial.println("⚠️  Very weak signal detected - WiFi may drop soon");
+            }
         }
         
-        // Monitor WiFi connection and log if disconnected
-        if (millis() - lastConnCheck > 10000) {  // Check every 10s
+        // Monitor WiFi connection and attempt reconnection if needed
+        if (millis() - lastConnCheck > 5000) {  // Check every 5s (more frequent)
             if (WiFi.status() != WL_CONNECTED) {
-                Serial.printf("[WebSocket Task] WiFi disconnected! Status: %d\n", WiFi.status());
+                Serial.printf("[WebSocket Task] WiFi disconnected! Status: %d - Attempting reconnect...\n", WiFi.status());
+                WiFi.reconnect();
             } else if (!isWebSocketConnected) {
-                Serial.printf("[WebSocket Task] WebSocket not connected. WiFi RSSI: %d dBm\n", WiFi.RSSI());
+                int32_t rssi = WiFi.RSSI();
+                Serial.printf("[WebSocket Task] WebSocket not connected. WiFi RSSI: %d dBm\n", rssi);
             }
             lastConnCheck = millis();
         }

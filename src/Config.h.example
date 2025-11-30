@@ -38,11 +38,11 @@
 #define MAX_AUDIO_BUFFER_SIZE 32768
 #define SPEAKER_SAMPLE_RATE 24000
 
-// Opus Codec Configuration
-#define OPUS_SAMPLE_RATE 16000
-#define OPUS_BITRATE 16000
-#define OPUS_COMPLEXITY 5
-#define OPUS_FRAME_SIZE 320
+// PCM Streaming Configuration (no codec - raw PCM)
+// Mic: 16-bit PCM @ 16kHz mono → server
+// Speaker: 16-bit PCM @ 24kHz mono ← server
+#define PCM_CHUNK_SIZE 1920  // 960 samples * 2 bytes = 40ms at 24kHz
+#define MIC_FRAME_SIZE 320  // 320 samples @ 16kHz = 20ms chunks for mic recording
 
 // VAD (Voice Activity Detection)
 #define VAD_THRESHOLD 1200

@@ -25,6 +25,28 @@ const WEATHER_CACHE_DURATION_MS = 30 * 60 * 1000; // 30 minutes
 // Track which devices have received their first boot greeting
 const deviceFirstBoot = new Map<string, boolean>();
 
+// Helper function to decode WebSocket close codes
+function getCloseCodeDescription(code: number): string {
+  const codes: Record<number, string> = {
+    1000: "Normal Closure",
+    1001: "Going Away",
+    1002: "Protocol Error",
+    1003: "Unsupported Data",
+    1005: "No Status Received",
+    1006: "Abnormal Closure",
+    1007: "Invalid frame payload data",
+    1008: "Policy Violation",
+    1009: "Message Too Big",
+    1010: "Mandatory Extension",
+    1011: "Internal Server Error",
+    1012: "Service Restart",
+    1013: "Try Again Later",
+    1014: "Bad Gateway",
+    1015: "TLS Handshake"
+  };
+  return codes[code] || "Unknown";
+}
+
 // Debug: Check if API key is loaded
 console.log(`[DEBUG] GEMINI_API_KEY loaded: ${GEMINI_API_KEY ? "YES (" + GEMINI_API_KEY.substring(0, 10) + "...)" : "NO - EMPTY!"}`);
 
@@ -44,6 +66,13 @@ interface ClientConnection {
   lastFunctionResult?: any;
   pendingFunctionCallId?: string;
   ambientStreamCancel?: (() => void) | null;
+  
+  // Session tracking for diagnostics
+  geminiConnectedAt?: number;  // Timestamp when Gemini connected
+  geminiMessageCount?: number;  // Total messages received from Gemini
+  audioChunkCount?: number;     // Total audio chunks received
+  lastAudioChunkTime?: number;  // Timestamp of last audio chunk
+  lastMessageType?: string;     // Type of last message received
 }
 
 const connections = new Map<string, ClientConnection>();
@@ -649,12 +678,15 @@ Deno.serve({
     const { socket, response } = Deno.upgradeWebSocket(req);
     const deviceId = url.searchParams.get("device_id") || crypto.randomUUID();
     
-    console.log(`[${deviceId}] Device connected`);
+    const activeConnections = connections.size;
+    console.log(`[${deviceId}] 🔌 ESP32 connected (active connections: ${activeConnections + 1})`);
     
     const connection: ClientConnection = {
       socket,
       geminiSocket: null,
       deviceId,
+      geminiMessageCount: 0,
+      audioChunkCount: 0,
     };
     
     connections.set(deviceId, connection);
@@ -666,6 +698,15 @@ Deno.serve({
     socket.onmessage = async (event) => {
       try {
         const data = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
+        
+        // Log message type for diagnostics (skip binary audio data to reduce noise)
+        if (typeof event.data === "string") {
+          const msgType = data.type || data.action || "unknown";
+          // Only log if not a realtimeInput (audio) message to reduce spam
+          if (msgType !== "unknown" || !data.realtimeInput) {
+            console.log(`[${deviceId}] 📨 ESP32 message: ${msgType}`);
+          }
+        }
         
         // Setup message - establish Gemini connection
         if (data.type === "setup" || (!connection.geminiSocket && typeof event.data === "string")) {
@@ -776,10 +817,12 @@ Deno.serve({
           }
           connection.geminiSocket.send(event.data);
         } else {
-          console.error(`[${deviceId}] Gemini not connected, buffering...`);
+          const state = connection.geminiSocket ? `state=${connection.geminiSocket.readyState}` : "null";
+          console.error(`[${deviceId}] ⚠️  Cannot forward to Gemini (${state})`);
         }
       } catch (error) {
-        console.error(`[${deviceId}] Error processing message:`, error);
+        console.error(`[${deviceId}] ❌ Error processing ESP32 message:`, error);
+        console.error(`[${deviceId}] Error stack:`, error instanceof Error ? error.stack : "no stack");
       }
     };
     
@@ -788,12 +831,18 @@ Deno.serve({
     };
     
     socket.onclose = () => {
-      console.log(`[${deviceId}] Device disconnected`);
+      const sessionDuration = connection.geminiConnectedAt 
+        ? ((Date.now() - connection.geminiConnectedAt) / 1000).toFixed(1)
+        : "N/A";
+      const stats = `msgs=${connection.geminiMessageCount || 0}, audio=${connection.audioChunkCount || 0}, duration=${sessionDuration}s`;
+      console.log(`[${deviceId}] 🔌 ESP32 disconnected (${stats})`);
       
       if (connection.geminiSocket) {
+        console.log(`[${deviceId}] Closing Gemini socket (state=${connection.geminiSocket.readyState})`);
         connection.geminiSocket.close();
       }
       connections.delete(deviceId);
+      console.log(`[${deviceId}] Cleanup complete (active connections: ${connections.size})`);
     };
     
     return response;
@@ -819,7 +868,11 @@ async function connectToGemini(connection: ClientConnection) {
     connection.geminiSocket = new WebSocket(wsUrl);
     
     connection.geminiSocket.onopen = () => {
-      console.log(`[${connection.deviceId}] Connected to Gemini`);
+      connection.geminiConnectedAt = Date.now();
+      console.log(`[${connection.deviceId}] ✅ Gemini CONNECTED at ${new Date().toISOString()}`);
+      
+      // Raw PCM streaming - no codec initialization needed
+      console.log(`[${connection.deviceId}] 🎵 Audio pipeline: Raw PCM (24kHz, mono, 16-bit)`);
       
       // Send setup message to Gemini with function declarations
       const setupMessage = {
@@ -941,8 +994,25 @@ async function connectToGemini(connection: ClientConnection) {
         
         const json = JSON.parse(rawData);
         
-        // Log ALL messages for debugging
-        console.log(`[${connection.deviceId}] ← Gemini message:`, JSON.stringify(json).substring(0, 200));
+        // Track message statistics
+        connection.geminiMessageCount = (connection.geminiMessageCount || 0) + 1;
+        const msgNum = connection.geminiMessageCount;
+        const timeSinceConnect = connection.geminiConnectedAt 
+          ? ((Date.now() - connection.geminiConnectedAt) / 1000).toFixed(1)
+          : "N/A";
+        
+        // Determine message type for logging
+        let msgType = "unknown";
+        if (json.setupComplete) msgType = "setupComplete";
+        else if (json.toolCall) msgType = "toolCall";
+        else if (json.serverContent?.modelTurn) msgType = "modelTurn";
+        else if (json.serverContent?.turnComplete) msgType = "turnComplete";
+        
+        connection.lastMessageType = msgType;
+        
+        // Log message with timing info
+        const preview = JSON.stringify(json).substring(0, 150);
+        console.log(`[${connection.deviceId}] 📩 Gemini #${msgNum} [${msgType}] @${timeSinceConnect}s: ${preview}${json.serverContent ? '...' : ''}`);
         
         // Handle setup complete
         if (json.setupComplete) {
@@ -1175,24 +1245,42 @@ async function connectToGemini(connection: ClientConnection) {
             if (part.inlineData?.data) {
               const base64Audio = part.inlineData.data;
               const mimeType = part.inlineData.mimeType || "unknown";
-              console.log(`[${connection.deviceId}] Audio: ${base64Audio.length} chars base64, mimeType: ${mimeType}`);
               
-              // Decode base64 to raw PCM bytes
+              // Track audio chunk statistics
+              connection.audioChunkCount = (connection.audioChunkCount || 0) + 1;
+              const now = Date.now();
+              const gapMs = connection.lastAudioChunkTime ? (now - connection.lastAudioChunkTime) : 0;
+              connection.lastAudioChunkTime = now;
+              
+              const chunkNum = connection.audioChunkCount;
+              console.log(`[${connection.deviceId}] 🔊 Audio chunk #${chunkNum}: ${base64Audio.length} chars base64, gap=${gapMs}ms, mimeType=${mimeType}`);
+              
+              // Decode base64 to raw PCM bytes (16-bit little-endian)
               const binaryString = atob(base64Audio);
-              const pcmData = new Uint8Array(binaryString.length);
+              const pcmBytes = new Uint8Array(binaryString.length);
               for (let i = 0; i < binaryString.length; i++) {
-                pcmData[i] = binaryString.charCodeAt(i);
+                pcmBytes[i] = binaryString.charCodeAt(i);
               }
               
-              // Send raw PCM in larger chunks (1024 bytes) with no delay
-              const chunkSize = 1024;
-              const numChunks = Math.ceil(pcmData.length / chunkSize);
-              console.log(`[${connection.deviceId}] 📤 ESP32 PCM: ${pcmData.length} bytes in ${numChunks} chunks`);
+              // Stream raw PCM directly to ESP32 without encoding
+              // PCM is already 16-bit little-endian mono at 24kHz from Gemini
+              const CHUNK_SIZE = 1920;  // 960 samples * 2 bytes = 40ms chunks
               
-              for (let i = 0; i < pcmData.length; i += chunkSize) {
-                const chunk = pcmData.slice(i, Math.min(i + chunkSize, pcmData.length));
+              let totalBytesSent = 0;
+              let chunksInThisPart = 0;
+              
+              // Send PCM in fixed-size chunks - no artificial delays
+              // Let TCP/WebSocket handle flow control naturally
+              for (let offset = 0; offset < pcmBytes.length; offset += CHUNK_SIZE) {
+                const chunkEnd = Math.min(offset + CHUNK_SIZE, pcmBytes.length);
+                const chunk = pcmBytes.subarray(offset, chunkEnd);
+                
                 connection.socket.send(chunk);
+                totalBytesSent += chunk.length;
+                chunksInThisPart++;
               }
+              
+              console.log(`[${connection.deviceId}] 📤 ESP32 Raw PCM: ${totalBytesSent} bytes in ${chunksInThisPart} chunks (${(totalBytesSent / 2 / 24000 * 1000).toFixed(0)}ms audio)`);
             }
             
             // Handle text responses
@@ -1210,12 +1298,23 @@ async function connectToGemini(connection: ClientConnection) {
         }
         
       } catch (error) {
-        console.error(`[${connection.deviceId}] Error processing message:`, error);
+        console.error(`[${connection.deviceId}] ❌ Error processing Gemini message:`, error);
+        console.error(`[${connection.deviceId}] Error type: ${error instanceof Error ? error.name : typeof error}`);
+        console.error(`[${connection.deviceId}] Error message: ${error instanceof Error ? error.message : String(error)}`);
+        console.error(`[${connection.deviceId}] Stack trace:`, error instanceof Error ? error.stack : "no stack");
+        console.error(`[${connection.deviceId}] Last message type: ${connection.lastMessageType || "none"}`);
+        console.error(`[${connection.deviceId}] Session duration: ${connection.geminiConnectedAt ? ((Date.now() - connection.geminiConnectedAt) / 1000).toFixed(1) : "N/A"}s`);
       }
     };
     
     connection.geminiSocket.onerror = (error) => {
-      console.error(`[${connection.deviceId}] Gemini WebSocket error:`, error);
+      const sessionDuration = connection.geminiConnectedAt 
+        ? ((Date.now() - connection.geminiConnectedAt) / 1000).toFixed(1)
+        : "N/A";
+      console.error(`[${connection.deviceId}] ⚠️  Gemini WebSocket ERROR after ${sessionDuration}s:`, error);
+      console.error(`[${connection.deviceId}] Error details: ${JSON.stringify(error)}`);
+      console.error(`[${connection.deviceId}] Session stats: msgs=${connection.geminiMessageCount || 0}, audio=${connection.audioChunkCount || 0}`);
+      
       connection.socket.send(JSON.stringify({ 
         type: "error",
         message: "Gemini connection error" 
@@ -1223,28 +1322,47 @@ async function connectToGemini(connection: ClientConnection) {
     };
     
     connection.geminiSocket.onclose = (event) => {
-      console.log(`[${connection.deviceId}] Gemini connection closed - code: ${event.code}, reason: "${event.reason}", wasClean: ${event.wasClean}`);
+      const sessionDuration = connection.geminiConnectedAt 
+        ? ((Date.now() - connection.geminiConnectedAt) / 1000).toFixed(1)
+        : "N/A";
+      const stats = `msgs=${connection.geminiMessageCount || 0}, audio=${connection.audioChunkCount || 0}, lastMsg=${connection.lastMessageType || "none"}`;
+      
+      console.log(`[${connection.deviceId}] ❌ Gemini CLOSED after ${sessionDuration}s`);
+      console.log(`[${connection.deviceId}]    Code: ${event.code} (${getCloseCodeDescription(event.code)})`);
+      console.log(`[${connection.deviceId}]    Reason: "${event.reason || "(empty)"}"`);
+      console.log(`[${connection.deviceId}]    WasClean: ${event.wasClean}`);
+      console.log(`[${connection.deviceId}]    Stats: ${stats}`);
+      console.log(`[${connection.deviceId}]    ESP32 state: ${connection.socket.readyState} (${connection.socket.readyState === WebSocket.OPEN ? "OPEN" : "CLOSED"})`);
+      
       connection.geminiSocket = null;
       
       // Don't auto-reconnect if ambient sound is playing - we don't need Gemini for that
       // Auto-reconnect after 1 second if ESP32 is still connected
       if (connections.has(connection.deviceId)) {
-        console.log(`[${connection.deviceId}] Scheduling Gemini reconnection in 1s...`);
+        console.log(`[${connection.deviceId}] ⏳ Scheduling Gemini reconnection in 1s (ESP32 still connected)...`);
         setTimeout(() => {
           if (connections.has(connection.deviceId) && !connection.geminiSocket) {
-            console.log(`[${connection.deviceId}] Auto-reconnecting to Gemini...`);
+            console.log(`[${connection.deviceId}] 🔄 Attempting Gemini reconnection...`);
+            // Reset statistics for new session
+            connection.geminiMessageCount = 0;
+            connection.audioChunkCount = 0;
+            connection.lastMessageType = undefined;
+            connection.lastAudioChunkTime = undefined;
             connectToGemini(connection);
+          } else {
+            console.log(`[${connection.deviceId}] ⚠️  Reconnection cancelled (ESP32 gone or Gemini already connected)`);
           }
         }, 1000);
+      } else {
+        console.log(`[${connection.deviceId}] ℹ️  No reconnection (ESP32 disconnected)`);
       }
     };
     
-    connection.geminiSocket.onerror = (error) => {
-      console.error(`[${connection.deviceId}] Gemini WebSocket error:`, error);
-    };
     
   } catch (error) {
-    console.error(`[${connection.deviceId}] Failed to connect to Gemini:`, error);
+    console.error(`[${connection.deviceId}] ❌ Failed to establish Gemini connection:`, error);
+    console.error(`[${connection.deviceId}] Error type: ${error instanceof Error ? error.name : typeof error}`);
+    console.error(`[${connection.deviceId}] Error message: ${error instanceof Error ? error.message : String(error)}`);
     connection.socket.send(JSON.stringify({ 
       type: "error",
       message: "Failed to connect to Gemini API" 

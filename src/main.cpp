@@ -11,11 +11,6 @@
 #include <lwip/sockets.h>
 #include "Config.h"
 
-// Opus codec
-extern "C" {
-    #include "opus.h"
-}
-
 // ============== GLOBAL STATE ==============
 WiFiClientSecure wifiClient;
 WebSocketsClient webSocket;
@@ -54,13 +49,11 @@ TaskHandle_t websocketTaskHandle = NULL;
 TaskHandle_t ledTaskHandle = NULL;
 TaskHandle_t audioTaskHandle = NULL;
 
-// Opus encoder/decoder handles
-OpusEncoder *encoder = NULL;
-OpusDecoder *decoder = NULL;
+// Audio processing (raw PCM - no codec needed)
 
 // Audio buffers
 QueueHandle_t audioOutputQueue;   // Queue for playback audio
-#define AUDIO_QUEUE_SIZE 30
+#define AUDIO_QUEUE_SIZE 30  // 30 packets = ~1.2s buffer (good jitter tolerance with paced delivery)
 
 struct AudioChunk {
     uint8_t data[2048];
@@ -187,50 +180,8 @@ void setup() {
     Serial.println("✓ Audio queue created");
     Serial.flush();
     
-    // Initialize Opus encoder
-    Serial.println("Creating Opus encoder...");
-    Serial.flush();
-    int error = 0;
-    
-    // Allocate encoder in PSRAM (board has 2MB PSRAM)
-    size_t encoder_size = opus_encoder_get_size(AUDIO_CHANNELS);
-    Serial.printf("Encoder size needed: %d bytes\n", encoder_size);
-    encoder = (OpusEncoder*)ps_malloc(encoder_size);
-    if (!encoder) {
-        Serial.println("✗ Failed to allocate Opus encoder memory");
-        currentLEDMode = LED_ERROR;
-        return;
-    }
-    
-    error = opus_encoder_init(encoder, OPUS_SAMPLE_RATE, AUDIO_CHANNELS, OPUS_APPLICATION_VOIP);
-    if (error != OPUS_OK) {
-        Serial.printf("✗ Failed to initialize Opus encoder: %d\n", error);
-        free(encoder);
-        encoder = NULL;
-        currentLEDMode = LED_ERROR;
-        return;
-    }
-    opus_encoder_ctl(encoder, OPUS_SET_BITRATE(OPUS_BITRATE));
-    opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(OPUS_COMPLEXITY));
-    Serial.println("✓ Opus encoder initialized");
-    
-    // Initialize Opus decoder
-    size_t decoder_size = opus_decoder_get_size(AUDIO_CHANNELS);
-    Serial.printf("Decoder size needed: %d bytes\n", decoder_size);
-    decoder = (OpusDecoder*)ps_malloc(decoder_size);
-    if (!decoder) {
-        Serial.println("✗ Failed to allocate Opus decoder memory");
-        currentLEDMode = LED_ERROR;
-        return;
-    }
-    
-    error = opus_decoder_init(decoder, OPUS_SAMPLE_RATE, AUDIO_CHANNELS);
-    if (error != OPUS_OK || !decoder) {
-        Serial.printf("✗ Failed to create Opus decoder: %d\n", error);
-        currentLEDMode = LED_ERROR;
-        return;
-    }
-    Serial.println("✓ Opus decoder initialized");
+    // Raw PCM streaming - no codec initialization needed
+    Serial.println("✓ Audio pipeline: Raw PCM (16-bit, 16kHz mic → 24kHz speaker)");
 
     // Initialize I2S audio
     if (!initI2SMic()) {
@@ -336,8 +287,8 @@ void setup() {
     
     webSocket.onEvent(onWebSocketEvent);
     webSocket.setReconnectInterval(WS_RECONNECT_INTERVAL);
-    webSocket.enableHeartbeat(10000, 3000, 2);  // Ping every 10s, timeout 3s, 2 retries (more aggressive keepalive)
-    Serial.println("✓ WebSocket initialized with keepalive");
+    webSocket.enableHeartbeat(60000, 30000, 5);  // Ping every 60s, timeout 30s, 5 retries = ~210s tolerance
+    Serial.println("✓ WebSocket initialized with relaxed keepalive");
     
     // Note: TCP buffer sizes are controlled by lwIP configuration, not runtime changeable
     Serial.println("✓ Using default TCP buffers (configured in sdkconfig)");
@@ -346,12 +297,11 @@ void setup() {
     // WebSocket needs high priority (3) and larger stack for heavy audio streaming
     xTaskCreatePinnedToCore(websocketTask, "WebSocket", 16384, NULL, 3, &websocketTaskHandle, CORE_1);  // Increased from 8KB to 16KB
     xTaskCreatePinnedToCore(ledTask, "LEDs", 4096, NULL, 0, &ledTaskHandle, CORE_0);
-    xTaskCreatePinnedToCore(audioTask, "Audio", 32768, NULL, 2, &audioTaskHandle, CORE_1);  // Increased to 32KB for Opus + buffers
+    xTaskCreatePinnedToCore(audioTask, "Audio", 32768, NULL, 2, &audioTaskHandle, CORE_1);  // 32KB for audio buffers + processing
     Serial.println("✓ Tasks created on dual cores");
 
     // Play startup sound
     Serial.println("🔊 Playing startup sound...");
-    waitingForGreeting = true;  // Flag to skip conversation mode for greeting
     playStartupSound();
     
     currentLEDMode = LED_IDLE;
@@ -587,11 +537,17 @@ void loop() {
         processingStartTime = 0;
     }
     
-    // Auto-return to IDLE when Gemini playback finishes (no audio chunks for 2 seconds)
-    // NOTE: This should NOT trigger for ambient sounds - they may have gaps in streaming
-    if (isPlayingResponse && !isPlayingAmbient && (millis() - lastAudioChunkTime) > 2000) {
-        isPlayingResponse = false;
-        Serial.println("⏹️  Audio playback complete (2s timeout)");
+    // Check for audio playback completion
+    // Timeout only if BOTH: (1) no new packets for 2s AND (2) queue nearly drained
+    // This prevents cutting off audio that's still queued but TCP-delayed
+    if (isPlayingResponse && !isPlayingAmbient) {
+        uint32_t queueDepth = uxQueueMessagesWaiting(audioOutputQueue);
+        bool noNewPackets = (millis() - lastAudioChunkTime) > 2000;
+        bool queueDrained = queueDepth < 3;  // < 120ms of audio remaining
+        
+        if (noNewPackets && queueDrained) {
+            isPlayingResponse = false;
+            Serial.printf("⏹️  Audio playback complete (timeout + queue drained to %u)\n", queueDepth);
         
         // Check if turn is complete - if so, open conversation window
         // Skip conversation mode for startup greeting
@@ -628,6 +584,7 @@ void loop() {
                 Serial.println("✓ Audio playback complete - switching to IDLE");
             }
         }
+        }
     }
     
     // Check for ambient sound streaming completion
@@ -648,11 +605,11 @@ void loop() {
     if (conversationMode && !isPlayingResponse && !recordingActive) {
         uint32_t elapsed = millis() - conversationWindowStart;
         
-        // Debug every 2 seconds
+        // Debug every 2 seconds - show current state
         static uint32_t lastDebugPrint = 0;
         if (millis() - lastDebugPrint > 2000) {
-            Serial.printf("💬 Monitoring: mode=%d, playing=%d, recording=%d, elapsed=%ums\n", 
-                         conversationMode, isPlayingResponse, recordingActive, elapsed);
+            Serial.printf("💬 [CONV] active, window=%ums/%u, LED=%d, turnComplete=%d\n", 
+                         elapsed, CONVERSATION_WINDOW_MS, currentLEDMode, turnComplete);
             lastDebugPrint = millis();
         }
         
@@ -790,20 +747,84 @@ bool detectVoiceActivity(int16_t* samples, size_t count) {
 
 // ============== AUDIO PROCESSING TASK ==============
 void audioTask(void * parameter) {
-    int16_t inputBuffer[OPUS_FRAME_SIZE];
+    int16_t inputBuffer[MIC_FRAME_SIZE];  // For microphone recording (320 samples = 20ms @ 16kHz)
+    static int16_t stereoBuffer[1920];  // For playback stereo conversion (960 samples * 2 channels)
     size_t bytes_read = 0;
     static uint32_t lastDebug = 0;
+    AudioChunk playbackChunk;
     
     while(1) {
-        // Capture and send audio when recording (but not during playback)
+        bool processedAudio = false;
+        
+        // PRIORITY 1: Process playback queue (don't wait if empty during playback)
+        while (xQueueReceive(audioOutputQueue, &playbackChunk, 0) == pdTRUE) {
+            processedAudio = true;
+            
+            // Raw PCM from server (24kHz, 16-bit mono, little-endian)
+            // Convert bytes to 16-bit samples
+            int numSamples = playbackChunk.length / 2;  // 2 bytes per sample
+            int16_t* pcmSamples = (int16_t*)playbackChunk.data;
+            
+            if (numSamples > 0 && numSamples <= 2880) {  // Max 2880 samples (stereo buffer size / 2)
+                // Calculate audio level
+                int32_t sum = 0;
+                for (int i = 0; i < numSamples; i++) {
+                    sum += abs(pcmSamples[i]);
+                }
+                int instantLevel = sum / numSamples;
+                
+                // Update LED sync buffer
+                audioLevelBuffer[audioBufferIndex] = instantLevel;
+                audioBufferIndex = (audioBufferIndex + 1) % AUDIO_DELAY_BUFFER_SIZE;
+                currentAudioLevel = audioLevelBuffer[audioBufferIndex];
+                
+                // Convert mono → stereo with volume
+                for (int i = 0; i < numSamples; i++) {
+                    int32_t sample = (int32_t)(pcmSamples[i] * volumeMultiplier);
+                    if (sample > 32767) sample = 32767;
+                    if (sample < -32768) sample = -32768;
+                    stereoBuffer[i * 2] = (int16_t)sample;
+                    stereoBuffer[i * 2 + 1] = (int16_t)sample;
+                }
+                
+                // Write to I2S (long timeout but not infinite - 500ms should be plenty)
+                size_t bytes_written;
+                esp_err_t result = i2s_write(I2S_NUM_1, stereoBuffer, numSamples * 4, &bytes_written, pdMS_TO_TICKS(500));
+                
+                if (result != ESP_OK || bytes_written < numSamples * 4) {
+                    Serial.printf("⚠️  I2S write failed: result=%d, wrote=%u/%u\n", result, bytes_written, numSamples*4);
+                    // Continue anyway - don't get stuck
+                }
+                
+                // Update last audio chunk time to prevent timeout while queue has data
+                lastAudioChunkTime = millis();
+                
+                // Debug periodically
+                static uint32_t lastPlaybackDebug = 0;
+                if (millis() - lastPlaybackDebug > 1000) {
+                    Serial.printf("[PLAYBACK] Raw PCM: %d bytes → %d samples, level=%d, queue=%d\n", 
+                                 playbackChunk.length, numSamples, currentAudioLevel, uxQueueMessagesWaiting(audioOutputQueue));
+                    lastPlaybackDebug = millis();
+                }
+            } else {
+                Serial.printf("❌ Invalid PCM chunk: %d bytes (%d samples)\n", playbackChunk.length, numSamples);
+            }
+        }
+        
+        // If we processed audio, yield and check queue again immediately
+        if (processedAudio) {
+            taskYIELD();
+            continue;
+        }
+        
+        // PRIORITY 2: Recording (only when not playing)
         if (recordingActive && !isPlayingResponse) {
-            if (i2s_read(I2S_NUM_0, inputBuffer, OPUS_FRAME_SIZE * sizeof(int16_t), &bytes_read, 100) == ESP_OK) {
-                if (bytes_read == OPUS_FRAME_SIZE * sizeof(int16_t)) {
-                    // Apply software gain (amplify by 16x to compensate for low INMP441 output)
+            if (i2s_read(I2S_NUM_0, inputBuffer, MIC_FRAME_SIZE * sizeof(int16_t), &bytes_read, 100) == ESP_OK) {
+                if (bytes_read == MIC_FRAME_SIZE * sizeof(int16_t)) {
+                    // Apply software gain
                     const int16_t GAIN = 16;
-                    for (size_t i = 0; i < OPUS_FRAME_SIZE; i++) {
+                    for (size_t i = 0; i < MIC_FRAME_SIZE; i++) {
                         int32_t amplified = (int32_t)inputBuffer[i] * GAIN;
-                        // Clamp to int16_t range
                         if (amplified > 32767) amplified = 32767;
                         if (amplified < -32768) amplified = -32768;
                         inputBuffer[i] = (int16_t)amplified;
@@ -811,39 +832,34 @@ void audioTask(void * parameter) {
                     
                     // Calculate amplitude for VAD
                     int32_t sum = 0;
-                    for (size_t i = 0; i < OPUS_FRAME_SIZE; i++) {
+                    for (size_t i = 0; i < MIC_FRAME_SIZE; i++) {
                         sum += abs(inputBuffer[i]);
                     }
-                    int32_t avgAmplitude = sum / OPUS_FRAME_SIZE;
-                    
-                    // Update current audio level for LED VU meter
+                    int32_t avgAmplitude = sum / MIC_FRAME_SIZE;
                     currentAudioLevel = avgAmplitude;
                     
                     // VAD check
-                    bool hasVoice = detectVoiceActivity(inputBuffer, OPUS_FRAME_SIZE);
+                    bool hasVoice = detectVoiceActivity(inputBuffer, MIC_FRAME_SIZE);
                     
-                    // Debug output every 2 seconds
+                    // Debug every 2 seconds
                     if (millis() - lastDebug > 2000) {
                         Serial.printf("[AUDIO] Recording: bytes_read=%d, hasVoice=%d, avgAmp=%d, threshold=%d\n", 
                                       bytes_read, hasVoice, avgAmplitude, VAD_THRESHOLD);
                         lastDebug = millis();
                     }
                     
-                    // Send raw PCM audio directly (Live API handles encoding)
+                    // Send raw PCM
                     sendAudioChunk((uint8_t*)inputBuffer, bytes_read);
                     
-                    // Update last voice activity time for VAD
                     if (hasVoice) {
                         lastVoiceActivityTime = millis();
                     }
                 }
             }
         } else {
-            // Not recording - just sleep
-            vTaskDelay(100 / portTICK_PERIOD_MS);
+            // Nothing to do - sleep briefly
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
-        
-        vTaskDelay(1 / portTICK_PERIOD_MS);
     }
 }
 
@@ -914,7 +930,7 @@ void playShutdownSound() {
         }
         
         size_t bytes_written;
-        i2s_write(I2S_NUM_1, toneBuffer, numSamples * 4, &bytes_written, portMAX_DELAY);
+        i2s_write(I2S_NUM_1, toneBuffer, numSamples * 4, &bytes_written, pdMS_TO_TICKS(100));
     }
 }
 
@@ -938,7 +954,7 @@ void playVolumeChime() {
     }
     
     size_t bytes_written;
-    i2s_write(I2S_NUM_1, toneBuffer, numSamples * 4, &bytes_written, portMAX_DELAY);
+    i2s_write(I2S_NUM_1, toneBuffer, numSamples * 4, &bytes_written, pdMS_TO_TICKS(100));
 }
 
 // ============== WEBSOCKET HANDLERS ==============
@@ -1070,6 +1086,37 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             
         case WStype_BIN:
             {
+                // 🔍 DIAGNOSTIC: Track packet timing to detect bursting
+                static uint32_t packetCount = 0;
+                static uint32_t lastPacketTime = 0;
+                static uint32_t fastPackets = 0;  // Packets received < 20ms apart
+                static uint32_t binaryBytesReceived = 0;
+                static uint32_t lastBinaryRateLog = 0;
+                
+                packetCount++;
+                uint32_t now = millis();
+                uint32_t timeSinceLastPacket = now - lastPacketTime;
+                
+                // Detect burst: packets arriving faster than expected (~33ms with server pacing)
+                if (lastPacketTime > 0 && timeSinceLastPacket < 20) {
+                    fastPackets++;
+                }
+                lastPacketTime = now;
+                
+                binaryBytesReceived += length;
+                
+                if (now - lastBinaryRateLog > 5000) {
+                    uint32_t bytesPerSec = binaryBytesReceived / 5;
+                    float avgInterval = packetCount > 1 ? 5000.0f / packetCount : 0;
+                    uint32_t queueDepth = uxQueueMessagesWaiting(audioOutputQueue);
+                    Serial.printf("📊 [STREAM] %u packets, %.1fms avg interval, %u fast (<20ms), %u KB/s, queue=%u\n", 
+                                 packetCount, avgInterval, fastPackets, bytesPerSec/1024, queueDepth);
+                    packetCount = 0;
+                    fastPackets = 0;
+                    binaryBytesReceived = 0;
+                    lastBinaryRateLog = now;
+                }
+                
                 // Drain mode: silently discard all packets for 2s after stopping ambient
                 if (ambientSound.drainUntil > 0 && millis() < ambientSound.drainUntil) {
                     // Silently discard - no logging to prevent spam
@@ -1128,57 +1175,65 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 // Raw PCM audio data from server (16-bit mono samples)
                 // This handles BOTH Gemini responses and ambient sounds
                 if (!isPlayingResponse) {
-                    isPlayingResponse = true;
+                    // Wait for prebuffer before starting playback to eliminate initial stutter
+                    uint32_t queueDepth = uxQueueMessagesWaiting(audioOutputQueue);
+                    const uint32_t MIN_PREBUFFER = 8;  // ~320ms buffer (8 packets × 40ms)
                     
-                    // Only reset turn state for non-ambient audio
-                    if (!isPlayingAmbient) {
-                        turnComplete = false;  // New Gemini turn starting
-                    }
-                    
-                    recordingActive = false;  // Ensure recording is stopped
-                    
-                    // Set LED mode - prioritize visualizations during playback
-                    if (!ambientSound.active) {
-                        if (moonState.active) {
-                            currentLEDMode = LED_MOON;
-                            moonState.displayStartTime = millis();
-                            Serial.println("🌙 Showing moon visualization during playback");
-                        } else if (tideState.active) {
-                            currentLEDMode = LED_TIDE;
-                            tideState.displayStartTime = millis();
-                            Serial.println("🌊 Showing tide visualization during playback");
-                        } else {
-                            currentLEDMode = LED_AUDIO_REACTIVE;
+                    if (queueDepth >= MIN_PREBUFFER) {
+                        isPlayingResponse = true;
+                        
+                        // Only reset turn state for non-ambient audio
+                        if (!isPlayingAmbient) {
+                            turnComplete = false;  // New Gemini turn starting
                         }
-                    }
-                    
-                    firstAudioChunk = true;
-                    // NOTE: Don't clear responseInterrupted here! Only clear it on turnComplete
-                    // to prevent buffered chunks from interrupted response playing through
-                    // Clear all LEDs immediately when starting playback
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                    FastLED.show();
-                    // Clear delay buffer for clean LED sync
-                    for (int i = 0; i < AUDIO_DELAY_BUFFER_SIZE; i++) {
-                        audioLevelBuffer[i] = 0;
-                    }
-                    audioBufferIndex = 0;
-                    
-                    if (isPlayingAmbient) {
-                        Serial.printf("🔊 Starting ambient audio stream: %s\n", ambientSound.name.c_str());
+                        
+                        recordingActive = false;  // Ensure recording is stopped
+                        
+                        // Set LED mode - prioritize visualizations during playback
+                        if (!ambientSound.active) {
+                            if (moonState.active) {
+                                currentLEDMode = LED_MOON;
+                                moonState.displayStartTime = millis();
+                                Serial.println("🌙 Showing moon visualization during playback");
+                            } else if (tideState.active) {
+                                currentLEDMode = LED_TIDE;
+                                tideState.displayStartTime = millis();
+                                Serial.println("🌊 Showing tide visualization during playback");
+                            } else {
+                                currentLEDMode = LED_AUDIO_REACTIVE;
+                            }
+                        }
+                        
+                        firstAudioChunk = true;
+                        // NOTE: Don't clear responseInterrupted here! Only clear it on turnComplete
+                        // to prevent buffered chunks from interrupted response playing through
+                        // Clear all LEDs immediately when starting playback
+                        fill_solid(leds, NUM_LEDS, CRGB::Black);
+                        FastLED.show();
+                        // Clear delay buffer for clean LED sync
+                        for (int i = 0; i < AUDIO_DELAY_BUFFER_SIZE; i++) {
+                            audioLevelBuffer[i] = 0;
+                        }
+                        audioBufferIndex = 0;
+                        
+                        if (isPlayingAmbient) {
+                            Serial.printf("🔊 Starting ambient audio stream: %s (prebuffered %u packets)\n", 
+                                         ambientSound.name.c_str(), queueDepth);
+                        } else {
+                            Serial.printf("🔊 Starting audio playback with %u packets prebuffered\n", queueDepth);
+                        }
                     } else {
-                        Serial.println("🔊 Starting audio playback...");
+                        // Silent prebuffering phase - log once per stream
+                        static uint32_t lastPrebufferLog = 0;
+                        if (millis() - lastPrebufferLog > 1000) {
+                            Serial.printf("⏳ Prebuffering... (%u/%u packets)\n", queueDepth, MIN_PREBUFFER);
+                            lastPrebufferLog = millis();
+                        }
                     }
                 }
                 
                 // Update last audio chunk time
                 lastAudioChunkTime = millis();
-                
-                // Clear greeting flag on first audio chunk
-                if (waitingForGreeting) {
-                    waitingForGreeting = false;
-                    Serial.println("👋 Startup greeting received!");
-                }
                 
                 // Debug first chunk
                 if (firstAudioChunk) {
@@ -1190,57 +1245,39 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     firstAudioChunk = false;
                 }
                 
-                int16_t* samples = (int16_t*)payload;
-                int numSamples = length / 2;
-                
-                // Calculate amplitude for VU meter
-                int32_t sum = 0;
-                for (int i = 0; i < numSamples; i++) {
-                    sum += abs(samples[i]);
-                }
-                int instantLevel = sum / numSamples;
-                
-                // Add to delay buffer and get delayed value for LED sync
-                audioLevelBuffer[audioBufferIndex] = instantLevel;
-                audioBufferIndex = (audioBufferIndex + 1) % AUDIO_DELAY_BUFFER_SIZE;
-                currentAudioLevel = audioLevelBuffer[audioBufferIndex];  // Use delayed value for LEDs
-                
-                // Debug audio level periodically
-                static uint32_t lastLevelDebug = 0;
-                if (millis() - lastLevelDebug > 1000) {
-                    Serial.printf("[PLAYBACK] avgAmp=%d, smoothed=%.0f, mode=%d, volume=%.2f\n", 
-                                  currentAudioLevel, smoothedAudioLevel, currentLEDMode, volumeMultiplier);
-                    lastLevelDebug = millis();
-                }
-                
-                // Convert mono to stereo using static buffer (no malloc delay)
-                static int16_t stereoBuffer[1024];  // Max 512 samples = 1024 bytes input
-                
-                for (int i = 0; i < numSamples && i < 512; i++) {
-                    // Apply volume control
-                    int32_t sample = (int32_t)(samples[i] * volumeMultiplier);
-                    // Clamp to int16 range
-                    if (sample > 32767) sample = 32767;
-                    if (sample < -32768) sample = -32768;
-                    stereoBuffer[i * 2] = (int16_t)sample;
-                    stereoBuffer[i * 2 + 1] = (int16_t)sample;
-                }
-                
-                size_t bytes_written;
-                
-                // Determine if we should play this audio
-                // Play if: (1) Not in ambient mode (Gemini audio), OR (2) In ambient mode AND actively playing
-                bool shouldPlay = !ambientSound.active || (ambientSound.active && isPlayingAmbient);
-                
-                if (shouldPlay) {
-                    esp_err_t result = i2s_write(I2S_NUM_1, stereoBuffer, numSamples * 4, &bytes_written, portMAX_DELAY);
+                // Queue raw PCM chunk for audio task
+                // Use blocking send with timeout to apply backpressure instead of dropping
+                if (length <= sizeof(AudioChunk::data)) {
+                    AudioChunk chunk;
+                    memcpy(chunk.data, payload, length);
+                    chunk.length = length;
                     
-                    if (result != ESP_OK || bytes_written < numSamples * 4) {
-                        Serial.printf("[I2S WARNING] Write issue: result=%d, requested=%d, written=%d\n", 
-                                     result, numSamples * 4, bytes_written);
+                    // 🔍 DIAGNOSTIC: Track queue depth before send
+                    uint32_t queueBefore = uxQueueMessagesWaiting(audioOutputQueue);
+                    
+                    // Block up to 100ms if queue is full (applies backpressure to TCP)
+                    // This prevents bursting by slowing down the receive rate
+                    if (xQueueSend(audioOutputQueue, &chunk, pdMS_TO_TICKS(100)) != pdTRUE) {
+                        // Only drop if truly stuck (audio system frozen)
+                        static uint32_t lastDropWarning = 0;
+                        static uint32_t dropsince = 0;
+                        dropsince++;
+                        if (millis() - lastDropWarning > 2000) {
+                            if (dropsince > 0) {
+                                Serial.printf("⚠️  Blocked on queue for 100ms+ (%u times, queue=%u/%u) - audio system may be frozen\n", 
+                                             dropsince, queueBefore, AUDIO_QUEUE_SIZE);
+                                dropsince = 0;
+                            }
+                            lastDropWarning = millis();
+                        }
+                    } else {
+                        // 🔍 DIAGNOSTIC: Log queue growth (only when significant)
+                        if (queueBefore == 0 || queueBefore >= AUDIO_QUEUE_SIZE - 5) {
+                            Serial.printf("📈 Queue: %u → %u/%u\n", queueBefore, queueBefore + 1, AUDIO_QUEUE_SIZE);
+                        }
                     }
                 } else {
-                    bytes_written = numSamples * 4;  // Pretend we wrote it
+                    Serial.printf("❌ PCM chunk too large: %d bytes\n", length);
                 }
             }
             break;
@@ -1310,6 +1347,12 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
         // Don't change LED mode here - let the audio finish playing naturally
         // isPlayingResponse will be set to false when audio actually stops
         // Conversation window will open after audio completes
+        
+        // Clear greeting flag ONLY if this was the startup greeting
+        if (waitingForGreeting) {
+            waitingForGreeting = false;
+            Serial.println("👋 Startup greeting complete!");
+        }
         
         // Clear interrupt flag - old turn is done, ready for new response
         if (responseInterrupted) {
@@ -1888,6 +1931,12 @@ void websocketTask(void * parameter) {
             int32_t rssi = WiFi.RSSI();
             uint32_t timeSinceLastSend = millis() - lastWebSocketSendTime;
             
+            // Get memory statistics
+            uint32_t freeHeap = ESP.getFreeHeap();
+            uint32_t minFreeHeap = ESP.getMinFreeHeap();
+            uint32_t heapSize = ESP.getHeapSize();
+            uint32_t freePsram = ESP.getFreePsram();
+            
             // Warn if signal is degrading rapidly
             if (lastRSSI != 0 && (lastRSSI - rssi) > 10) {
                 Serial.printf("⚠️  WiFi signal dropped %d dBm! (%d → %d)\n", lastRSSI - rssi, lastRSSI, rssi);
@@ -1895,8 +1944,15 @@ void websocketTask(void * parameter) {
             
             Serial.printf("[WS Health] Connected=%d, WiFi=%d dBm, LastSend=%us ago, Failures=%u\n",
                          isWebSocketConnected, rssi, timeSinceLastSend/1000, webSocketSendFailures);
+            Serial.printf("[Memory] Heap: %u/%u KB (min=%u KB), PSRAM: %u KB, Playing=%d\n",
+                         freeHeap/1024, heapSize/1024, minFreeHeap/1024, freePsram/1024, isPlayingResponse);
             lastRSSI = rssi;
             lastHealthLog = millis();
+            
+            // Warn if heap is getting low
+            if (freeHeap < 50000) {  // Less than 50KB free
+                Serial.printf("⚠️  LOW HEAP WARNING: Only %u KB free!\n", freeHeap/1024);
+            }
             
             // Attempt to reconnect WiFi if signal is very poor but still connected
             if (rssi < -80 && WiFi.status() == WL_CONNECTED) {

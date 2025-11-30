@@ -43,6 +43,7 @@ int32_t currentAudioLevel = 0;  // Current audio amplitude for VU meter
 float smoothedAudioLevel = 0.0f;  // Smoothed audio level for stable VU meter
 bool conversationMode = false;  // Track if we're in conversation window
 uint32_t conversationWindowStart = 0;  // Timestamp when conversation window opened
+bool conversationRecording = false;  // Track if current recording was triggered from conversation mode
 
 // Audio level delay buffer for LED sync (compensates for I2S buffer latency)
 #define AUDIO_DELAY_BUFFER_SIZE 12  // ~360ms delay to match I2S playback buffer + speaker latency
@@ -350,6 +351,7 @@ void setup() {
 
     // Play startup sound
     Serial.println("🔊 Playing startup sound...");
+    waitingForGreeting = true;  // Flag to skip conversation mode for greeting
     playStartupSound();
     
     currentLEDMode = LED_IDLE;
@@ -510,10 +512,11 @@ void loop() {
             Serial.printf("🎤 Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
         }
         // Start recording on rising edge (normal case - not interrupting)
-        // Block if: recording active, playing response, OR in ambient sound mode
-        else if (startTouch && !startPressed && !recordingActive && !isPlayingResponse && !isPlayingAmbient) {
+        // Block if: recording active, playing response, OR in ambient sound mode, OR conversation window is open
+        else if (startTouch && !startPressed && !recordingActive && !isPlayingResponse && !isPlayingAmbient && !conversationMode) {
             // Clear all previous state
             responseInterrupted = false;
+            conversationRecording = false;  // Button press = normal recording timeout
             tideState.active = false;
             moonState.active = false;
             timerState.active = false;
@@ -554,21 +557,34 @@ void loop() {
         lastDebounceTime = millis();
     }
     
-    // Auto-stop on silence (VAD)
-    if (recordingActive && (millis() - lastVoiceActivityTime) > VAD_SILENCE_MS) {
+    // Auto-stop on silence (VAD) - use longer timeout for conversation mode
+    uint32_t silenceTimeout = conversationRecording ? VAD_CONVERSATION_SILENCE_MS : VAD_SILENCE_MS;
+    if (recordingActive && (millis() - lastVoiceActivityTime) > silenceTimeout) {
         recordingActive = false;
+        conversationRecording = false;  // Reset flag for next recording
         // Don't change LED mode if ambient sound is already active
         if (!ambientSound.active) {
-            currentLEDMode = LED_PROCESSING;
+            // Don't show thinking animation yet - wait to see if response is fast
             processingStartTime = millis();
+            // Stay in recording mode for now
         }
         Serial.println("⏹️  Recording stopped - Silence detected");
     }
     
+    // Show thinking animation if response is taking too long (after delay)
+    if (currentLEDMode == LED_RECORDING && processingStartTime > 0 && 
+        (millis() - processingStartTime) > THINKING_ANIMATION_DELAY_MS && 
+        (millis() - processingStartTime) < 10000) {
+        currentLEDMode = LED_PROCESSING;
+        Serial.println("⏳ Response delayed - showing thinking animation");
+    }
+    
     // Timeout PROCESSING mode if no response after 10 seconds
-    if (currentLEDMode == LED_PROCESSING && processingStartTime > 0 && (millis() - processingStartTime) > 10000) {
+    if ((currentLEDMode == LED_PROCESSING || currentLEDMode == LED_RECORDING) && 
+        processingStartTime > 0 && (millis() - processingStartTime) > 10000) {
         Serial.println("⚠️  Processing timeout - no response received, returning to IDLE");
         currentLEDMode = LED_IDLE;
+        processingStartTime = 0;
     }
     
     // Auto-return to IDLE when Gemini playback finishes (no audio chunks for 2 seconds)
@@ -578,7 +594,8 @@ void loop() {
         Serial.println("⏹️  Audio playback complete (2s timeout)");
         
         // Check if turn is complete - if so, open conversation window
-        if (turnComplete) {
+        // Skip conversation mode for startup greeting
+        if (turnComplete && !waitingForGreeting) {
             // Start conversation window for follow-up questions
             conversationMode = true;
             conversationWindowStart = millis();
@@ -631,6 +648,14 @@ void loop() {
     if (conversationMode && !isPlayingResponse && !recordingActive) {
         uint32_t elapsed = millis() - conversationWindowStart;
         
+        // Debug every 2 seconds
+        static uint32_t lastDebugPrint = 0;
+        if (millis() - lastDebugPrint > 2000) {
+            Serial.printf("💬 Monitoring: mode=%d, playing=%d, recording=%d, elapsed=%ums\n", 
+                         conversationMode, isPlayingResponse, recordingActive, elapsed);
+            lastDebugPrint = millis();
+        }
+        
         if (elapsed < CONVERSATION_WINDOW_MS) {
             // Window is open - check for voice activity
             static int16_t windowBuffer[320];  // 20ms at 16kHz for quick VAD check
@@ -641,6 +666,16 @@ void loop() {
             if (result == ESP_OK && bytes_read > 0) {
                 size_t samples_read = bytes_read / sizeof(int16_t);
                 
+                // Apply same 16x gain as normal recording (INMP441 has low output)
+                const int16_t GAIN = 16;
+                for (size_t i = 0; i < samples_read; i++) {
+                    int32_t amplified = (int32_t)windowBuffer[i] * GAIN;
+                    // Clamp to int16_t range
+                    if (amplified > 32767) amplified = 32767;
+                    if (amplified < -32768) amplified = -32768;
+                    windowBuffer[i] = (int16_t)amplified;
+                }
+                
                 // Calculate amplitude
                 int32_t sum = 0;
                 for (size_t i = 0; i < samples_read; i++) {
@@ -648,16 +683,30 @@ void loop() {
                 }
                 int32_t avgAmplitude = sum / samples_read;
                 
+                // Debug sound detection
+                static uint32_t lastSoundPrint = 0;
+                if (avgAmplitude > 100 && millis() - lastSoundPrint > 500) {
+                    Serial.printf("🔊 Sound: %d (threshold=%d, bytes=%d)\n", avgAmplitude, VAD_CONVERSATION_THRESHOLD, bytes_read);
+                    lastSoundPrint = millis();
+                }
+                
                 // Use lower threshold during conversation window for faster response
                 if (samples_read > 0 && avgAmplitude > VAD_CONVERSATION_THRESHOLD) {
                     // Voice detected! Start recording immediately
                     Serial.println("🎤 Voice detected in conversation window - starting recording");
                     conversationMode = false;  // Exit window mode
+                    conversationRecording = true;  // Flag for longer silence timeout
                     recordingActive = true;
                     recordingStartTime = millis();
                     lastVoiceActivityTime = millis();
                     currentLEDMode = LED_RECORDING;
                     lastDebounceTime = millis();  // Reset debounce to prevent immediate stop
+                }
+            } else {
+                static uint32_t lastErrorPrint = 0;
+                if (millis() - lastErrorPrint > 3000) {
+                    Serial.printf("⚠️  I2S error: result=%d, bytes=%d\n", result, bytes_read);
+                    lastErrorPrint = millis();
                 }
             }
         } else {
@@ -1088,9 +1137,19 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     
                     recordingActive = false;  // Ensure recording is stopped
                     
-                    // Set LED mode (ambient sounds set their own mode in ambientStart)
+                    // Set LED mode - prioritize visualizations during playback
                     if (!ambientSound.active) {
-                        currentLEDMode = LED_AUDIO_REACTIVE;
+                        if (moonState.active) {
+                            currentLEDMode = LED_MOON;
+                            moonState.displayStartTime = millis();
+                            Serial.println("🌙 Showing moon visualization during playback");
+                        } else if (tideState.active) {
+                            currentLEDMode = LED_TIDE;
+                            tideState.displayStartTime = millis();
+                            Serial.println("🌊 Showing tide visualization during playback");
+                        } else {
+                            currentLEDMode = LED_AUDIO_REACTIVE;
+                        }
                     }
                     
                     firstAudioChunk = true;

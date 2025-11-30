@@ -48,9 +48,11 @@
 #define VAD_THRESHOLD 1200
 #define VAD_SILENCE_MS 1200
 #define VAD_CONVERSATION_THRESHOLD 600  // Lower threshold during conversation window for faster response
+#define VAD_CONVERSATION_SILENCE_MS 2500  // Longer silence timeout during conversation (more forgiving for natural pauses)
 
 // Conversation Mode
 #define CONVERSATION_WINDOW_MS 10000  // 10 second window for follow-up questions
+#define THINKING_ANIMATION_DELAY_MS 2000  // Only show rainbow thinking animation after 2s delay
 
 // Edge Server Configuration
 #define EDGE_SERVER_HOST "192.168.0.xxx"  // Your server IP

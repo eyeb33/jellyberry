@@ -60,9 +60,66 @@ struct AudioChunk {
     size_t length;
 };
 
-enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU, LED_AMBIENT_RAIN, LED_AMBIENT_OCEAN, LED_AMBIENT_RAINFOREST, LED_CONVERSATION_WINDOW };
-LEDMode currentLEDMode = LED_BOOT;
+enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU, LED_AMBIENT_RAIN, LED_AMBIENT_OCEAN, LED_AMBIENT_RAINFOREST, LED_CONVERSATION_WINDOW, LED_MARQUEE };
+LEDMode currentLEDMode = LED_IDLE;  // Start directly in idle mode
+LEDMode targetLEDMode = LED_IDLE;  // Mode to switch to after marquee finishes
 bool ambientVUMode = false;  // Toggle for ambient sound VU meter mode
+
+// Marquee text scrolling state
+struct MarqueeState {
+    String text;           // Text to display
+    int scrollPosition;    // Current horizontal scroll offset
+    uint32_t lastUpdate;   // Last time we scrolled
+    bool active;
+    CRGB color;            // Text color
+} marqueeState = {"", 0, 0, false, CRGB::White};
+
+// Simple 5x7 pixel font (stored as columns for easy vertical display)
+// Each character is 5 columns wide, 7 rows tall (we have 12 rows, so we'll center it)
+const uint8_t FONT_WIDTH = 5;
+const uint8_t FONT_HEIGHT = 7;
+const uint8_t FONT_SPACING = 1;  // Space between characters
+
+// Font bitmap - each byte represents a column of the character (7 bits used)
+const uint8_t font5x7[][5] = {
+    {0x7E, 0x89, 0x91, 0xA1, 0x7E}, // A
+    {0xFF, 0x91, 0x91, 0x91, 0x6E}, // B
+    {0x7E, 0x81, 0x81, 0x81, 0x42}, // C
+    {0xFF, 0x81, 0x81, 0x81, 0x7E}, // D
+    {0xFF, 0x91, 0x91, 0x91, 0x81}, // E
+    {0xFF, 0x90, 0x90, 0x90, 0x80}, // F
+    {0x7E, 0x81, 0x89, 0x89, 0x4E}, // G
+    {0xFF, 0x10, 0x10, 0x10, 0xFF}, // H
+    {0x00, 0x81, 0xFF, 0x81, 0x00}, // I
+    {0x06, 0x01, 0x01, 0x01, 0xFE}, // J
+    {0xFF, 0x10, 0x28, 0x44, 0x82}, // K
+    {0xFF, 0x01, 0x01, 0x01, 0x01}, // L
+    {0xFF, 0x40, 0x20, 0x40, 0xFF}, // M
+    {0xFF, 0x40, 0x20, 0x10, 0xFF}, // N
+    {0x7E, 0x81, 0x81, 0x81, 0x7E}, // O
+    {0xFF, 0x88, 0x88, 0x88, 0x70}, // P
+    {0x7E, 0x81, 0x85, 0x82, 0x7D}, // Q
+    {0xFF, 0x88, 0x8C, 0x8A, 0x71}, // R
+    {0x62, 0x91, 0x91, 0x91, 0x8C}, // S
+    {0x80, 0x80, 0xFF, 0x80, 0x80}, // T
+    {0xFE, 0x01, 0x01, 0x01, 0xFE}, // U
+    {0xF8, 0x04, 0x02, 0x04, 0xF8}, // V
+    {0xFF, 0x02, 0x04, 0x02, 0xFF}, // W
+    {0xC3, 0x24, 0x18, 0x24, 0xC3}, // X
+    {0xE0, 0x10, 0x0F, 0x10, 0xE0}, // Y
+    {0x83, 0x85, 0x99, 0xA1, 0xC1}, // Z
+    {0x00, 0x00, 0x00, 0x00, 0x00}, // Space (index 26)
+    {0x3E, 0x51, 0x49, 0x45, 0x3E}, // 0
+    {0x00, 0x42, 0x7F, 0x40, 0x00}, // 1
+    {0x42, 0x43, 0x45, 0x49, 0x31}, // 2
+    {0x22, 0x41, 0x49, 0x49, 0x36}, // 3
+    {0x18, 0x28, 0x48, 0x7F, 0x08}, // 4
+    {0x71, 0x49, 0x49, 0x49, 0x46}, // 5
+    {0x3E, 0x49, 0x49, 0x49, 0x06}, // 6
+    {0x40, 0x47, 0x48, 0x50, 0x60}, // 7
+    {0x36, 0x49, 0x49, 0x49, 0x36}, // 8
+    {0x30, 0x49, 0x49, 0x49, 0x3E}, // 9
+};
 
 // Tide visualization state
 struct TideState {
@@ -111,6 +168,31 @@ bool detectVoiceActivity(int16_t* samples, size_t count);
 void sendAudioChunk(uint8_t* data, size_t length);
 void playStartupSound();
 void playShutdownSound();
+void startMarquee(String text, CRGB color, LEDMode nextMode);
+int getCharIndex(char c);
+
+// ============== MARQUEE FUNCTIONS ==============
+
+// Get font index for a character (A-Z = 0-25, space = 26, 0-9 = 27-36)
+int getCharIndex(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a';  // Convert lowercase to uppercase
+    if (c >= '0' && c <= '9') return 27 + (c - '0');
+    return 26;  // Space for any other character
+}
+
+// Start a marquee animation before switching modes
+void startMarquee(String text, CRGB color, LEDMode nextMode) {
+    marqueeState.text = text;
+    marqueeState.text.toUpperCase();  // Convert to uppercase for font
+    marqueeState.scrollPosition = LED_COLUMNS;  // Start off right edge
+    marqueeState.lastUpdate = millis();
+    marqueeState.active = true;
+    marqueeState.color = color;
+    targetLEDMode = nextMode;
+    currentLEDMode = LED_MARQUEE;
+    Serial.printf("📜 Starting marquee: '%s'\n", text.c_str());
+}
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
 
 // ============== WIFI EVENT HANDLER ==============
@@ -158,7 +240,7 @@ void setup() {
     Serial.println("========================================");
     Serial.flush();
 
-    // Initialize LED strip (9 LEDs on GPIO 1)
+    // Initialize LED strip (144 LEDs on GPIO 1)
     Serial.write("LED_INIT_START\r\n", 16);
     FastLED.addLeds<LED_CHIPSET, LED_DATA_PIN, LED_COLOR_ORDER>(leds, NUM_LEDS);
     FastLED.setBrightness(LED_BRIGHTNESS);
@@ -304,8 +386,7 @@ void setup() {
     Serial.println("🔊 Playing startup sound...");
     playStartupSound();
     
-    currentLEDMode = LED_IDLE;
-    Serial.printf("=== Initialization Complete ===  [LEDMode set to %d]\n", currentLEDMode);
+    Serial.printf("=== Initialization Complete ===  [LEDMode: IDLE]\n");
     Serial.println("Touch START pad to begin recording");
 }
 
@@ -361,12 +442,12 @@ void loop() {
             // Cycle to next mode
             if (currentLEDMode == LED_IDLE || currentLEDMode == LED_MOON || 
                 currentLEDMode == LED_TIDE || currentLEDMode == LED_TIMER) {
-                currentLEDMode = LED_AMBIENT_VU;
+                // Show marquee before switching
                 ambientVUMode = true;
                 ambientSound.sequence++;  // Increment for mode change
+                startMarquee("VU MODE", CRGB::Green, LED_AMBIENT_VU);
                 Serial.println("🎵 Ambient VU meter mode enabled");
             } else if (currentLEDMode == LED_AMBIENT_VU) {
-                currentLEDMode = LED_AMBIENT_RAIN;
                 ambientVUMode = false;
                 ambientSound.name = "rain";
                 ambientSound.active = true;
@@ -376,6 +457,8 @@ void loop() {
                 firstAudioChunk = true;
                 lastAudioChunkTime = millis();  // Initialize timing
                 Serial.printf("🌧️  Rain ambient sound mode (seq %d)\n", ambientSound.sequence);
+                // Show marquee first
+                startMarquee("RAIN MODE", CRGB(0, 100, 255), LED_AMBIENT_RAIN);  // Blue for rain
                 // Brief delay to let server cancel previous stream
                 delay(200);
                 // Request rain sounds from server
@@ -387,7 +470,6 @@ void loop() {
                 serializeJson(ambientDoc, ambientMsg);
                 webSocket.sendTXT(ambientMsg);
             } else if (currentLEDMode == LED_AMBIENT_RAIN) {
-                currentLEDMode = LED_AMBIENT_OCEAN;
                 ambientSound.name = "ocean";
                 ambientSound.active = true;
                 ambientSound.sequence++;
@@ -396,6 +478,8 @@ void loop() {
                 firstAudioChunk = true;
                 lastAudioChunkTime = millis();  // Initialize timing
                 Serial.printf("🌊 Ocean ambient sound mode (seq %d)\n", ambientSound.sequence);
+                // Show marquee first
+                startMarquee("OCEAN MODE", CRGB(0, 150, 200), LED_AMBIENT_OCEAN);  // Cyan for ocean
                 // Request ocean sounds from server
                 JsonDocument ambientDoc;
                 ambientDoc["action"] = "requestAmbient";
@@ -405,7 +489,6 @@ void loop() {
                 serializeJson(ambientDoc, ambientMsg);
                 webSocket.sendTXT(ambientMsg);
             } else if (currentLEDMode == LED_AMBIENT_OCEAN) {
-                currentLEDMode = LED_AMBIENT_RAINFOREST;
                 ambientSound.name = "rainforest";
                 ambientSound.active = true;
                 ambientSound.sequence++;
@@ -414,6 +497,8 @@ void loop() {
                 firstAudioChunk = true;
                 lastAudioChunkTime = millis();  // Initialize timing
                 Serial.printf("🌿 Rainforest ambient sound mode (seq %d)\n", ambientSound.sequence);
+                // Show marquee first
+                startMarquee("FOREST MODE", CRGB(50, 255, 50), LED_AMBIENT_RAINFOREST);  // Bright green
                 // Request rainforest sounds from server
                 JsonDocument ambientDoc;
                 ambientDoc["action"] = "requestAmbient";
@@ -432,7 +517,9 @@ void loop() {
                 ambientSound.active = false;
                 ambientSound.name = "";
                 ambientSound.sequence++;  // Increment to invalidate in-flight chunks
-                currentLEDMode = LED_IDLE;
+                
+                // Show "IDLE MODE" marquee before returning to idle
+                startMarquee("IDLE MODE", CRGB(100, 100, 255), LED_IDLE);  // Blue for idle
                 
                 // Send stop request to server
                 JsonDocument stopDoc;
@@ -1485,6 +1572,13 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
 void updateLEDs() {
     static uint8_t hue = 0;
     static uint8_t brightness = 100;
+    static uint32_t lastModeLog = 0;
+    
+    // Debug: log mode every 3 seconds
+    if (millis() - lastModeLog > 3000) {
+        Serial.printf("🎨 LED Mode: %d (IDLE=1, RECORDING=2, PROCESSING=3, AUDIO_REACTIVE=4)\n", currentLEDMode);
+        lastModeLog = millis();
+    }
     
     // Smooth the audio level with exponential moving average
     const float smoothing = 0.15f;  // Lower = more smoothing (was 0.3)
@@ -1501,32 +1595,60 @@ void updateLEDs() {
 
     switch(currentLEDMode) {
         case LED_BOOT:
-            brightness = constrain(100 + (int)(50 * sin(millis() / 500.0)), 0, 255);
-            fill_solid(leds, NUM_LEDS, CHSV(160, 255, brightness));
+            // Orange pulsing during boot to distinguish from idle blue
+            {
+                static uint32_t lastBootDebug = 0;
+                if (millis() - lastBootDebug > 1000) {
+                    Serial.println("🔶 LED_BOOT: Orange pulsing (connecting...)");
+                    lastBootDebug = millis();
+                }
+                brightness = constrain(100 + (int)(50 * sin(millis() / 500.0)), 0, 255);
+                fill_solid(leds, NUM_LEDS, CHSV(25, 255, brightness));  // Orange instead of cyan
+            }
             break;
             
         case LED_IDLE:
-            // Jellyfish-inspired pulse animation - wave travels up with fade trail
+            // Gentle blue pulse - all strips in sync, bottom to top to bottom
+            // Smooth bouncing wave with even fade at both ends
             {
-                float t = (millis() % 3000) / 3000.0;  // 3 second cycle
-                // Create wave position (travels from LED 0 to LED 8)
-                float wavePos = t * (NUM_LEDS + 3);  // +3 for smooth exit
+                // 5.3 second cycle (50% faster than 8s), bounces up and down
+                float t = (millis() % 5333) / 5333.0;
                 
-                for (int i = 0; i < NUM_LEDS; i++) {
-                    // Calculate distance from wave center
-                    float distance = wavePos - i;
-                    
-                    if (distance >= 0 && distance < 4) {
-                        // Active wave (bright blue with trail)
-                        float waveBrightness = (1.0 - (distance / 4.0)) * 255;
-                        leds[i] = CHSV(160, 200, (uint8_t)waveBrightness);
-                    } else {
-                        // Fade trail (dims gradually)
-                        uint8_t currentBrightness = leds[i].getLuma();
-                        if (currentBrightness > 30) {
-                            leds[i].fadeToBlackBy(25);  // Gentle fade
+                // Create bouncing wave: stays within LED range (0-11) with fade margins
+                // Range 0→14→0 where 14 gives smooth fade at top (doesn't hit full 16)
+                float wavePos;
+                if (t < 0.5) {
+                    // First half: bottom to top (0→14)
+                    wavePos = (t * 2.0) * 14.0;
+                } else {
+                    // Second half: top to bottom (14→0)
+                    wavePos = ((1.0 - t) * 2.0) * 14.0;
+                }
+                
+                // Debug every 2 seconds
+                static uint32_t lastIdleDebug = 0;
+                if (millis() - lastIdleDebug > 2000) {
+                    Serial.printf("💙 IDLE: t=%.2f, wavePos=%.2f, hue=160 (blue)\n", t, wavePos);
+                    lastIdleDebug = millis();
+                }
+                
+                // Process all strips identically (column-based indexing)
+                for (int col = 0; col < LED_COLUMNS; col++) {
+                    for (int row = 0; row < LEDS_PER_COLUMN; row++) {
+                        int ledIndex = col * LEDS_PER_COLUMN + row;
+                        
+                        // Calculate distance from wave center (based on row position)
+                        float distance = abs(wavePos - row);
+                        
+                        // Soft wave with gradient trail (6 LED spread for smoother effect)
+                        if (distance < 6.0) {
+                            float waveBrightness = (1.0 - (distance / 6.0));
+                            waveBrightness = waveBrightness * waveBrightness;  // Squared for softer falloff
+                            uint8_t brightness = (uint8_t)(waveBrightness * 180 + 30);  // 30-210 range (not too bright)
+                            leds[ledIndex] = CHSV(160, 200, brightness);  // Blue hue locked at 160
                         } else {
-                            leds[i] = CHSV(160, 200, 30);  // Minimum ambient glow
+                            // Base ambient glow when wave is far away
+                            leds[ledIndex] = CHSV(160, 200, 30);  // Dim blue
                         }
                     }
                 }
@@ -1534,23 +1656,34 @@ void updateLEDs() {
             break;
             
         case LED_RECORDING:
-            // VU meter during recording - green to yellow to red
+            // VU meter during recording - vertical bars on all strips with fade trail
+            // Orange gradient for person speaking (warm, friendly)
             {
-                // Map audio level to LED count (0-9 LEDs)
-                // Typical range: 0-5000 (after 16x gain), map to 0-9 LEDs
-                int numLEDs = map(constrain((int)smoothedAudioLevel, 0, 5000), 0, 5000, 0, NUM_LEDS);
+                // Fade all LEDs for trail effect
                 for (int i = 0; i < NUM_LEDS; i++) {
-                    if (i < numLEDs) {
-                        // Universal VU meter gradient
-                        if (i < NUM_LEDS * 0.6) {
-                            leds[i] = CRGB::Green;  // 0-60% = green (safe)
-                        } else if (i < NUM_LEDS * 0.85) {
-                            leds[i] = CRGB::Yellow;  // 60-85% = yellow (approaching limit)
-                        } else {
-                            leds[i] = CRGB::Red;  // 85-100% = red (near max)
+                    leds[i].fadeToBlackBy(80);  // Gentle fade creates smooth trail
+                }
+                
+                // Map audio level to row count (0-12 rows)
+                // Typical range: 0-5000 (after 16x gain), map to 0-12 rows
+                int numRows = map(constrain((int)smoothedAudioLevel, 0, 5000), 0, 5000, 0, LEDS_PER_COLUMN);
+                
+                // Light all strips identically (column-based)
+                for (int col = 0; col < LED_COLUMNS; col++) {
+                    for (int row = 0; row < LEDS_PER_COLUMN; row++) {
+                        int ledIndex = col * LEDS_PER_COLUMN + row;
+                        
+                        if (row < numRows) {
+                            // Orange gradient for person
+                            if (row < LEDS_PER_COLUMN * 0.6) {
+                                leds[ledIndex] = CRGB(255, 140, 0);  // Soft orange (bottom 60%)
+                            } else if (row < LEDS_PER_COLUMN * 0.85) {
+                                leds[ledIndex] = CRGB(255, 100, 0);  // Deeper orange (60-85%)
+                            } else {
+                                leds[ledIndex] = CRGB(255, 50, 0);  // Red-orange (top 85-100%)
+                            }
                         }
-                    } else {
-                        leds[i] = CRGB::Black;  // Turn off unused LEDs
+                        // LEDs above numRows keep their faded value
                     }
                 }
             }
@@ -1564,14 +1697,16 @@ void updateLEDs() {
             break;
             
         case LED_AMBIENT_VU:
-            // Ambient sound VU meter - uses microphone to visualize external sounds
-            // Read microphone continuously and display real-time VU meter
+            // Ambient sound VU meter - vertical bars on all strips with fade trail
+            // Each strip is a vertical VU meter synced together
             {
                 static int16_t ambientBuffer[640];  // 40ms at 16kHz (640 samples)
                 size_t bytes_read = 0;
                 
-                // Clear all LEDs first to ensure clean state
-                fill_solid(leds, NUM_LEDS, CRGB::Black);
+                // Fade all LEDs slightly for trail effect (instead of clearing)
+                for (int i = 0; i < NUM_LEDS; i++) {
+                    leds[i].fadeToBlackBy(80);  // Gentle fade creates smooth trail
+                }
                 
                 // Read from microphone
                 if (i2s_read(I2S_NUM_0, ambientBuffer, sizeof(ambientBuffer), &bytes_read, 0) == ESP_OK) {
@@ -1618,30 +1753,34 @@ void updateLEDs() {
                     static float smoothedRMS = 0.0f;
                     smoothedRMS = smoothedRMS * 0.80f + gainedRMS * 0.20f;  // 80/20 for more smoothing
                     
-                    // Map to LED count - lower threshold for better verse visibility
-                    // Adjusted range: 150-1600 (was 200-1600)
-                    int numLEDs = map(constrain((int)smoothedRMS, 150, 1600), 150, 1600, 0, NUM_LEDS);
+                    // Map to row count (0-12 rows) instead of total LED count
+                    // Adjusted range: 150-1600 for good sensitivity
+                    int numRows = map(constrain((int)smoothedRMS, 150, 1600), 150, 1600, 0, LEDS_PER_COLUMN);
                     
                     // Debug output every 2 seconds
                     static uint32_t lastDebug = 0;
                     if (millis() - lastDebug > 2000) {
-                        Serial.printf("🎵 VU: raw=%.0f gain=%.1f gained=%.0f smooth=%.0f LEDs=%d\n", 
-                                     rms, autoGain, gainedRMS, smoothedRMS, numLEDs);
+                        Serial.printf("🎵 VU: raw=%.0f gain=%.1f gained=%.0f smooth=%.0f rows=%d\n", 
+                                     rms, autoGain, gainedRMS, smoothedRMS, numRows);
                         lastDebug = millis();
                     }
                     
-                    // VU meter gradient (green to yellow to red)
-                    for (int i = 0; i < NUM_LEDS; i++) {
-                        if (i < numLEDs) {
-                            if (i < NUM_LEDS * 0.6) {
-                                leds[i] = CRGB(0, 255, 0);  // Pure green
-                            } else if (i < NUM_LEDS * 0.85) {
-                                leds[i] = CRGB(255, 255, 0);  // Pure yellow
-                            } else {
-                                leds[i] = CRGB(255, 0, 0);  // Pure red
+                    // VU meter gradient - vertical on all strips (column-based)
+                    for (int col = 0; col < LED_COLUMNS; col++) {
+                        for (int row = 0; row < LEDS_PER_COLUMN; row++) {
+                            int ledIndex = col * LEDS_PER_COLUMN + row;
+                            
+                            if (row < numRows) {
+                                // Gradient based on row height
+                                if (row < LEDS_PER_COLUMN * 0.6) {
+                                    leds[ledIndex] = CRGB(0, 255, 0);  // Green (bottom 60%)
+                                } else if (row < LEDS_PER_COLUMN * 0.85) {
+                                    leds[ledIndex] = CRGB(255, 255, 0);  // Yellow (60-85%)
+                                } else {
+                                    leds[ledIndex] = CRGB(255, 0, 0);  // Red (top 85-100%)
+                                }
                             }
-                        } else {
-                            leds[i] = CRGB(0, 0, 0);  // Off
+                            // LEDs above numRows will keep their faded value from fadeToBlackBy
                         }
                     }
                 }
@@ -1649,24 +1788,34 @@ void updateLEDs() {
             break;
             
         case LED_AUDIO_REACTIVE:
-            // VU meter during playback - same green to yellow to red
+            // VU meter during playback - vertical bars on all strips with fade trail
+            // Purple gradient for Gemini speaking (AI, calm)
             {
-                // Clear all LEDs first
-                fill_solid(leds, NUM_LEDS, CRGB::Black);
+                // Fade all LEDs for trail effect
+                for (int i = 0; i < NUM_LEDS; i++) {
+                    leds[i].fadeToBlackBy(80);  // Gentle fade creates smooth trail
+                }
                 
-                // Map audio level to LED count (0-144 LEDs)
-                // Playback audio range: 0-3000, map to 0-144 LEDs
-                int numLEDs = map(constrain((int)smoothedAudioLevel, 0, 3000), 0, 3000, 0, NUM_LEDS);
+                // Map audio level to row count (0-12 rows)
+                // Playback audio range: 0-3000, map to 0-12 rows
+                int numRows = map(constrain((int)smoothedAudioLevel, 0, 3000), 0, 3000, 0, LEDS_PER_COLUMN);
                 
-                // Set LEDs up to numLEDs with gradient
-                for (int i = 0; i < numLEDs; i++) {
-                    // Universal VU meter gradient (same as recording)
-                    if (i < NUM_LEDS * 0.6) {
-                        leds[i] = CRGB(0, 255, 0);  // Pure green
-                    } else if (i < NUM_LEDS * 0.85) {
-                        leds[i] = CRGB(255, 255, 0);  // Pure yellow
-                    } else {
-                        leds[i] = CRGB(255, 0, 0);  // Pure red
+                // Light all strips identically (column-based)
+                for (int col = 0; col < LED_COLUMNS; col++) {
+                    for (int row = 0; row < LEDS_PER_COLUMN; row++) {
+                        int ledIndex = col * LEDS_PER_COLUMN + row;
+                        
+                        if (row < numRows) {
+                            // Purple gradient for Gemini
+                            if (row < LEDS_PER_COLUMN * 0.6) {
+                                leds[ledIndex] = CRGB(120, 60, 200);  // Soft purple (bottom 60%)
+                            } else if (row < LEDS_PER_COLUMN * 0.85) {
+                                leds[ledIndex] = CRGB(140, 40, 220);  // Brighter purple (60-85%)
+                            } else {
+                                leds[ledIndex] = CRGB(160, 20, 240);  // Vibrant purple (top 85-100%)
+                            }
+                        }
+                        // LEDs above numRows keep their faded value
                     }
                 }
             }
@@ -1872,16 +2021,17 @@ void updateLEDs() {
             break;
             
         case LED_CONVERSATION_WINDOW:
-            // Progress bar countdown - shows remaining conversation window time
+            // Progress bar countdown - vertical bars showing remaining conversation window time
+            // All strips sync together
             {
                 if (conversationMode) {
                     uint32_t elapsed = millis() - conversationWindowStart;
                     uint32_t remaining = CONVERSATION_WINDOW_MS - elapsed;
                     
                     if (remaining > 0) {
-                        // Calculate number of LEDs to light based on remaining time
+                        // Calculate number of rows to light based on remaining time
                         float progress = (float)remaining / (float)CONVERSATION_WINDOW_MS;
-                        int numLEDs = (int)(progress * NUM_LEDS);
+                        int numRows = (int)(progress * LEDS_PER_COLUMN);
                         
                         // Pulse effect in final 3 seconds for urgency
                         uint8_t brightness = 255;
@@ -1890,12 +2040,16 @@ void updateLEDs() {
                             brightness = (uint8_t)(255 * pulse);
                         }
                         
-                        // Cyan color for conversation listening mode
-                        for (int i = 0; i < NUM_LEDS; i++) {
-                            if (i < numLEDs) {
-                                leds[i] = CHSV(160, 200, brightness);  // Cyan
-                            } else {
-                                leds[i] = CRGB::Black;
+                        // Cyan color for conversation listening mode - all strips sync
+                        for (int col = 0; col < LED_COLUMNS; col++) {
+                            for (int row = 0; row < LEDS_PER_COLUMN; row++) {
+                                int ledIndex = col * LEDS_PER_COLUMN + row;
+                                
+                                if (row < numRows) {
+                                    leds[ledIndex] = CHSV(160, 200, brightness);  // Cyan
+                                } else {
+                                    leds[ledIndex] = CRGB::Black;
+                                }
                             }
                         }
                     } else {
@@ -1908,8 +2062,72 @@ void updateLEDs() {
             }
             break;
             
+        case LED_MARQUEE:
+            // Scrolling text marquee around the circle
+            {
+                // Update scroll position every 240ms for readable scrolling (1/3 speed)
+                if (millis() - marqueeState.lastUpdate > 240) {
+                    marqueeState.scrollPosition--;
+                    marqueeState.lastUpdate = millis();
+                    
+                    // Calculate total width of text
+                    int totalWidth = marqueeState.text.length() * (FONT_WIDTH + FONT_SPACING);
+                    
+                    // If text has scrolled completely off the left, finish marquee
+                    if (marqueeState.scrollPosition < -totalWidth) {
+                        marqueeState.active = false;
+                        currentLEDMode = targetLEDMode;
+                        Serial.printf("📜 Marquee complete, switching to mode %d\n", targetLEDMode);
+                    }
+                }
+                
+                // Clear all LEDs
+                fill_solid(leds, NUM_LEDS, CRGB::Black);
+                
+                // Draw each character of the text
+                int xPos = marqueeState.scrollPosition;  // Current x position for drawing
+                
+                for (int charIdx = 0; charIdx < marqueeState.text.length(); charIdx++) {
+                    char c = marqueeState.text[charIdx];
+                    int fontIdx = getCharIndex(c);
+                    
+                    // Draw this character column by column
+                    for (int col = 0; col < FONT_WIDTH; col++) {
+                        int screenCol = xPos + col;
+                        
+                        // Only draw if within visible area (0 to LED_COLUMNS-1)
+                        if (screenCol >= 0 && screenCol < LED_COLUMNS) {
+                            uint8_t columnBits = font5x7[fontIdx][col];
+                            
+                            // Draw pixels vertically - center the 7-pixel font in 12-pixel height
+                            int yOffset = (LEDS_PER_COLUMN - FONT_HEIGHT) / 2;  // Center vertically
+                            
+                            for (int row = 0; row < FONT_HEIGHT; row++) {
+                                if (columnBits & (1 << (6 - row))) {  // Check bit (top to bottom)
+                                    int ledIndex = screenCol * LEDS_PER_COLUMN + (yOffset + row);
+                                    if (ledIndex >= 0 && ledIndex < NUM_LEDS) {
+                                        leds[ledIndex] = marqueeState.color;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Move to next character position (width + spacing)
+                    xPos += FONT_WIDTH + FONT_SPACING;
+                }
+            }
+            break;
+            
         case LED_CONNECTED:
-            fill_solid(leds, NUM_LEDS, CHSV(128, 255, LED_BRIGHTNESS));
+            {
+                static uint32_t lastConnDebug = 0;
+                if (millis() - lastConnDebug > 500) {
+                    Serial.println("✅ LED_CONNECTED: Solid green");
+                    lastConnDebug = millis();
+                }
+                fill_solid(leds, NUM_LEDS, CRGB(0, 255, 0));  // Pure green
+            }
             break;
             
         case LED_ERROR:

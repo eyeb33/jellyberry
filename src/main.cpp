@@ -439,15 +439,18 @@ void loop() {
             tideState.active = false;
             timerState.active = false;
             
+            // Use targetLEDMode if marquee is active, otherwise use currentLEDMode
+            LEDMode modeToCheck = (currentLEDMode == LED_MARQUEE) ? targetLEDMode : currentLEDMode;
+            
             // Cycle to next mode
-            if (currentLEDMode == LED_IDLE || currentLEDMode == LED_MOON || 
-                currentLEDMode == LED_TIDE || currentLEDMode == LED_TIMER) {
+            if (modeToCheck == LED_IDLE || modeToCheck == LED_MOON || 
+                modeToCheck == LED_TIDE || modeToCheck == LED_TIMER) {
                 // Show marquee before switching
                 ambientVUMode = true;
                 ambientSound.sequence++;  // Increment for mode change
                 startMarquee("VU MODE", CRGB::Green, LED_AMBIENT_VU);
                 Serial.println("🎵 Ambient VU meter mode enabled");
-            } else if (currentLEDMode == LED_AMBIENT_VU) {
+            } else if (modeToCheck == LED_AMBIENT_VU) {
                 ambientVUMode = false;
                 ambientSound.name = "rain";
                 ambientSound.active = true;
@@ -468,8 +471,9 @@ void loop() {
                 ambientDoc["sequence"] = ambientSound.sequence;
                 String ambientMsg;
                 serializeJson(ambientDoc, ambientMsg);
+                Serial.printf("📤 Sending ambient request: %s\n", ambientMsg.c_str());
                 webSocket.sendTXT(ambientMsg);
-            } else if (currentLEDMode == LED_AMBIENT_RAIN) {
+            } else if (modeToCheck == LED_AMBIENT_RAIN) {
                 ambientSound.name = "ocean";
                 ambientSound.active = true;
                 ambientSound.sequence++;
@@ -488,7 +492,7 @@ void loop() {
                 String ambientMsg;
                 serializeJson(ambientDoc, ambientMsg);
                 webSocket.sendTXT(ambientMsg);
-            } else if (currentLEDMode == LED_AMBIENT_OCEAN) {
+            } else if (modeToCheck == LED_AMBIENT_OCEAN) {
                 ambientSound.name = "rainforest";
                 ambientSound.active = true;
                 ambientSound.sequence++;
@@ -507,7 +511,7 @@ void loop() {
                 String ambientMsg;
                 serializeJson(ambientDoc, ambientMsg);
                 webSocket.sendTXT(ambientMsg);
-            } else if (currentLEDMode == LED_AMBIENT_RAINFOREST) {
+            } else if (modeToCheck == LED_AMBIENT_RAINFOREST) {
                 // Stop ambient and return to IDLE
                 Serial.println("⏹️  Ambient mode stopped - draining buffered chunks for 2s...");
                 
@@ -636,20 +640,31 @@ void loop() {
             isPlayingResponse = false;
             Serial.printf("⏹️  Audio playback complete (timeout + queue drained to %u)\n", queueDepth);
         
-        // Check if turn is complete - if so, open conversation window
+        // Check if turn is complete - if so, decide what to show
         // Skip conversation mode for startup greeting
         if (turnComplete && !waitingForGreeting) {
-            // Start conversation window for follow-up questions
-            conversationMode = true;
-            conversationWindowStart = millis();
-            currentLEDMode = LED_CONVERSATION_WINDOW;
-            
-            // Clear any visualization states - conversation mode takes priority
-            moonState.active = false;
-            tideState.active = false;
-            
-            Serial.println("💬 Conversation window opened - speak anytime in next 10 seconds");
+            // Priority: Show visualizations first, then conversation window
+            // Timer > Moon > Tide > Conversation Window
+            if (timerState.active) {
+                currentLEDMode = LED_TIMER;
+                Serial.println("✓ Audio playback complete - switching to TIMER display (will open conversation window after)");
+            } else if (moonState.active) {
+                currentLEDMode = LED_MOON;
+                moonState.displayStartTime = millis();
+                Serial.println("✓ Audio playback complete - switching to MOON display (will open conversation window after)");
+            } else if (tideState.active) {
+                currentLEDMode = LED_TIDE;
+                tideState.displayStartTime = millis();
+                Serial.printf("✓ Audio playback complete - switching to TIDE display (will open conversation window after)\n");
+            } else {
+                // No visualizations - open conversation window immediately
+                conversationMode = true;
+                conversationWindowStart = millis();
+                currentLEDMode = LED_CONVERSATION_WINDOW;
+                Serial.println("💬 Conversation window opened - speak anytime in next 10 seconds");
+            }
         } else {
+            // Turn not complete - show visualizations or return to idle/ambient
             // Priority: Timer > Moon > Tide > Ambient VU > Idle
             if (timerState.active) {
                 currentLEDMode = LED_TIMER;
@@ -686,6 +701,34 @@ void loop() {
         isPlayingResponse = false;
         ambientSound.active = false;
         ambientSound.name = "";
+    }
+    
+    // Auto-transition from visualizations to conversation window
+    // After 10 seconds of showing tide/moon/timer, open conversation window if turn is complete
+    if (turnComplete && !conversationMode && !isPlayingResponse && !recordingActive) {
+        bool shouldOpenConversation = false;
+        
+        if (currentLEDMode == LED_TIDE && tideState.active) {
+            if (millis() - tideState.displayStartTime > 10000) {
+                Serial.println("🌊 Tide display complete - opening conversation window");
+                tideState.active = false;
+                shouldOpenConversation = true;
+            }
+        } else if (currentLEDMode == LED_MOON && moonState.active) {
+            if (millis() - moonState.displayStartTime > 10000) {
+                Serial.println("🌙 Moon display complete - opening conversation window");
+                moonState.active = false;
+                shouldOpenConversation = true;
+            }
+        }
+        // Note: Timer has its own expiry logic and shouldn't auto-transition
+        
+        if (shouldOpenConversation) {
+            conversationMode = true;
+            conversationWindowStart = millis();
+            currentLEDMode = LED_CONVERSATION_WINDOW;
+            Serial.println("💬 Conversation window opened - speak anytime in next 10 seconds");
+        }
     }
     
     // Conversation window monitoring
@@ -1276,19 +1319,9 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                         
                         recordingActive = false;  // Ensure recording is stopped
                         
-                        // Set LED mode - prioritize visualizations during playback
+                        // Always show VU meter during playback (visualizations will show after)
                         if (!ambientSound.active) {
-                            if (moonState.active) {
-                                currentLEDMode = LED_MOON;
-                                moonState.displayStartTime = millis();
-                                Serial.println("🌙 Showing moon visualization during playback");
-                            } else if (tideState.active) {
-                                currentLEDMode = LED_TIDE;
-                                tideState.displayStartTime = millis();
-                                Serial.println("🌊 Showing tide visualization during playback");
-                            } else {
-                                currentLEDMode = LED_AUDIO_REACTIVE;
-                            }
+                            currentLEDMode = LED_AUDIO_REACTIVE;
                         }
                         
                         firstAudioChunk = true;
@@ -1496,11 +1529,11 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
     
     // Handle timer set from server
     if (doc["type"].is<const char*>() && doc["type"] == "timerSet") {
-        Serial.println("⏱️  Timer set - starting countdown");
+        Serial.println("⏱️  Timer set - storing for display after speech");
         timerState.totalSeconds = doc["durationSeconds"].as<int>();
         timerState.startTime = millis();
         timerState.active = true;
-        currentLEDMode = LED_TIMER;  // Switch to timer display immediately
+        // Don't switch LED mode yet - let it display after audio finishes
         
         Serial.printf("⏱️  Timer: %d seconds (%d minutes)\n",
                       timerState.totalSeconds,
@@ -1543,12 +1576,13 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
     
     // Handle moon data
     if (doc["type"].is<const char*>() && doc["type"] == "moonData") {
+        Serial.println("🌙 Received moon data - storing for display after speech");
         moonState.phaseName = doc["phaseName"].as<String>();
         moonState.illumination = doc["illumination"].as<int>();
         moonState.moonAge = doc["moonAge"].as<float>();
-        moonState.displayStartTime = millis();
         moonState.active = true;
-        currentLEDMode = LED_MOON;
+        // Don't switch LED mode yet - let it display after audio finishes
+        
         Serial.printf("🌙 Moon: %s (%d%% illuminated, %.1f days old)\n", 
                       moonState.phaseName.c_str(), moonState.illumination, moonState.moonAge);
         return;
@@ -1657,7 +1691,7 @@ void updateLEDs() {
             
         case LED_RECORDING:
             // VU meter during recording - vertical bars on all strips with fade trail
-            // Orange gradient for person speaking (warm, friendly)
+            // Traditional VU meter colors: green → yellow → red
             {
                 // Fade all LEDs for trail effect
                 for (int i = 0; i < NUM_LEDS; i++) {
@@ -1673,14 +1707,23 @@ void updateLEDs() {
                     for (int row = 0; row < LEDS_PER_COLUMN; row++) {
                         int ledIndex = col * LEDS_PER_COLUMN + row;
                         
+                        // Bounds check to prevent array overflow
+                        if (ledIndex >= NUM_LEDS) {
+                            Serial.printf("⚠️ LED overflow: col=%d, row=%d, idx=%d\n", col, row, ledIndex);
+                            continue;
+                        }
+                        
                         if (row < numRows) {
-                            // Orange gradient for person
-                            if (row < LEDS_PER_COLUMN * 0.6) {
-                                leds[ledIndex] = CRGB(255, 140, 0);  // Soft orange (bottom 60%)
-                            } else if (row < LEDS_PER_COLUMN * 0.85) {
-                                leds[ledIndex] = CRGB(255, 100, 0);  // Deeper orange (60-85%)
+                            // Traditional VU meter gradient based on row height
+                            // Green at bottom, yellow in middle, red at top
+                            float progress = (float)row / (float)LEDS_PER_COLUMN;
+                            
+                            if (progress < 0.4) {
+                                leds[ledIndex] = CRGB(0, 255, 0);  // Green (bottom 40%)
+                            } else if (progress < 0.7) {
+                                leds[ledIndex] = CRGB(255, 255, 0);  // Yellow (40-70%)
                             } else {
-                                leds[ledIndex] = CRGB(255, 50, 0);  // Red-orange (top 85-100%)
+                                leds[ledIndex] = CRGB(255, 0, 0);  // Red (top 70-100%)
                             }
                         }
                         // LEDs above numRows keep their faded value
@@ -1789,7 +1832,7 @@ void updateLEDs() {
             
         case LED_AUDIO_REACTIVE:
             // VU meter during playback - vertical bars on all strips with fade trail
-            // Purple gradient for Gemini speaking (AI, calm)
+            // Blue/teal/indigo gradient for Gemini speaking (AI, calm)
             {
                 // Fade all LEDs for trail effect
                 for (int i = 0; i < NUM_LEDS; i++) {
@@ -1805,14 +1848,23 @@ void updateLEDs() {
                     for (int row = 0; row < LEDS_PER_COLUMN; row++) {
                         int ledIndex = col * LEDS_PER_COLUMN + row;
                         
+                        // Bounds check to prevent array overflow
+                        if (ledIndex >= NUM_LEDS) {
+                            Serial.printf("⚠️ LED overflow: col=%d, row=%d, idx=%d\n", col, row, ledIndex);
+                            continue;
+                        }
+                        
                         if (row < numRows) {
-                            // Purple gradient for Gemini
-                            if (row < LEDS_PER_COLUMN * 0.6) {
-                                leds[ledIndex] = CRGB(120, 60, 200);  // Soft purple (bottom 60%)
-                            } else if (row < LEDS_PER_COLUMN * 0.85) {
-                                leds[ledIndex] = CRGB(140, 40, 220);  // Brighter purple (60-85%)
+                            // Blue → cyan → magenta gradient based on row height
+                            // More pronounced color differences for better visibility
+                            float progress = (float)row / (float)LEDS_PER_COLUMN;
+                            
+                            if (progress < 0.4) {
+                                leds[ledIndex] = CRGB(0, 150, 255);  // Sky blue (bottom 40%)
+                            } else if (progress < 0.7) {
+                                leds[ledIndex] = CRGB(0, 255, 200);  // Cyan/aqua (40-70%)
                             } else {
-                                leds[ledIndex] = CRGB(160, 20, 240);  // Vibrant purple (top 85-100%)
+                                leds[ledIndex] = CRGB(150, 0, 255);  // Magenta/purple (top 70-100%)
                             }
                         }
                         // LEDs above numRows keep their faded value
@@ -1822,9 +1874,9 @@ void updateLEDs() {
             break;
             
         case LED_TIDE:
-            // Tide visualization: water level represented by LED count
-            // Blue = flooding (incoming), Red = ebbing (outgoing)
-            // Stays active until next user interaction
+            // Tide visualization: water level shown as vertical bars on all strips
+            // Blue = flooding (incoming), Orange = ebbing (outgoing)
+            // Wave effect ripples around the circular array
             {
                 // Debug: log mode switch
                 static uint32_t lastDebugLog = 0;
@@ -1834,24 +1886,42 @@ void updateLEDs() {
                     lastDebugLog = millis();
                 }
                 
-                // Calculate number of LEDs to light based on water level (0.0 to 1.0)
-                int numLEDs = max(1, (int)(tideState.waterLevel * NUM_LEDS));
+                // Calculate base water level in rows (0-12)
+                int baseRows = max(1, (int)(tideState.waterLevel * LEDS_PER_COLUMN));
                 
                 // Choose color based on tide state
-                CRGB tideColor = tideState.state == "flooding" ? CRGB(0, 100, 255) : CRGB(255, 50, 0);
+                CRGB tideColor = tideState.state == "flooding" ? CRGB(0, 100, 255) : CRGB(255, 100, 0);
                 
-                // Add gentle wave animation
-                float wave = sin((millis() / 1000.0) * 2.0) * 0.3 + 0.7; // 0.4 to 1.0
+                // Create wave effect that travels around the circle
+                // Each column gets a phase offset based on its position
+                float time = millis() / 1000.0;
                 
-                for (int i = 0; i < NUM_LEDS; i++) {
-                    if (i < numLEDs) {
-                        // Apply wave brightness modulation
-                        uint8_t r = (uint8_t)(tideColor.r * wave);
-                        uint8_t g = (uint8_t)(tideColor.g * wave);
-                        uint8_t b = (uint8_t)(tideColor.b * wave);
-                        leds[i] = CRGB(r, g, b);
-                    } else {
-                        leds[i] = CRGB(0, 0, 0);
+                for (int col = 0; col < LED_COLUMNS; col++) {
+                    // Phase offset for this column (creates traveling wave around circle)
+                    float phaseOffset = (float)col / (float)LED_COLUMNS * TWO_PI;
+                    
+                    // Wave oscillation: -2 to +2 rows
+                    float wave = sin(time * 1.5 + phaseOffset) * 2.0;
+                    
+                    // Calculate water level for this column with wave effect
+                    int waterRows = constrain(baseRows + (int)wave, 0, LEDS_PER_COLUMN);
+                    
+                    // Light the column from bottom up to water level
+                    for (int row = 0; row < LEDS_PER_COLUMN; row++) {
+                        int ledIndex = col * LEDS_PER_COLUMN + row;
+                        
+                        if (ledIndex >= NUM_LEDS) continue;
+                        
+                        if (row < waterRows) {
+                            // Add subtle brightness variation for water shimmer
+                            float shimmer = 0.7 + 0.3 * sin(time * 3.0 + phaseOffset * 2.0);
+                            uint8_t r = (uint8_t)(tideColor.r * shimmer);
+                            uint8_t g = (uint8_t)(tideColor.g * shimmer);
+                            uint8_t b = (uint8_t)(tideColor.b * shimmer);
+                            leds[ledIndex] = CRGB(r, g, b);
+                        } else {
+                            leds[ledIndex] = CRGB(0, 0, 0);
+                        }
                     }
                 }
                 
@@ -1916,40 +1986,52 @@ void updateLEDs() {
             break;
             
         case LED_MOON:
-            // Moon phase visualization - brightness based on illumination
+            // Moon phase visualization - grows from center outward
+            // New moon = center only, Full moon = all columns, then shrinks back
             {
                 if (moonState.active) {
                     // Soft blue-white color (low saturation for pale moon glow)
                     uint8_t moonHue = 160;  // Blue-cyan
                     uint8_t moonSat = 80;   // Low saturation for pale white-blue
                     
-                    // Map illumination (0-100%) to brightness
-                    uint8_t brightness = map(moonState.illumination, 0, 100, 20, 255);
-                    
-                    // Gentle pulse effect (slower for moon)
+                    // Gentle pulse effect for moon glow
                     float pulse = 0.85 + 0.15 * sin(millis() / 1500.0);
-                    brightness = (uint8_t)(brightness * pulse);
+                    uint8_t baseBrightness = (uint8_t)(220 * pulse);
                     
-                    // Number of LEDs lit based on illumination phase
-                    int numLEDs = map(moonState.illumination, 0, 100, 1, NUM_LEDS);
+                    // Calculate how many columns to light from center outward
+                    // illumination: 0% = 1 column (center), 100% = all 12 columns
+                    int numColumns = max(1, (int)((moonState.illumination / 100.0) * LED_COLUMNS));
                     
-                    for (int i = 0; i < NUM_LEDS; i++) {
-                        if (i < numLEDs) {
-                            // Gradient fade from center
-                            float fadePosition = (float)i / numLEDs;
-                            uint8_t ledBrightness = (uint8_t)(brightness * (1.0 - fadePosition * 0.3));
-                            leds[i] = CHSV(moonHue, moonSat, ledBrightness);
-                        } else {
-                            leds[i] = CRGB::Black;
+                    // Center column is column 5 or 6 (middle of 0-11)
+                    int centerCol = LED_COLUMNS / 2;  // 6 for 12 columns
+                    
+                    // Expand outward from center
+                    // e.g., 1 col = [6], 2 cols = [5,6], 3 cols = [5,6,7], etc.
+                    int leftMost = centerCol - (numColumns / 2);
+                    int rightMost = leftMost + numColumns - 1;
+                    
+                    // Clear all LEDs first
+                    fill_solid(leds, NUM_LEDS, CRGB::Black);
+                    
+                    // Light the columns from center outward
+                    for (int col = 0; col < LED_COLUMNS; col++) {
+                        if (col >= leftMost && col <= rightMost) {
+                            // This column should be lit - calculate brightness based on distance from center
+                            int distanceFromCenter = abs(col - centerCol);
+                            float brightnessFactor = 1.0 - (distanceFromCenter / (float)LED_COLUMNS * 0.3);  // Slight fade at edges
+                            uint8_t colBrightness = (uint8_t)(baseBrightness * brightnessFactor);
+                            
+                            // Light all rows in this column
+                            for (int row = 0; row < LEDS_PER_COLUMN; row++) {
+                                int ledIndex = col * LEDS_PER_COLUMN + row;
+                                if (ledIndex < NUM_LEDS) {
+                                    leds[ledIndex] = CHSV(moonHue, moonSat, colBrightness);
+                                }
+                            }
                         }
                     }
                     
-                    // Auto-return to IDLE after 20 seconds
-                    if (millis() - moonState.displayStartTime > 20000) {
-                        moonState.active = false;
-                        currentLEDMode = LED_IDLE;
-                        Serial.println("🌙 Moon display timeout - returning to IDLE");
-                    }
+                    // Note: Auto-return removed - handled by auto-transition to conversation window
                 } else {
                     fill_solid(leds, NUM_LEDS, CRGB::Black);
                 }
@@ -1987,19 +2069,61 @@ void updateLEDs() {
             break;
             
         case LED_AMBIENT_OCEAN:
-            // Swelling ocean waves - blue wave that rises and falls
+            // Swelling ocean waves - synced with actual ocean sound amplitude
+            // Wave height follows audio amplitude from playback stream
             {
-                float wave = (sin(millis() / 2000.0) + 1.0) / 2.0;  // 0.0 to 1.0
-                int numLit = (int)(wave * NUM_LEDS);
+                static float smoothedWave = 0.0f;
+                static uint32_t lastDebugLog = 0;
                 
-                for (int i = 0; i < NUM_LEDS; i++) {
-                    if (i < numLit) {
-                        // Gradient from deep blue to cyan
-                        uint8_t hue = 160 + (i * 10 / NUM_LEDS);  // 160-170 range
-                        uint8_t brightness = 150 + (i * 105 / NUM_LEDS);  // Brighter at top
-                        leds[i] = CHSV(hue, 255, brightness);
-                    } else {
-                        leds[i] = CRGB::Black;
+                // Use the actual playback audio level (calculated in audio task)
+                // currentAudioLevel is the average amplitude from PCM playback
+                float instantLevel = (float)currentAudioLevel;
+                
+                // Smooth the wave height for fluid motion (slower smoothing for ocean waves)
+                smoothedWave = smoothedWave * 0.90f + instantLevel * 0.10f;
+                
+                // Debug log every 2 seconds
+                if (millis() - lastDebugLog > 2000) {
+                    Serial.printf("🌊 Ocean: Level=%d, Smoothed=%.0f, Rows=%d/%d\n", 
+                                 currentAudioLevel, smoothedWave, 
+                                 (int)(constrain(smoothedWave / 400.0f, 0.15f, 0.95f) * LEDS_PER_COLUMN), 
+                                 LEDS_PER_COLUMN);
+                    lastDebugLog = millis();
+                }
+                
+                // Map audio level to wave height with dramatic swell
+                // Ocean sound typically has levels 50-300 (based on PCM amplitude)
+                // Use higher divisor for more dynamic range: low = 2 LEDs, high = 11 LEDs
+                float normalizedWave = constrain(smoothedWave / 400.0f, 0.15f, 0.95f);
+                
+                // Convert to number of rows (vertical wave on all columns)
+                int waveRows = (int)(normalizedWave * LEDS_PER_COLUMN);
+                
+                // Add MORE traveling wave phase for dramatic effect
+                float time = millis() / 3000.0;
+                
+                for (int col = 0; col < LED_COLUMNS; col++) {
+                    // Phase offset for traveling wave effect
+                    float phaseOffset = (float)col / (float)LED_COLUMNS * TWO_PI;
+                    float phaseWave = sin(time + phaseOffset) * 3.0;  // ±3 rows variation (was ±1.5)
+                    
+                    int colWaveRows = constrain(waveRows + (int)phaseWave, 1, LEDS_PER_COLUMN);
+                    
+                    // Light column from bottom to wave height
+                    for (int row = 0; row < LEDS_PER_COLUMN; row++) {
+                        int ledIndex = col * LEDS_PER_COLUMN + row;
+                        
+                        if (ledIndex >= NUM_LEDS) continue;
+                        
+                        if (row < colWaveRows) {
+                            // Gradient from deep blue (bottom) to cyan (top)
+                            float progress = (float)row / (float)LEDS_PER_COLUMN;
+                            uint8_t hue = 160 + (uint8_t)(progress * 10);  // 160-170 range
+                            uint8_t brightness = 150 + (uint8_t)(progress * 105);  // Brighter at top
+                            leds[ledIndex] = CHSV(hue, 255, brightness);
+                        } else {
+                            leds[ledIndex] = CRGB::Black;
+                        }
                     }
                 }
             }
@@ -2197,9 +2321,22 @@ void websocketTask(void * parameter) {
 }
 
 void ledTask(void * parameter) {
+    static uint32_t lastLedUpdate = 0;
+    static uint32_t ledTaskStalls = 0;
+    
     while(1) {
+        // Watchdog: detect if LED updates are stalling
+        uint32_t now = millis();
+        if (lastLedUpdate > 0 && (now - lastLedUpdate) > 200) {
+            ledTaskStalls++;
+            Serial.printf("⚠️ LED task stalled #%d: %dms since last update\n", 
+                         ledTaskStalls, now - lastLedUpdate);
+        }
+        
         updateLEDs();
         FastLED.show();
+        lastLedUpdate = millis();
+        
         vTaskDelay(30 / portTICK_PERIOD_MS);  // 33Hz update rate - matches audio chunk timing better
     }
 }

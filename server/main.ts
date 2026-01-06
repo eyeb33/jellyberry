@@ -708,13 +708,7 @@ Deno.serve({
           }
         }
         
-        // Setup message - establish Gemini connection
-        if (data.type === "setup" || (!connection.geminiSocket && typeof event.data === "string")) {
-          await connectToGemini(connection);
-          return;
-        }
-        
-        // Handle ambient sound requests from ESP32
+        // Handle ambient sound requests from ESP32 (check BEFORE setup to avoid misclassification)
         if (data.action === "requestAmbient") {
           const soundName = data.sound || "rain";
           const sequence = data.sequence || 0;
@@ -735,9 +729,9 @@ Deno.serve({
             
             // Read and stream the PCM file with sequence header
             const audioData = await Deno.readFile(audioPath);
-            console.log(`[${deviceId}] ✓ Loaded ${soundName}.pcm (${audioData.byteLength} bytes)`);
+            console.log(`[${deviceId}] ✓ Loaded ${soundName}.pcm (${audioData.byteLength} bytes) - looping...`);
             
-            // Stream with flow control
+            // Stream with flow control - loop continuously until cancelled
             const CHUNK_SIZE = 1024;
             const CHUNKS_PER_BATCH = 5;
             const BATCH_DELAY_MS = 100;
@@ -745,7 +739,7 @@ Deno.serve({
             let position = 0;
             let chunksInBatch = 0;
             
-            while (position < audioData.byteLength && connection.socket.readyState === WebSocket.OPEN && !cancelled) {
+            while (connection.socket.readyState === WebSocket.OPEN && !cancelled) {
               const chunk = audioData.slice(position, Math.min(position + CHUNK_SIZE, audioData.byteLength));
               
               // Prepend 4-byte magic header: [0xA5, 0x5A, sequence_low, sequence_high]
@@ -765,6 +759,11 @@ Deno.serve({
               position += CHUNK_SIZE;
               chunksInBatch++;
               
+              // Loop back to start when file ends
+              if (position >= audioData.byteLength) {
+                position = 0;
+              }
+              
               if (chunksInBatch >= CHUNKS_PER_BATCH) {
                 await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
                 chunksInBatch = 0;
@@ -774,7 +773,7 @@ Deno.serve({
             if (cancelled) {
               console.log(`[${deviceId}] ✗ Stream cancelled: ${soundName}.pcm (sequence ${sequence})`);
             } else {
-              console.log(`[${deviceId}] ✓ Streamed ${soundName}.pcm (sequence ${sequence})`);
+              console.log(`[${deviceId}] ✓ Stream ended: ${soundName}.pcm (sequence ${sequence})`);
             }
             
             // Clear cancellation handler if this stream completed
@@ -795,6 +794,12 @@ Deno.serve({
             connection.ambientStreamCancel = null;
             console.log(`[${deviceId}] ✓ Ambient stream stopped`);
           }
+          return;
+        }
+        
+        // Setup message - establish Gemini connection (check AFTER ambient handlers)
+        if (data.type === "setup" || (!connection.geminiSocket && typeof event.data === "string")) {
+          await connectToGemini(connection);
           return;
         }
         

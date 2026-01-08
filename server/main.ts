@@ -66,6 +66,7 @@ interface ClientConnection {
   lastFunctionResult?: any;
   pendingFunctionCallId?: string;
   ambientStreamCancel?: (() => void) | null;
+  ambientSequence?: number;  // Current ambient stream sequence number
   
   // Session tracking for diagnostics
   geminiConnectedAt?: number;  // Timestamp when Gemini connected
@@ -712,7 +713,7 @@ Deno.serve({
         if (data.action === "requestAmbient") {
           const soundName = data.sound || "rain";
           const sequence = data.sequence || 0;
-          console.log(`[${deviceId}] Ambient sound requested: ${soundName} (sequence ${sequence})`);
+          console.log(`[${deviceId}] 🎵 Ambient sound requested: ${soundName} (sequence ${sequence})`);
           
           // Cancel any existing ambient stream for this connection
           if (connection.ambientStreamCancel) {
@@ -720,12 +721,18 @@ Deno.serve({
             console.log(`[${deviceId}] ✗ Cancelled previous ambient stream`);
           }
           
+          // Store current sequence number to validate later
+          connection.ambientSequence = sequence;
+          
           const audioPath = `./audio/${soundName}.pcm`;
           
           try {
             // Create cancellation flag for this stream
             let cancelled = false;
-            connection.ambientStreamCancel = () => { cancelled = true; };
+            connection.ambientStreamCancel = () => { 
+              cancelled = true;
+              console.log(`[${deviceId}] 🛑 Cancel flag set for sequence ${sequence}`);
+            };
             
             // Read and stream the PCM file with sequence header
             const audioData = await Deno.readFile(audioPath);
@@ -740,6 +747,18 @@ Deno.serve({
             let chunksInBatch = 0;
             
             while (connection.socket.readyState === WebSocket.OPEN && !cancelled) {
+              // Check cancellation before processing
+              if (cancelled) {
+                console.log(`[${deviceId}] ✗ Stream cancelled before chunk ${Math.floor(position / CHUNK_SIZE)}`);
+                break;
+              }
+              
+              // ADDITIONAL CHECK: Stop if sequence number changed (new request came in)
+              if (connection.ambientSequence !== sequence) {
+                console.log(`[${deviceId}] ✗ Sequence mismatch: streaming ${sequence} but current is ${connection.ambientSequence}, stopping`);
+                break;
+              }
+              
               const chunk = audioData.slice(position, Math.min(position + CHUNK_SIZE, audioData.byteLength));
               
               // Prepend 4-byte magic header: [0xA5, 0x5A, sequence_low, sequence_high]
@@ -754,14 +773,33 @@ Deno.serve({
               chunkWithHeader.set(header, 0);
               chunkWithHeader.set(chunk, header.length);
               
-              connection.socket.send(chunkWithHeader);
+              try {
+                connection.socket.send(chunkWithHeader);
+              } catch (err) {
+                console.log(`[${deviceId}] ❌ Send failed, stopping stream: ${err}`);
+                break;
+              }
               
               position += CHUNK_SIZE;
               chunksInBatch++;
               
-              // Loop back to start when file ends
+              // Check cancellation after send
+              if (cancelled) {
+                console.log(`[${deviceId}] ✗ Stream cancelled after chunk ${Math.floor(position / CHUNK_SIZE)}`);
+                break;
+              }
+              
+              // Check if file ended
               if (position >= audioData.byteLength) {
-                position = 0;
+                // For meditation sounds (om001-007), play once and send completion
+                // For other ambient sounds, loop continuously
+                if (soundName.startsWith('om')) {
+                  console.log(`[${deviceId}] ✓ Meditation track ${soundName} completed - not looping`);
+                  break;  // Exit loop to trigger completion notification
+                } else {
+                  // Loop ambient sounds (rain, ocean, rainforest)
+                  position = 0;
+                }
               }
               
               if (chunksInBatch >= CHUNKS_PER_BATCH) {
@@ -773,26 +811,45 @@ Deno.serve({
             if (cancelled) {
               console.log(`[${deviceId}] ✗ Stream cancelled: ${soundName}.pcm (sequence ${sequence})`);
             } else {
-              console.log(`[${deviceId}] ✓ Stream ended: ${soundName}.pcm (sequence ${sequence})`);
+              console.log(`[${deviceId}] ✓ Stream ended naturally: ${soundName}.pcm (sequence ${sequence})`);
+              
+              // Notify ESP32 that stream completed naturally
+              const completionMsg = JSON.stringify({
+                type: "ambientComplete",
+                sound: soundName,
+                sequence: sequence
+              });
+              connection.socket.send(completionMsg);
+              console.log(`[${deviceId}] 📤 Sent completion notification for ${soundName}`);
             }
             
-            // Clear cancellation handler if this stream completed
-            if (connection.ambientStreamCancel === connection.ambientStreamCancel) {
+            // Clear cancellation handler ONLY if this sequence is still current
+            // (prevents clearing handler for a newer stream)
+            if (connection.ambientSequence === sequence) {
               connection.ambientStreamCancel = null;
+              console.log(`[${deviceId}] ✓ Cleared cancel handler for sequence ${sequence}`);
+            } else {
+              console.log(`[${deviceId}] ⚠️  Not clearing cancel handler (current seq ${connection.ambientSequence}, ended seq ${sequence})`);
             }
           } catch (error) {
             console.error(`[${deviceId}] ❌ Error loading ambient sound:`, error);
+            // Only clear if this was the current stream
+            if (connection.ambientSequence === sequence) {
+              connection.ambientStreamCancel = null;
+            }
           }
           return;
         }
         
         // Handle stop ambient request from ESP32
         if (data.action === "stopAmbient") {
-          console.log(`[${deviceId}] ⏹️  Stop ambient sound requested`);
+          console.log(`[${deviceId}] 🛑 Stop ambient sound requested`);
           if (connection.ambientStreamCancel) {
             connection.ambientStreamCancel();
             connection.ambientStreamCancel = null;
-            console.log(`[${deviceId}] ✓ Ambient stream stopped`);
+            console.log(`[${deviceId}] ✓ Ambient stream cancel called`);
+          } else {
+            console.log(`[${deviceId}] ⚠️  No active stream to cancel`);
           }
           return;
         }
@@ -963,6 +1020,60 @@ async function connectToGemini(connection: ClientConnection) {
             {
               name: "get_moon_phase",
               description: "Get the current moon phase information. ONLY use this when the user specifically asks about the moon, moon phase, or lunar cycle. Do not call this for unrelated questions.",
+              parameters: {
+                type: "OBJECT",
+                properties: {},
+                required: []
+              }
+            },
+            {
+              name: "start_pomodoro",
+              description: "Start a Pomodoro timer session with 25-minute focus periods and breaks. Use when user says 'start pomodoro', 'begin focus session', 'help me focus', etc.",
+              parameters: {
+                type: "OBJECT",
+                properties: {},
+                required: []
+              }
+            },
+            {
+              name: "pause_pomodoro",
+              description: "Pause the current Pomodoro timer. Use when user says 'pause timer', 'pause pomodoro', 'take a break', etc.",
+              parameters: {
+                type: "OBJECT",
+                properties: {},
+                required: []
+              }
+            },
+            {
+              name: "resume_pomodoro",
+              description: "Resume a paused Pomodoro timer. Use when user says 'resume timer', 'continue working', 'unpause', etc.",
+              parameters: {
+                type: "OBJECT",
+                properties: {},
+                required: []
+              }
+            },
+            {
+              name: "stop_pomodoro",
+              description: "Stop and exit Pomodoro mode entirely. Use when user says 'stop pomodoro', 'cancel focus session', 'end pomodoro', etc.",
+              parameters: {
+                type: "OBJECT",
+                properties: {},
+                required: []
+              }
+            },
+            {
+              name: "skip_pomodoro_session",
+              description: "Skip the current session and advance to the next one (focus to break, or break to focus). Use when user says 'skip this break', 'skip to next session', etc.",
+              parameters: {
+                type: "OBJECT",
+                properties: {},
+                required: []
+              }
+            },
+            {
+              name: "get_pomodoro_status",
+              description: "Get the current Pomodoro timer status (session type, time remaining, session count). Use when user asks 'how much time left', 'what session am I in', 'pomodoro status', etc.",
               parameters: {
                 type: "OBJECT",
                 properties: {},
@@ -1140,6 +1251,61 @@ async function connectToGemini(connection: ClientConnection) {
                   moonAge: functionResult.moonAge
                 }));
               }
+            } else if (funcName === "start_pomodoro") {
+              console.log(`[${connection.deviceId}] Starting Pomodoro session`);
+              connection.socket.send(JSON.stringify({
+                type: "pomodoroStart"
+              }));
+              functionResult = {
+                success: true,
+                message: "Pomodoro timer started with a 25-minute focus session"
+              };
+            } else if (funcName === "pause_pomodoro") {
+              console.log(`[${connection.deviceId}] Pausing Pomodoro`);
+              connection.socket.send(JSON.stringify({
+                type: "pomodoroPause"
+              }));
+              functionResult = {
+                success: true,
+                message: "Pomodoro timer paused"
+              };
+            } else if (funcName === "resume_pomodoro") {
+              console.log(`[${connection.deviceId}] Resuming Pomodoro`);
+              connection.socket.send(JSON.stringify({
+                type: "pomodoroResume"
+              }));
+              functionResult = {
+                success: true,
+                message: "Pomodoro timer resumed"
+              };
+            } else if (funcName === "stop_pomodoro") {
+              console.log(`[${connection.deviceId}] Stopping Pomodoro`);
+              connection.socket.send(JSON.stringify({
+                type: "pomodoroStop"
+              }));
+              functionResult = {
+                success: true,
+                message: "Pomodoro session ended"
+              };
+            } else if (funcName === "skip_pomodoro_session") {
+              console.log(`[${connection.deviceId}] Skipping Pomodoro session`);
+              connection.socket.send(JSON.stringify({
+                type: "pomodoroSkip"
+              }));
+              functionResult = {
+                success: true,
+                message: "Skipped to next Pomodoro session"
+              };
+            } else if (funcName === "get_pomodoro_status") {
+              console.log(`[${connection.deviceId}] Getting Pomodoro status`);
+              connection.socket.send(JSON.stringify({
+                type: "pomodoroStatusRequest"
+              }));
+              // Note: ESP32 will send back status, but for now return placeholder
+              functionResult = {
+                success: true,
+                message: "Pomodoro status requested from device"
+              };
             }
             
             // Send function response back to Gemini

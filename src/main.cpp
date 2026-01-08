@@ -13,6 +13,11 @@
 #include <lwip/sockets.h>
 #include "Config.h"
 
+// Chakra names array (used across multiple functions)
+static const char* CHAKRA_NAMES[NUM_CHAKRAS] = {
+    "ROOT", "SACRAL", "SOLAR", "HEART", "THROAT", "THIRD_EYE", "CROWN"
+};
+
 // ============== GLOBAL STATE ==============
 WiFiClientSecure wifiClient;
 WebSocketsClient webSocket;
@@ -67,7 +72,7 @@ struct AudioChunk {
     size_t length;
 };
 
-enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU, LED_AMBIENT, LED_POMODORO, LED_MEDITATION, LED_CONVERSATION_WINDOW, LED_MARQUEE };
+enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU, LED_AMBIENT, LED_POMODORO, LED_MEDITATION, LED_CLOCK, LED_LAMP, LED_CONVERSATION_WINDOW, LED_MARQUEE };
 LEDMode currentLEDMode = LED_IDLE;  // Start directly in idle mode
 LEDMode targetLEDMode = LED_IDLE;  // Mode to switch to after marquee finishes
 bool ambientVUMode = false;  // Toggle for ambient sound VU meter mode
@@ -148,6 +153,29 @@ struct MeditationState {
     float savedVolume;       // User's volume before meditation
 } meditationState = {MeditationState::ROOT, MeditationState::INHALE, 0, false, true, false, 1.0f};
 
+// Clock display state
+struct ClockState {
+    int lastHour;            // Last displayed hour
+    int lastMinute;          // Last displayed minute
+    int scrollPosition;      // Horizontal scroll position for rotating display
+    uint32_t lastScrollUpdate; // Last time scroll position updated
+    bool active;             // Clock mode active
+} clockState = {-1, -1, 0, 0, false};
+
+// Lamp mode state
+struct LampState {
+    enum Color { WHITE, RED, GREEN, BLUE };
+    Color currentColor;      // Current target color
+    Color previousColor;     // Color being replaced
+    int currentRow;          // Current row being lit (0-11)
+    int currentCol;          // Current column within row (0-11)
+    uint32_t lastUpdate;     // Last LED update time
+    uint32_t ledStartTimes[NUM_LEDS]; // Start time for each LED fade
+    bool active;             // Lamp mode active
+    bool fullyLit;           // All LEDs fully lit
+    bool transitioning;      // Currently transitioning between colors
+} lampState = {LampState::WHITE, LampState::WHITE, 0, 0, 0, {0}, false, false, false};
+
 // ============== FORWARD DECLARATIONS ==============
 void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length);
 void websocketTask(void * parameter);
@@ -163,6 +191,7 @@ void playStartupSound();
 void playShutdownSound();
 void playVolumeChime();
 void startMarquee(String text, CRGB color, LEDMode nextMode);
+void clearAudioAndLEDs();  // Helper to clear audio buffers and LEDs
 
 // ============== MARQUEE FUNCTIONS ==============
 
@@ -186,6 +215,28 @@ void startMarquee(String text, CRGB color, LEDMode nextMode) {
     currentLEDMode = LED_MARQUEE;
     Serial.printf("📜 Starting marquee: '%s' (width=%d px)\n", text.c_str(), marqueeState.textWidth);
 }
+
+// ============== HELPER FUNCTIONS ==============
+
+// Helper function to clear audio buffers and LEDs (called during mode transitions)
+void clearAudioAndLEDs() {
+    // Triple clear audio buffer for clean slate
+    i2s_zero_dma_buffer(I2S_NUM_1);
+    delay(30);
+    i2s_zero_dma_buffer(I2S_NUM_1);
+    delay(30);
+    i2s_zero_dma_buffer(I2S_NUM_1);
+    
+    // Clear LED buffer with mutex protection
+    if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
+        fill_solid(leds, NUM_LEDS, CRGB::Black);
+        FastLED.show();
+        xSemaphoreGive(ledMutex);
+    }
+    
+    delay(50);  // Let everything settle
+}
+
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
 
 // ============== WIFI EVENT HANDLER ==============
@@ -248,8 +299,8 @@ void setup() {
     FastLED.setCorrection(TypicalLEDStrip);  // Color correction for consistent output
     
     // Initialize NeoMatrix for text/graphics (12x12 grid)
-    // Layout: columns are vertical strips, progressive order
-    matrix = new FastLED_NeoMatrix(leds, LED_COLUMNS, LEDS_PER_COLUMN,
+    // Layout: Correct orientation with TOP + LEFT + COLUMNS + PROGRESSIVE
+    matrix = new FastLED_NeoMatrix(leds, LEDS_PER_COLUMN, LED_COLUMNS,
         NEO_MATRIX_TOP + NEO_MATRIX_LEFT + NEO_MATRIX_COLUMNS + NEO_MATRIX_PROGRESSIVE);
     matrix->begin();
     matrix->setTextWrap(false);  // Don't wrap text
@@ -485,6 +536,20 @@ void loop() {
                 Serial.printf("🔊 Volume restored to %.0f%%\n", volumeMultiplier * 100);
             }
             
+            // Clear Clock
+            if (clockState.active) {
+                clockState.active = false;
+                clockState.lastHour = -1;
+                clockState.lastMinute = -1;
+                clockState.scrollPosition = 0;
+            }
+            
+            // Clear Lamp
+            if (lampState.active) {
+                lampState.active = false;
+                lampState.fullyLit = false;
+            }
+            
             // Return to IDLE and start recording immediately
             currentLEDMode = LED_IDLE;
             targetLEDMode = LED_IDLE;
@@ -665,11 +730,79 @@ void loop() {
                 Serial.println("🧘 Meditation mode activated (waiting for marquee)");
                 startMarquee("MEDITATION", CRGB(255, 0, 255), LED_MEDITATION);  // Magenta
             } else if (modeToCheck == LED_MEDITATION) {
-                // Exit Meditation and return to IDLE
+                // Exit Meditation and go to Clock
                 Serial.println("⏹️  Meditation mode stopped");
                 
                 // Clear meditation state
                 meditationState.active = false;
+                meditationState.paused = false;
+                meditationState.phaseStartTime = 0;
+                meditationState.streaming = false;
+                volumeMultiplier = meditationState.savedVolume;  // Restore volume
+                Serial.printf("🔊 Volume restored to %.0f%%\n", volumeMultiplier * 100);
+                
+                // Stop any audio
+                JsonDocument stopDoc;
+                stopDoc["action"] = "stopAmbient";
+                String stopMsg;
+                serializeJson(stopDoc, stopMsg);
+                webSocket.sendTXT(stopMsg);
+                
+                // Clear audio and LEDs
+                clearAudioAndLEDs();
+                
+                // Clear ambient state
+                isPlayingResponse = false;
+                isPlayingAmbient = false;
+                ambientSound.active = false;
+                ambientSound.name = "";
+                ambientSound.sequence++;
+                
+                // Initialize clock state
+                clockState.active = true;
+                clockState.lastHour = -1;  // Force initial display
+                clockState.lastMinute = -1;
+                clockState.scrollPosition = 0;
+                clockState.lastScrollUpdate = millis();
+                
+                Serial.println("🕐 Clock mode activated");
+                startMarquee("CLOCK", CRGB::White, LED_CLOCK);
+            } else if (modeToCheck == LED_CLOCK) {
+                // Exit Clock and go to Lamp
+                Serial.println("⏹️  Clock mode stopped");
+                
+                // Clear clock state
+                clockState.active = false;
+                clockState.lastHour = -1;
+                clockState.lastMinute = -1;
+                clockState.scrollPosition = 0;
+                
+                // Initialize lamp state
+                lampState.active = true;
+                lampState.currentColor = LampState::WHITE;
+                lampState.previousColor = LampState::WHITE;
+                lampState.currentRow = 0;
+                lampState.currentCol = 0;
+                lampState.lastUpdate = millis();
+                lampState.fullyLit = false;
+                lampState.transitioning = false;
+                for (int i = 0; i < NUM_LEDS; i++) {
+                    lampState.ledStartTimes[i] = 0;
+                }
+                
+                Serial.println("💡 Lamp mode activated");
+                startMarquee("LAMP", CRGB::White, LED_LAMP);
+            } else if (modeToCheck == LED_LAMP) {
+                // Exit Lamp and return to IDLE
+                Serial.println("⏹️  Lamp mode stopped");
+                
+                // Clear lamp state
+                lampState.active = false;
+                lampState.fullyLit = false;
+                
+                Serial.println("💤 Returning to IDLE mode");
+                currentLEDMode = LED_IDLE;
+                targetLEDMode = LED_IDLE;
                 meditationState.paused = false;
                 meditationState.phaseStartTime = 0;
                 meditationState.streaming = false;
@@ -845,9 +978,8 @@ void loop() {
                     lastAudioChunkTime = millis();
                     
                     // Show chakra name
-                    const char* chakraNames[] = {"ROOT", "SACRAL", "SOLAR", "HEART", "THROAT", "THIRD EYE", "CROWN"};
-                    Serial.printf("🧘 Chakra changed to %s\n", chakraNames[meditationState.currentChakra]);
-                    startMarquee(chakraNames[meditationState.currentChakra], CRGB(255, 0, 255), LED_MEDITATION);
+                    Serial.printf("🧘 Chakra changed to %s\n", CHAKRA_NAMES[meditationState.currentChakra]);
+                    startMarquee(CHAKRA_NAMES[meditationState.currentChakra], CRGB(255, 0, 255), LED_MEDITATION);
                     
                     playVolumeChime();
                     lastMeditationAction = millis();
@@ -888,9 +1020,32 @@ void loop() {
             currentLEDMode = LED_RECORDING;
             Serial.printf("🎤 Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
         }
+        // LAMP MODE: Button 1 cycles colors (WHITE → RED → GREEN → BLUE)
+        else if (currentLEDMode == LED_LAMP && lampState.active && startTouch && !startPressed) {
+            // Cycle to next color
+            lampState.previousColor = lampState.currentColor;
+            lampState.currentColor = (LampState::Color)((lampState.currentColor + 1) % 4);
+            
+            // Reset spiral for transition effect
+            lampState.currentRow = 0;
+            lampState.currentCol = 0;
+            lampState.lastUpdate = millis();
+            lampState.fullyLit = false;
+            lampState.transitioning = true;
+            
+            // Reset LED start times for new spiral
+            for (int i = 0; i < NUM_LEDS; i++) {
+                lampState.ledStartTimes[i] = 0;
+            }
+            
+            const char* colorNames[] = {"WHITE", "RED", "GREEN", "BLUE"};
+            Serial.printf("🎨 Lamp color: %s → %s\n", 
+                         colorNames[lampState.previousColor], 
+                         colorNames[lampState.currentColor]);
+        }
         // Start recording on rising edge (normal case - not interrupting)
-        // Block if: recording active, playing response, OR in ambient sound mode, OR conversation window is open, OR in Pomodoro/Meditation/Ambient mode
-        else if (currentLEDMode != LED_POMODORO && currentLEDMode != LED_MEDITATION && currentLEDMode != LED_AMBIENT && startTouch && !startPressed && !recordingActive && !isPlayingResponse && !isPlayingAmbient && !conversationMode) {
+        // Block if: recording active, playing response, OR in ambient sound mode, OR conversation window is open, OR in Pomodoro/Meditation/Ambient/Lamp mode
+        else if (currentLEDMode != LED_POMODORO && currentLEDMode != LED_MEDITATION && currentLEDMode != LED_AMBIENT && currentLEDMode != LED_LAMP && startTouch && !startPressed && !recordingActive && !isPlayingResponse && !isPlayingAmbient && !conversationMode) {
             // Clear all previous state
             responseInterrupted = false;
             conversationRecording = false;  // Button press = normal recording timeout
@@ -959,7 +1114,7 @@ void loop() {
     // Timeout PROCESSING mode if no response after 10 seconds
     if ((currentLEDMode == LED_PROCESSING || currentLEDMode == LED_RECORDING) && 
         processingStartTime > 0 && (millis() - processingStartTime) > 10000) {
-        Serial.println("⚠️  Processing timeout - no response received, returning to IDLE");
+        Serial.printf("⚠️  Processing timeout after 10s - no response received, returning to IDLE (mode was %d)\n", currentLEDMode);
         currentLEDMode = LED_IDLE;
         processingStartTime = 0;
     }
@@ -974,7 +1129,7 @@ void loop() {
         
         if (noNewPackets && queueDrained) {
             isPlayingResponse = false;
-            Serial.printf("⏹️  Audio playback complete (timeout + queue drained to %u)\n", queueDepth);
+            Serial.printf("⏹️  Audio playback complete (timeout + queue drained to %u), turnComplete=%d\n", queueDepth, turnComplete);
         
         // Check if turn is complete - if so, decide what to show
         // Skip conversation mode for startup greeting
@@ -1201,14 +1356,22 @@ void loop() {
                 // Use lower threshold during conversation window for faster response
                 if (samples_read > 0 && avgAmplitude > VAD_CONVERSATION_THRESHOLD) {
                     // Voice detected! Start recording immediately
-                    Serial.println("🎤 Voice detected in conversation window - starting recording");
+                    Serial.printf("🎤 Voice detected in conversation window - avgAmp=%d, starting recording\n", avgAmplitude);
+                    
+                    // Set audio level immediately for instant VU meter feedback
+                    currentAudioLevel = avgAmplitude;
+                    
+                    // Exit conversation mode and start recording
                     conversationMode = false;  // Exit window mode
                     conversationRecording = true;  // Flag for longer silence timeout
                     recordingActive = true;
                     recordingStartTime = millis();
                     lastVoiceActivityTime = millis();
+                    processingStartTime = 0;  // CRITICAL: Reset processing timer to prevent immediate timeout
                     currentLEDMode = LED_RECORDING;
                     lastDebounceTime = millis();  // Reset debounce to prevent immediate stop
+                    
+                    Serial.printf("✅ Recording mode activated: LED=%d, audioLevel=%d\n", currentLEDMode, currentAudioLevel);
                 }
             } else {
                 static uint32_t lastErrorPrint = 0;
@@ -2064,8 +2227,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
                 firstAudioChunk = true;
                 lastAudioChunkTime = millis();
                 
-                const char* chakraNames[] = {"ROOT", "SACRAL", "SOLAR", "HEART", "THROAT", "THIRD EYE", "CROWN"};
-                Serial.printf("🧘 Auto-advancing to %s chakra (color will smoothly transition)\n", chakraNames[meditationState.currentChakra]);
+                Serial.printf("🧘 Auto-advancing to %s chakra (color will smoothly transition)\n", CHAKRA_NAMES[meditationState.currentChakra]);
                 // DON'T show marquee - let LED color smoothly transition in breathing visualization
             } else {
                 // All chakras complete - show completion message
@@ -2235,14 +2397,14 @@ void updateLEDs() {
                         float distance = abs(wavePos - row);
                         
                         // Soft wave with gradient trail (6 LED spread for smoother effect)
-                        if (distance < 6.0) {
-                            float waveBrightness = (1.0 - (distance / 6.0));
+                        if (distance < IDLE_WAVE_SPREAD) {
+                            float waveBrightness = (1.0 - (distance / IDLE_WAVE_SPREAD));
                             waveBrightness = waveBrightness * waveBrightness;  // Squared for softer falloff
-                            uint8_t brightness = (uint8_t)(waveBrightness * 180 + 30);  // 30-210 range (not too bright)
+                            uint8_t brightness = (uint8_t)(waveBrightness * (IDLE_WAVE_BRIGHTNESS_MAX - IDLE_WAVE_BRIGHTNESS_MIN) + IDLE_WAVE_BRIGHTNESS_MIN);
                             leds[ledIndex] = CHSV(160, 200, brightness);  // Blue hue locked at 160
                         } else {
                             // Base ambient glow when wave is far away
-                            leds[ledIndex] = CHSV(160, 200, 30);  // Dim blue
+                            leds[ledIndex] = CHSV(160, 200, IDLE_WAVE_BRIGHTNESS_MIN);  // Dim blue
                         }
                     }
                 }
@@ -2605,6 +2767,14 @@ void updateLEDs() {
                     // Falling rain effect - random blue drops falling down
                     static uint32_t lastDrop = 0;
                     static uint8_t dropBrightness[144] = {0};  // Track drop brightness (max LEDs)
+                    static bool rainInitialized = false;
+                    
+                    // Reset on first entry to rain mode
+                    if (!rainInitialized) {
+                        memset(dropBrightness, 0, sizeof(dropBrightness));
+                        lastDrop = millis();
+                        rainInitialized = true;
+                    }
                     
                     // Fade all LEDs
                     for (int i = 0; i < NUM_LEDS; i++) {
@@ -2612,8 +2782,8 @@ void updateLEDs() {
                     }
                     
                     // Add new drops randomly
-                    if (millis() - lastDrop > 100) {
-                        if (random(100) < 30) {  // 30% chance each 100ms
+                    if (millis() - lastDrop > RAIN_DROP_SPAWN_INTERVAL_MS) {
+                        if (random(100) < RAIN_DROP_SPAWN_CHANCE) {  // 30% chance each 100ms
                             int pos = random(NUM_LEDS);
                             dropBrightness[pos] = 255;
                         }
@@ -2624,7 +2794,7 @@ void updateLEDs() {
                     for (int i = 0; i < NUM_LEDS; i++) {
                         if (dropBrightness[i] > 0) {
                             leds[i] = CHSV(160, 255, dropBrightness[i]);  // Blue
-                            dropBrightness[i] = dropBrightness[i] * 0.85;  // Fade out
+                            dropBrightness[i] = dropBrightness[i] * RAIN_DROP_FADE_RATE;  // Fade out
                         }
                     }
                 } else if (currentAmbientSoundType == SOUND_OCEAN) {
@@ -2632,6 +2802,13 @@ void updateLEDs() {
                     // Wave height follows audio amplitude from playback stream
                     static float smoothedWave = 0.0f;
                     static uint32_t lastDebugLog = 0;
+                    static bool oceanInitialized = false;
+                    
+                    // Reset on first entry to ocean mode
+                    if (!oceanInitialized) {
+                        smoothedWave = 0.0f;
+                        oceanInitialized = true;
+                    }
                     
                     // Use the actual playback audio level (calculated in audio task)
                     // currentAudioLevel is the average amplitude from PCM playback
@@ -2831,19 +3008,24 @@ void updateLEDs() {
                     CRGB currentColor = chakraColors[meditationState.currentChakra];
                     
                     // Smooth color transition between chakras
-                    static int lastChakra = 0;
-                    static CRGB lastColor = chakraColors[0];
+                    static int lastChakra = -1;  // -1 = uninitialized
+                    static CRGB lastColor = CRGB::Black;
                     static uint32_t colorTransitionStart = 0;
-                    const uint32_t COLOR_TRANSITION_MS = 3000;  // 3 second fade between colors
+                    
+                    // Initialize on first use
+                    if (lastChakra == -1) {
+                        lastChakra = meditationState.currentChakra;
+                        lastColor = currentColor;
+                        colorTransitionStart = millis() - COLOR_TRANSITION_MS;  // Already complete
+                    }
                     
                     // Detect chakra change and start color transition
                     if (meditationState.currentChakra != lastChakra) {
                         lastChakra = meditationState.currentChakra;
                         colorTransitionStart = millis();
                         
-                        const char* chakraNames[] = {"ROOT", "SACRAL", "SOLAR", "HEART", "THROAT", "THIRD_EYE", "CROWN"};
                         Serial.printf("🎨 Chakra changed to %s: RGB(%d,%d,%d) - starting 3s color fade\n", 
-                                     chakraNames[meditationState.currentChakra],
+                                     CHAKRA_NAMES[meditationState.currentChakra],
                                      currentColor.r, currentColor.g, currentColor.b);
                     }
                     
@@ -2884,24 +3066,24 @@ void updateLEDs() {
                         
                         // Calculate brightness based on breath phase (all LEDs breathe together)
                         // 20% to 100% breathing effect for entire sphere
-                        float breathBrightness = 0.20f;  // Default to minimum
+                        float breathBrightness = MEDITATION_BREATH_MIN;  // Default to minimum
                         
                         switch (currentPhase) {
                             case MeditationState::INHALE:
                                 // Smooth fade from 20% to 100% over 4 seconds
-                                breathBrightness = 0.20f + (0.80f * phaseProgress);
+                                breathBrightness = MEDITATION_BREATH_MIN + ((MEDITATION_BREATH_MAX - MEDITATION_BREATH_MIN) * phaseProgress);
                                 break;
                             case MeditationState::HOLD_TOP:
                                 // Hold at 100% for 4 seconds
-                                breathBrightness = 1.0f;
+                                breathBrightness = MEDITATION_BREATH_MAX;
                                 break;
                             case MeditationState::EXHALE:
                                 // Smooth fade from 100% to 20% over 4 seconds
-                                breathBrightness = 1.0f - (0.80f * phaseProgress);
+                                breathBrightness = MEDITATION_BREATH_MAX - ((MEDITATION_BREATH_MAX - MEDITATION_BREATH_MIN) * phaseProgress);
                                 break;
                             case MeditationState::HOLD_BOTTOM:
                                 // Hold at 20% for 4 seconds
-                                breathBrightness = 0.20f;
+                                breathBrightness = MEDITATION_BREATH_MIN;
                                 break;
                         }
                         
@@ -2926,6 +3108,159 @@ void updateLEDs() {
                             uint8_t g = (uint8_t)((displayColor.g * 77) / 255);
                             uint8_t b = (uint8_t)((displayColor.b * 77) / 255);
                             leds[i] = CRGB(r, g, b);
+                        }
+                    }
+                } else {
+                    fill_solid(leds, NUM_LEDS, CRGB::Black);
+                }
+            }
+            break;
+            
+        case LED_CLOCK:
+            // Display current time (hours and minutes) revolving around the sphere
+            {
+                if (clockState.active) {
+                    // Get current time from RTC
+                    struct tm timeinfo;
+                    if (getLocalTime(&timeinfo)) {
+                        int currentHour = timeinfo.tm_hour;
+                        int currentMinute = timeinfo.tm_min;
+                        
+                        // Update time string if time has changed
+                        if (currentHour != clockState.lastHour || currentMinute != clockState.lastMinute) {
+                            clockState.lastHour = currentHour;
+                            clockState.lastMinute = currentMinute;
+                            Serial.printf("🕐 Clock updated: %02d:%02d\n", currentHour, currentMinute);
+                        }
+                        
+                        // Format time string (24-hour format: "HH:MM")
+                        char timeStr[6];
+                        snprintf(timeStr, sizeof(timeStr), "%02d:%02d", currentHour, currentMinute);
+                        
+                        // Slowly scroll position every 200ms for smooth rotation
+                        if (millis() - clockState.lastScrollUpdate > 200) {
+                            clockState.scrollPosition--;
+                            clockState.lastScrollUpdate = millis();
+                            
+                            // Time string is 5 characters * 6 pixels = 30 pixels wide
+                            // Wrap around seamlessly
+                            if (clockState.scrollPosition < -30) {
+                                clockState.scrollPosition = LED_COLUMNS;  // Restart from right
+                            }
+                        }
+                        
+                        // Clear matrix and draw scrolling time
+                        matrix->fillScreen(0);
+                        matrix->setTextWrap(false);
+                        matrix->setTextSize(1);
+                        matrix->setTextColor(matrix->Color(255, 255, 255));  // White text
+                        matrix->setCursor(clockState.scrollPosition, 2);
+                        matrix->print(timeStr);
+                        matrix->show();
+                    } else {
+                        // If time not available, show error pattern
+                        static uint32_t lastBlink = 0;
+                        static bool blinkState = false;
+                        
+                        if (millis() - lastBlink > 500) {
+                            lastBlink = millis();
+                            blinkState = !blinkState;
+                            
+                            if (blinkState) {
+                                fill_solid(leds, NUM_LEDS, CRGB(50, 0, 0));  // Dim red
+                            } else {
+                                fill_solid(leds, NUM_LEDS, CRGB::Black);
+                            }
+                        }
+                    }
+                } else {
+                    fill_solid(leds, NUM_LEDS, CRGB::Black);
+                }
+            }
+            break;
+            
+        case LED_LAMP:
+            // White lamp with spiral swoosh lighting effect
+            // Button 1: cycle colors (WHITE → RED → GREEN → BLUE)
+            {
+                if (lampState.active) {
+                    const uint32_t FADE_DURATION_MS = 150;  // Quick fade-up per LED
+                    const uint32_t LED_INTERVAL_MS = 40;    // 40ms between lighting each LED (slowed down for better visual)
+                    
+                    uint32_t now = millis();
+                    
+                    // Get RGB values for current and previous colors at 25% brightness
+                    auto getColorRGB = [](LampState::Color color) -> CRGB {
+                        switch (color) {
+                            case LampState::RED:   return CRGB(64, 0, 0);    // 25% red
+                            case LampState::GREEN: return CRGB(0, 64, 0);    // 25% green
+                            case LampState::BLUE:  return CRGB(0, 0, 64);    // 25% blue
+                            default:               return CRGB(64, 64, 64);  // 25% white
+                        }
+                    };
+                    
+                    CRGB targetColor = getColorRGB(lampState.currentColor);
+                    CRGB previousColor = getColorRGB(lampState.previousColor);
+                    
+                    // Light next LED if it's time
+                    if (!lampState.fullyLit && (now - lampState.lastUpdate) >= LED_INTERVAL_MS) {
+                        // Calculate LED index: spiral pattern (row by row, rotating around strips)
+                        int ledIndex = lampState.currentCol * LEDS_PER_COLUMN + lampState.currentRow;
+                        
+                        if (ledIndex < NUM_LEDS) {
+                            lampState.ledStartTimes[ledIndex] = now;
+                            lampState.lastUpdate = now;
+                            
+                            // Move to next LED in spiral
+                            lampState.currentCol++;
+                            if (lampState.currentCol >= LED_COLUMNS) {
+                                lampState.currentCol = 0;
+                                lampState.currentRow++;
+                                
+                                if (lampState.currentRow >= LEDS_PER_COLUMN) {
+                                    lampState.fullyLit = true;
+                                    lampState.transitioning = false;
+                                    Serial.println("💡 Lamp fully lit");
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Render all LEDs with fade effect
+                    for (int i = 0; i < NUM_LEDS; i++) {
+                        if (lampState.transitioning && lampState.ledStartTimes[i] == 0) {
+                            // Not reached by spiral yet - show previous color
+                            leds[i] = previousColor;
+                        } else if (lampState.ledStartTimes[i] > 0) {
+                            uint32_t elapsed = now - lampState.ledStartTimes[i];
+                            
+                            if (elapsed < FADE_DURATION_MS) {
+                                // Fading up to new color
+                                float progress = (float)elapsed / FADE_DURATION_MS;
+                                progress = progress * progress;  // Ease-in
+                                
+                                if (lampState.transitioning) {
+                                    // Blend from previous to target color
+                                    leds[i] = CRGB(
+                                        previousColor.r + (targetColor.r - previousColor.r) * progress,
+                                        previousColor.g + (targetColor.g - previousColor.g) * progress,
+                                        previousColor.b + (targetColor.b - previousColor.b) * progress
+                                    );
+                                } else {
+                                    // Fading from black to target color (initial lighting)
+                                    leds[i] = CRGB(
+                                        (targetColor.r * progress),
+                                        (targetColor.g * progress),
+                                        (targetColor.b * progress)
+                                    );
+                                }
+                            } else {
+                                // Fully lit at target color
+                                leds[i] = targetColor;
+                            }
+                        } else {
+                            // Not lit yet (initial lighting)
+                            leds[i] = CRGB::Black;
                         }
                     }
                 } else {

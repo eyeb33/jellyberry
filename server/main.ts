@@ -248,6 +248,112 @@ function getCurrentTime() {
   };
 }
 
+// Set an alarm
+function setAlarm(deviceId: string, alarmTime: string) {
+  try {
+    // Parse the alarm time (ISO 8601 format: "2026-01-09T07:00:00Z" or "2026-01-09T07:00:00+00:00")
+    let alarmDate = new Date(alarmTime);
+    
+    console.log(`[${deviceId}] Parsing alarm time: "${alarmTime}"`);
+    console.log(`[${deviceId}] Parsed as: ${alarmDate.toISOString()}`);
+    console.log(`[${deviceId}] Current time: ${new Date().toISOString()}`);
+    console.log(`[${deviceId}] UK time now: ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
+    console.log(`[${deviceId}] Alarm UK time: ${alarmDate.toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
+    
+    if (isNaN(alarmDate.getTime())) {
+      return {
+        success: false,
+        error: "Invalid datetime format"
+      };
+    }
+    
+    // If alarm time is in the past, assume user means the next occurrence (tomorrow)
+    const now = Date.now();
+    const timeDiff = alarmDate.getTime() - now;
+    const minutesUntil = Math.round(timeDiff / 1000 / 60);
+    
+    console.log(`[${deviceId}] Time until alarm: ${minutesUntil} minutes`);
+    
+    if (alarmDate.getTime() <= now) {
+      console.log(`[${deviceId}] Alarm time is in the past, moving to next occurrence (tomorrow)`);
+      alarmDate = new Date(alarmDate.getTime() + 24 * 60 * 60 * 1000); // Add 24 hours
+    }
+    
+    // Generate unique alarm ID
+    const alarmID = Date.now() + Math.floor(Math.random() * 1000);
+    
+    // Calculate seconds until alarm
+    const triggerTime = alarmDate.getTime();
+    const secondsUntil = Math.round((triggerTime - now) / 1000);
+    
+    // Format time for response
+    const timeOptions: Intl.DateTimeFormatOptions = {
+      timeZone: 'Europe/London',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
+    };
+    const formattedTime = alarmDate.toLocaleTimeString('en-GB', timeOptions);
+    const formattedDate = alarmDate.toLocaleDateString('en-GB', {
+      timeZone: 'Europe/London',
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric'
+    });
+    
+    console.log(`[${deviceId}] Setting alarm for ${formattedTime} on ${formattedDate} (${secondsUntil}s from now)`);
+    
+    return {
+      success: true,
+      alarmID: alarmID,
+      triggerTime: triggerTime,
+      formattedTime: formattedTime,
+      formattedDate: formattedDate,
+      secondsUntil: secondsUntil
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: `Failed to parse alarm time: ${error}`
+    };
+  }
+}
+
+// Cancel alarm (next/specific/all)
+function cancelAlarm(deviceId: string, which: string = "next") {
+  try {
+    console.log(`[${deviceId}] Cancel alarm request: ${which}`);
+    
+    return {
+      success: true,
+      which: which,
+      message: `Alarm cancellation request sent to device`
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: `Failed to cancel alarm: ${error}`
+    };
+  }
+}
+
+// List alarms
+function listAlarms(deviceId: string) {
+  try {
+    console.log(`[${deviceId}] List alarms request`);
+    
+    return {
+      success: true,
+      message: "Requesting alarm list from device"
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: `Failed to list alarms: ${error}`
+    };
+  }
+}
+
 // Set a timer
 function setTimer(deviceId: string, durationMinutes: number) {
   const durationSeconds = Math.round(durationMinutes * 60);
@@ -709,6 +815,65 @@ Deno.serve({
           }
         }
         
+        // Handle alarm sound request from ESP32
+        if (data.action === "requestAlarm") {
+          console.log(`[${deviceId}] 🔔 Alarm sound requested`);
+          
+          // Cancel any existing alarm stream for this connection
+          if (connection.alarmStreamCancel) {
+            connection.alarmStreamCancel();
+            console.log(`[${deviceId}] ✗ Cancelled previous alarm stream`);
+          }
+          
+          const alarmPath = `./audio/alarm_sound.pcm`;
+          
+          try {
+            // Create cancellation flag for this stream
+            let cancelled = false;
+            connection.alarmStreamCancel = () => { 
+              cancelled = true;
+              console.log(`[${deviceId}] 🛑 Alarm stream cancelled`);
+            };
+            
+            // Read and stream the alarm PCM file - LOOP continuously until cancelled
+            const audioData = await Deno.readFile(alarmPath);
+            console.log(`[${deviceId}] ✓ Loaded alarm_sound.pcm (${audioData.byteLength} bytes) - looping until dismissed...`);
+            
+            // Stream with flow control - loop continuously until cancelled
+            const CHUNK_SIZE = 1024;
+            const CHUNKS_PER_BATCH = 5;
+            const BATCH_DELAY_MS = 100;
+            
+            while (!cancelled) {
+              for (let offset = 0; offset < audioData.byteLength && !cancelled; offset += CHUNK_SIZE) {
+                const chunk = audioData.slice(offset, offset + CHUNK_SIZE);
+                socket.send(chunk);
+                
+                // Flow control: batch chunks and add delays
+                if ((offset / CHUNK_SIZE) % CHUNKS_PER_BATCH === 0) {
+                  await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
+                }
+              }
+            }
+            
+            console.log(`[${deviceId}] ✓ Alarm stream stopped`);
+          } catch (err) {
+            console.error(`[${deviceId}] ⚠️ Failed to load alarm sound:`, err);
+          }
+          
+          return;  // Don't pass to Gemini
+        }
+        
+        // Handle stop alarm request from ESP32
+        if (data.action === "stopAlarm") {
+          console.log(`[${deviceId}] 🔕 Stop alarm requested`);
+          if (connection.alarmStreamCancel) {
+            connection.alarmStreamCancel();
+            connection.alarmStreamCancel = null;
+          }
+          return;
+        }
+        
         // Handle ambient sound requests from ESP32 (check BEFORE setup to avoid misclassification)
         if (data.action === "requestAmbient") {
           const soundName = data.sound || "rain";
@@ -841,6 +1006,42 @@ Deno.serve({
           return;
         }
         
+        // Handle alarm list response from ESP32
+        if (data.type === "alarmList") {
+          console.log(`[${deviceId}] 📋 Received alarm list:`, data.alarms);
+          
+          // Format alarm list for Gemini
+          const alarms = data.alarms || [];
+          let alarmDescription = "";
+          
+          if (alarms.length === 0) {
+            alarmDescription = "No alarms are currently set.";
+          } else {
+            alarmDescription = `You have ${alarms.length} alarm${alarms.length > 1 ? 's' : ''} set:\n`;
+            alarms.forEach((alarm: any, index: number) => {
+              alarmDescription += `${index + 1}. ${alarm.formattedTime}\n`;
+            });
+          }
+          
+          // Send to Gemini to speak the alarm list
+          if (connection.geminiSocket?.readyState === WebSocket.OPEN) {
+            const alarmMessage = {
+              clientContent: {
+                turns: [{
+                  role: "user",
+                  parts: [{
+                    text: `SYSTEM: ${alarmDescription}Say "checking alarms" then tell them about their alarms concisely.`
+                  }]
+                }],
+                turnComplete: true
+              }
+            };
+            console.log(`[${deviceId}] Sending alarm list to Gemini`);
+            connection.geminiSocket.send(JSON.stringify(alarmMessage));
+          }
+          return;
+        }
+        
         // Handle stop ambient request from ESP32
         if (data.action === "stopAmbient") {
           console.log(`[${deviceId}] 🛑 Stop ambient sound requested`);
@@ -937,6 +1138,13 @@ async function connectToGemini(connection: ClientConnection) {
       console.log(`[${connection.deviceId}] 🎵 Audio pipeline: Raw PCM (24kHz, mono, 16-bit)`);
       
       // Send setup message to Gemini with function declarations
+      const now = new Date();
+      const ukTime = now.toLocaleString('en-GB', { 
+        timeZone: 'Europe/London',
+        dateStyle: 'full',
+        timeStyle: 'long'
+      });
+      
       const setupMessage = {
         setup: {
           model: "models/gemini-2.0-flash-exp",
@@ -949,6 +1157,11 @@ async function connectToGemini(connection: ClientConnection) {
                 }
               }
             }
+          },
+          systemInstruction: {
+            parts: [{
+              text: `You are a helpful voice assistant for a smart device. The current date and time is: ${ukTime}. The user is located in the UK (Europe/London timezone). When setting alarms, if the user says a time without specifying a date, intelligently determine if they mean today or tomorrow based on the current time. For example, if it's 11:06pm and they say "set an alarm for 1:21", they likely mean 1:21am tonight (in a few hours), not 1:21pm tomorrow. Always confirm the exact date and time you're setting the alarm for.`
+            }]
           },
           tools: [{
             functionDeclarations: [
@@ -971,8 +1184,46 @@ async function connectToGemini(connection: ClientConnection) {
               }
             },
             {
+              name: "set_alarm",
+              description: "Set an alarm to ring at a SPECIFIC TIME (clock time like 7am, 2:30pm, etc). Use this when user mentions a time of day. Examples: 'set an alarm for 7am tomorrow', 'wake me up at 2pm', 'alarm for 9:30 tomorrow morning'. This is different from set_timer which counts down from now. The user is in UK timezone (Europe/London, GMT/BST).",
+              parameters: {
+                type: "OBJECT",
+                properties: {
+                  alarm_time: {
+                    type: "STRING",
+                    description: "The alarm time in ISO 8601 format. IMPORTANT: The user is in UK timezone. When they say '11:08pm', convert it to ISO format maintaining UK time, e.g., '2026-01-08T23:08:00+00:00'. If the time is later today, use today's date. If it's a past time today, assume they mean tomorrow. Always preserve the UK timezone in your conversion."
+                  }
+                },
+                required: ["alarm_time"]
+              }
+            },
+            {
+              name: "cancel_alarm",
+              description: "Cancel an alarm. Use when user says 'cancel alarm', 'delete alarm', 'remove my alarm', etc. Can cancel next alarm, all alarms, or a specific one.",
+              parameters: {
+                type: "OBJECT",
+                properties: {
+                  which: {
+                    type: "STRING",
+                    description: "Which alarm(s) to cancel: 'next' (default, cancels next scheduled alarm), 'all' (cancels all alarms)",
+                    enum: ["next", "all"]
+                  }
+                },
+                required: []
+              }
+            },
+            {
+              name: "list_alarms",
+              description: "List all currently set alarms with their times. Use when user asks 'what alarms do I have', 'show my alarms', 'do I have any alarms set', etc.",
+              parameters: {
+                type: "OBJECT",
+                properties: {},
+                required: []
+              }
+            },
+            {
               name: "set_timer",
-              description: "Set a countdown timer for a specified duration. Use when user says 'set a timer', 'timer for X minutes', etc.",
+              description: "Set a countdown timer for a DURATION (X minutes/seconds from now). Use this when user mentions a duration, not a specific time. Examples: 'set a timer for 5 minutes', 'timer for 30 seconds'. This is different from set_alarm which rings at a specific clock time.",
               parameters: {
                 type: "OBJECT",
                 properties: {
@@ -1206,6 +1457,41 @@ async function connectToGemini(connection: ClientConnection) {
             } else if (funcName === "get_current_time") {
               functionResult = getCurrentTime();
               console.log(`[${connection.deviceId}] Current time: ${functionResult.time} on ${functionResult.date}`);
+            } else if (funcName === "set_alarm") {
+              const alarmTime = funcArgs.alarm_time || "";
+              functionResult = setAlarm(connection.deviceId, alarmTime);
+              
+              // Send alarm data to ESP32
+              if (functionResult.success) {
+                connection.socket.send(JSON.stringify({
+                  type: "setAlarm",
+                  alarmID: functionResult.alarmID,
+                  triggerTime: functionResult.triggerTime
+                }));
+                console.log(`[${connection.deviceId}] Sent alarm to ESP32: ID=${functionResult.alarmID}, time=${functionResult.formattedTime}`);
+              }
+            } else if (funcName === "cancel_alarm") {
+              const which = funcArgs.which || "next";
+              functionResult = cancelAlarm(connection.deviceId, which);
+              
+              // Send cancel request to ESP32
+              if (functionResult.success) {
+                connection.socket.send(JSON.stringify({
+                  type: "cancelAlarm",
+                  which: which
+                }));
+                console.log(`[${connection.deviceId}] Sent alarm cancel request: ${which}`);
+              }
+            } else if (funcName === "list_alarms") {
+              functionResult = listAlarms(connection.deviceId);
+              
+              // Request alarm list from ESP32
+              if (functionResult.success) {
+                connection.socket.send(JSON.stringify({
+                  type: "listAlarms"
+                }));
+                console.log(`[${connection.deviceId}] Requested alarm list from ESP32`);
+              }
             } else if (funcName === "set_timer") {
               const durationMinutes = funcArgs.duration_minutes || 0;
               functionResult = setTimer(connection.deviceId, durationMinutes);
@@ -1352,6 +1638,41 @@ async function connectToGemini(connection: ClientConnection) {
               } else if (funcName === "get_current_time") {
                 functionResult = getCurrentTime();
                 console.log(`[${connection.deviceId}] Current time: ${functionResult.time} on ${functionResult.date}`);
+              } else if (funcName === "set_alarm") {
+                const alarmTime = funcArgs.alarm_time || "";
+                functionResult = setAlarm(connection.deviceId, alarmTime);
+                
+                // Send alarm data to ESP32
+                if (functionResult.success) {
+                  connection.socket.send(JSON.stringify({
+                    type: "setAlarm",
+                    alarmID: functionResult.alarmID,
+                    triggerTime: functionResult.triggerTime
+                  }));
+                  console.log(`[${connection.deviceId}] Sent alarm to ESP32: ID=${functionResult.alarmID}, time=${functionResult.formattedTime}`);
+                }
+              } else if (funcName === "cancel_alarm") {
+                const which = funcArgs.which || "next";
+                functionResult = cancelAlarm(connection.deviceId, which);
+                
+                // Send cancel request to ESP32
+                if (functionResult.success) {
+                  connection.socket.send(JSON.stringify({
+                    type: "cancelAlarm",
+                    which: which
+                  }));
+                  console.log(`[${connection.deviceId}] Sent alarm cancel request: ${which}`);
+                }
+              } else if (funcName === "list_alarms") {
+                functionResult = listAlarms(connection.deviceId);
+                
+                // Request alarm list from ESP32
+                if (functionResult.success) {
+                  connection.socket.send(JSON.stringify({
+                    type: "listAlarms"
+                  }));
+                  console.log(`[${connection.deviceId}] Requested alarm list from ESP32`);
+                }
               } else if (funcName === "set_timer") {
                 const durationMinutes = funcArgs.duration_minutes || 0;
                 functionResult = setTimer(connection.deviceId, durationMinutes);

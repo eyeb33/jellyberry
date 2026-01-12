@@ -31,6 +31,7 @@ bool isWebSocketConnected = false;
 bool recordingActive = false;
 bool isPlayingResponse = false;
 bool isPlayingAmbient = false;  // Track ambient sound playback separately
+bool isPlayingAlarm = false;      // Track alarm sound playback
 bool turnComplete = false;  // Track when Gemini has finished its turn
 bool responseInterrupted = false;  // Flag to ignore audio after interrupt
 bool waitingForGreeting = false;  // Flag to skip timeout when waiting for startup greeting
@@ -53,7 +54,7 @@ uint32_t conversationWindowStart = 0;  // Timestamp when conversation window ope
 bool conversationRecording = false;  // Track if current recording was triggered from conversation mode
 
 // Audio level delay buffer for LED sync (compensates for I2S buffer latency)
-#define AUDIO_DELAY_BUFFER_SIZE 12  // ~360ms delay to match I2S playback buffer + speaker latency
+#define AUDIO_DELAY_BUFFER_SIZE 8  // ~240ms delay for optimal LED/audio sync
 int audioLevelBuffer[AUDIO_DELAY_BUFFER_SIZE] = {0};
 int audioBufferIndex = 0;
 
@@ -72,7 +73,7 @@ struct AudioChunk {
     size_t length;
 };
 
-enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU, LED_AMBIENT, LED_POMODORO, LED_MEDITATION, LED_CLOCK, LED_LAMP, LED_CONVERSATION_WINDOW, LED_MARQUEE };
+enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU, LED_AMBIENT, LED_POMODORO, LED_MEDITATION, LED_CLOCK, LED_LAMP, LED_ALARM, LED_CONVERSATION_WINDOW, LED_MARQUEE };
 LEDMode currentLEDMode = LED_IDLE;  // Start directly in idle mode
 LEDMode targetLEDMode = LED_IDLE;  // Mode to switch to after marquee finishes
 bool ambientVUMode = false;  // Toggle for ambient sound VU meter mode
@@ -175,6 +176,28 @@ struct LampState {
     bool fullyLit;           // All LEDs fully lit
     bool transitioning;      // Currently transitioning between colors
 } lampState = {LampState::WHITE, LampState::WHITE, 0, 0, 0, {0}, false, false, false};
+
+// Alarm state
+#define MAX_ALARMS 10
+struct Alarm {
+    uint32_t alarmID;        // Unique ID from server
+    time_t triggerTime;      // Unix timestamp when alarm should trigger
+    bool enabled;            // Alarm is active
+    bool triggered;          // Alarm has been triggered (prevent re-trigger)
+    bool snoozed;            // Currently snoozed
+    time_t snoozeUntil;      // Wake up from snooze at this time
+} alarms[MAX_ALARMS];
+
+struct AlarmState {
+    bool ringing;            // Alarm currently ringing
+    uint32_t ringStartTime;  // When alarm started ringing
+    uint32_t pulseStartTime; // For LED animation timing
+    float pulseRadius;       // Current radius for center-outward pulse
+    bool active;             // Alarm system active
+    LEDMode previousMode;    // Mode before alarm triggered (to restore after dismissal)
+    bool wasRecording;       // If recording was active when alarm triggered
+    bool wasPlayingResponse; // If playing response when alarm triggered
+} alarmState = {false, 0, 0, 0.0f, false, LED_IDLE, false, false};
 
 // ============== FORWARD DECLARATIONS ==============
 void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length);
@@ -455,6 +478,7 @@ void setup() {
 void loop() {
     static uint32_t lastPrint = 0;
     static uint32_t lastWiFiCheck = 0;
+    static uint32_t lastAlarmCheck = 0;
     
     if (millis() - lastPrint > 5000) {
         Serial.write("LOOP_TICK\r\n", 11);
@@ -468,6 +492,82 @@ void loop() {
             Serial.printf("[WiFi] WEAK SIGNAL: %d dBm (may cause disconnects)\n", rssi);
         }
         lastWiFiCheck = millis();
+    }
+    
+    // Check alarms every 10 seconds
+    if (alarmState.active && !alarmState.ringing && millis() - lastAlarmCheck > 10000) {
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo)) {
+            time_t now = mktime(&timeinfo);
+            
+            // Check each alarm
+            for (int i = 0; i < MAX_ALARMS; i++) {
+                if (alarms[i].enabled && !alarms[i].triggered) {
+                    // Check if snoozed
+                    if (alarms[i].snoozed) {
+                        if (now >= alarms[i].snoozeUntil) {
+                            // Snooze period ended - ring again
+                            alarms[i].snoozed = false;
+                            
+                            // Save current state before switching to alarm
+                            alarmState.previousMode = currentLEDMode;
+                            alarmState.wasRecording = recordingActive;
+                            alarmState.wasPlayingResponse = isPlayingResponse;
+                            
+                            alarmState.ringing = true;
+                            alarmState.ringStartTime = millis();
+                            alarmState.pulseStartTime = millis();
+                            alarmState.pulseRadius = 0.0f;
+                            currentLEDMode = LED_ALARM;
+                            Serial.printf("⏰ Alarm %u ringing after snooze! (interrupted mode: %d)\n", alarms[i].alarmID, alarmState.previousMode);
+                            
+                            // Play alarm sound
+                            isPlayingAlarm = true;
+                            isPlayingResponse = true;
+                            firstAudioChunk = true;
+                            lastAudioChunkTime = millis();
+                            JsonDocument alarmDoc;
+                            alarmDoc["action"] = "requestAlarm";
+                            String alarmMsg;
+                            serializeJson(alarmDoc, alarmMsg);
+                            Serial.println("🔔 Requesting alarm sound from server");
+                            webSocket.sendTXT(alarmMsg);
+                            
+                            break;
+                        }
+                    } else if (now >= alarms[i].triggerTime) {
+                        // Alarm time reached!
+                        
+                        // Save current state before switching to alarm
+                        alarmState.previousMode = currentLEDMode;
+                        alarmState.wasRecording = recordingActive;
+                        alarmState.wasPlayingResponse = isPlayingResponse;
+                        
+                        alarmState.ringing = true;
+                        alarmState.ringStartTime = millis();
+                        alarmState.pulseStartTime = millis();
+                        alarmState.pulseRadius = 0.0f;
+                        currentLEDMode = LED_ALARM;
+                        Serial.printf("⏰ Alarm %u triggered at %s (interrupted mode: %d)\n", alarms[i].alarmID, asctime(&timeinfo), alarmState.previousMode);
+                        
+                        // Play alarm sound
+                        isPlayingAlarm = true;
+                        isPlayingResponse = true;
+                        firstAudioChunk = true;
+                        lastAudioChunkTime = millis();
+                        JsonDocument alarmDoc;
+                        alarmDoc["action"] = "requestAlarm";
+                        String alarmMsg;
+                        serializeJson(alarmDoc, alarmMsg);
+                        Serial.println("🔔 Requesting alarm sound from server");
+                        webSocket.sendTXT(alarmMsg);
+                        
+                        break;
+                    }
+                }
+            }
+        }
+        lastAlarmCheck = millis();
     }
     
     // Ignore touch pads for first 5 seconds after boot to avoid false triggers
@@ -1020,6 +1120,80 @@ void loop() {
             currentLEDMode = LED_RECORDING;
             Serial.printf("🎤 Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
         }
+        // ALARM MODE: Button 1 or 2 dismisses alarm
+        else if (currentLEDMode == LED_ALARM && alarmState.ringing && (startTouch || stopTouch) && !startPressed && !stopPressed) {
+            Serial.println("⏰ Alarm dismissed");
+            
+            // Clear alarm from memory
+            for (int i = 0; i < MAX_ALARMS; i++) {
+                if (alarms[i].enabled && !alarms[i].triggered) {
+                    uint32_t dismissedID = alarms[i].alarmID;
+                    
+                    // Zero out the alarm slot
+                    alarms[i].alarmID = 0;
+                    alarms[i].triggerTime = 0;
+                    alarms[i].enabled = false;
+                    alarms[i].triggered = false;
+                    alarms[i].snoozed = false;
+                    alarms[i].snoozeUntil = 0;
+                    
+                    Serial.printf("✓ Alarm %u dismissed and cleared from slot %d\n", dismissedID, i);
+                    break;
+                }
+            }
+            
+            // Stop ringing
+            alarmState.ringing = false;
+            
+            // Stop alarm sound streaming from server
+            isPlayingAlarm = false;
+            isPlayingResponse = false;  // Stop audio playback
+            JsonDocument stopDoc;
+            stopDoc["action"] = "stopAlarm";
+            String stopMsg;
+            serializeJson(stopDoc, stopMsg);
+            webSocket.sendTXT(stopMsg);
+            Serial.println("🔕 Sent stop alarm request to server");
+            
+            // Stop I2S output - let buffered audio drain naturally
+            i2s_zero_dma_buffer(I2S_NUM_1);
+            
+            // Don't clear the queue - let audio task handle cleanup naturally
+            // (clearing queue while audio task is active causes crashes)
+            
+            // Restore previous mode
+            Serial.printf("↩️  Restoring previous mode: %d (recording=%d, playing=%d)\n", 
+                         alarmState.previousMode, alarmState.wasRecording, alarmState.wasPlayingResponse);
+            
+            currentLEDMode = alarmState.previousMode;
+            
+            // Restore recording state if it was active
+            if (alarmState.wasRecording) {
+                recordingActive = true;
+                Serial.println("↩️  Resuming recording");
+            }
+            
+            // Restore playback state if it was active
+            if (alarmState.wasPlayingResponse) {
+                isPlayingResponse = true;
+                lastAudioChunkTime = millis();  // Reset timeout
+                Serial.println("↩️  Resuming audio playback");
+            }
+            
+            // Check if any more alarms are active
+            bool hasActiveAlarms = false;
+            for (int i = 0; i < MAX_ALARMS; i++) {
+                if (alarms[i].enabled) {
+                    hasActiveAlarms = true;
+                    break;
+                }
+            }
+            if (!hasActiveAlarms) {
+                alarmState.active = false;
+            }
+            
+            playVolumeChime();  // Confirmation beep
+        }
         // LAMP MODE: Button 1 cycles colors (WHITE → RED → GREEN → BLUE)
         else if (currentLEDMode == LED_LAMP && lampState.active && startTouch && !startPressed) {
             // Cycle to next color
@@ -1046,12 +1220,20 @@ void loop() {
         // Start recording on rising edge (normal case - not interrupting)
         // Block if: recording active, playing response, OR in ambient sound mode, OR conversation window is open, OR in Pomodoro/Meditation/Ambient/Lamp mode
         else if (currentLEDMode != LED_POMODORO && currentLEDMode != LED_MEDITATION && currentLEDMode != LED_AMBIENT && currentLEDMode != LED_LAMP && startTouch && !startPressed && !recordingActive && !isPlayingResponse && !isPlayingAmbient && !conversationMode) {
+            // Additional safety: don't start recording if alarm is ringing
+            if (alarmState.ringing) {
+                Serial.println("⚠️  Cannot start recording - alarm is ringing");
+                startPressed = true;
+                return;
+            }
+            
             // Clear all previous state
             responseInterrupted = false;
             conversationRecording = false;  // Button press = normal recording timeout
             tideState.active = false;
             moonState.active = false;
-            timerState.active = false;
+            // DON'T clear timer - let it run in background and return after interaction
+            // timerState.active = false;
             
             // CRITICAL: Cancel drain timer so Gemini responses can play
             if (ambientSound.drainUntil > 0) {
@@ -1114,9 +1296,25 @@ void loop() {
     // Timeout PROCESSING mode if no response after 10 seconds
     if ((currentLEDMode == LED_PROCESSING || currentLEDMode == LED_RECORDING) && 
         processingStartTime > 0 && (millis() - processingStartTime) > 10000) {
-        Serial.printf("⚠️  Processing timeout after 10s - no response received, returning to IDLE (mode was %d)\n", currentLEDMode);
-        currentLEDMode = LED_IDLE;
+        Serial.printf("⚠️  Processing timeout after 10s - no response received (mode was %d)\n", currentLEDMode);
         processingStartTime = 0;
+        
+        // Return to visualizations if active, otherwise IDLE
+        if (timerState.active) {
+            currentLEDMode = LED_TIMER;
+            Serial.println("↩️  Timeout - returning to TIMER display");
+        } else if (moonState.active) {
+            currentLEDMode = LED_MOON;
+            moonState.displayStartTime = millis();
+            Serial.println("↩️  Timeout - returning to MOON display");
+        } else if (tideState.active) {
+            currentLEDMode = LED_TIDE;
+            tideState.displayStartTime = millis();
+            Serial.println("↩️  Timeout - returning to TIDE display");
+        } else {
+            currentLEDMode = LED_IDLE;
+            Serial.println("↩️  Timeout - returning to IDLE");
+        }
     }
     
     // Check for audio playback completion
@@ -1134,26 +1332,12 @@ void loop() {
         // Check if turn is complete - if so, decide what to show
         // Skip conversation mode for startup greeting
         if (turnComplete && !waitingForGreeting) {
-            // Priority: Show visualizations first, then conversation window
-            // Timer > Moon > Tide > Conversation Window
-            if (timerState.active) {
-                currentLEDMode = LED_TIMER;
-                Serial.println("✓ Audio playback complete - switching to TIMER display (will open conversation window after)");
-            } else if (moonState.active) {
-                currentLEDMode = LED_MOON;
-                moonState.displayStartTime = millis();
-                Serial.println("✓ Audio playback complete - switching to MOON display (will open conversation window after)");
-            } else if (tideState.active) {
-                currentLEDMode = LED_TIDE;
-                tideState.displayStartTime = millis();
-                Serial.printf("✓ Audio playback complete - switching to TIDE display (will open conversation window after)\n");
-            } else {
-                // No visualizations - open conversation window immediately
-                conversationMode = true;
-                conversationWindowStart = millis();
-                currentLEDMode = LED_CONVERSATION_WINDOW;
-                Serial.println("💬 Conversation window opened - speak anytime in next 10 seconds");
-            }
+            // Always open conversation window first (10 second listening period)
+            // Visualizations will show after conversation window closes
+            conversationMode = true;
+            conversationWindowStart = millis();
+            currentLEDMode = LED_CONVERSATION_WINDOW;
+            Serial.println("💬 Conversation window opened - speak anytime in next 10 seconds");
         } else {
             // Turn not complete - show visualizations or return to idle/ambient
             // Priority: Timer > Moon > Tide > Ambient VU > Idle
@@ -1300,6 +1484,8 @@ void loop() {
         // Note: Timer has its own expiry logic and shouldn't auto-transition
         
         if (shouldOpenConversation) {
+            Serial.printf("🔄 Transition to conversation: LED=%d, recording=%d, playing=%d, alarm=%d\n",
+                         currentLEDMode, recordingActive, isPlayingResponse, alarmState.ringing);
             conversationMode = true;
             conversationWindowStart = millis();
             currentLEDMode = LED_CONVERSATION_WINDOW;
@@ -1308,7 +1494,7 @@ void loop() {
     }
     
     // Conversation window monitoring
-    if (conversationMode && !isPlayingResponse && !recordingActive) {
+    if (conversationMode && !isPlayingResponse && !recordingActive && !alarmState.ringing) {
         uint32_t elapsed = millis() - conversationWindowStart;
         
         // Debug every 2 seconds - show current state
@@ -1323,6 +1509,11 @@ void loop() {
             // Window is open - check for voice activity
             static int16_t windowBuffer[320];  // 20ms at 16kHz for quick VAD check
             size_t bytes_read = 0;
+            
+            // Safety: Only read if not playing alarm
+            if (isPlayingAlarm) {
+                return;
+            }
             
             esp_err_t result = i2s_read(I2S_NUM_0, windowBuffer, sizeof(windowBuffer), &bytes_read, 10);
             
@@ -1381,10 +1572,26 @@ void loop() {
                 }
             }
         } else {
-            // Window expired with no voice - return to idle
-            Serial.println("💬 Conversation window expired - returning to IDLE");
+            // Window expired with no voice - return to visualizations or idle
+            Serial.println("💬 Conversation window expired");
             conversationMode = false;
-            currentLEDMode = LED_IDLE;
+            
+            // Priority: Timer > Moon > Tide > Idle
+            if (timerState.active) {
+                currentLEDMode = LED_TIMER;
+                Serial.println("↩️  Returning to TIMER display");
+            } else if (moonState.active) {
+                currentLEDMode = LED_MOON;
+                moonState.displayStartTime = millis();
+                Serial.println("↩️  Returning to MOON display");
+            } else if (tideState.active) {
+                currentLEDMode = LED_TIDE;
+                tideState.displayStartTime = millis();
+                Serial.println("↩️  Returning to TIDE display");
+            } else {
+                currentLEDMode = LED_IDLE;
+                Serial.println("↩️  Returning to IDLE");
+            }
         }
     }
     
@@ -1886,8 +2093,8 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 }
                 // else: Gemini audio (no magic header) - continue to play
                 
-                // Ignore audio if response was interrupted (but not for ambient sounds)
-                if (responseInterrupted && !isPlayingAmbient) {
+                // Ignore audio if response was interrupted (but not for ambient/alarm sounds)
+                if (responseInterrupted && !isPlayingAmbient && !isPlayingAlarm) {
                     Serial.println("🚫 Discarding audio chunk (response was interrupted)");
                     break;
                 }
@@ -1895,6 +2102,13 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 // Raw PCM audio data from server (16-bit mono samples)
                 // This handles BOTH Gemini responses and ambient sounds
                 if (!isPlayingResponse) {
+                    // CRITICAL: Stop recording immediately when response arrives (even during prebuffer)
+                    // This prevents connection overload from bidirectional audio traffic
+                    if (recordingActive) {
+                        Serial.println("⏹️  Stopping recording - response arriving");
+                        recordingActive = false;
+                    }
+                    
                     // Wait for prebuffer before starting playback to eliminate initial stutter
                     uint32_t queueDepth = uxQueueMessagesWaiting(audioOutputQueue);
                     const uint32_t MIN_PREBUFFER = 8;  // ~320ms buffer (8 packets × 40ms)
@@ -1903,14 +2117,14 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                         isPlayingResponse = true;
                         
                         // Only reset turn state for non-ambient audio
-                        if (!isPlayingAmbient) {
+                        if (!isPlayingAmbient && !isPlayingAlarm) {
                             turnComplete = false;  // New Gemini turn starting
                         }
                         
                         recordingActive = false;  // Ensure recording is stopped
                         
-                        // Always show VU meter during playback (visualizations will show after)
-                        if (!ambientSound.active) {
+                        // Show VU meter during Gemini playback, keep current mode for ambient/alarm
+                        if (!ambientSound.active && !isPlayingAlarm) {
                             currentLEDMode = LED_AUDIO_REACTIVE;
                         }
                         
@@ -1932,6 +2146,8 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                         if (isPlayingAmbient) {
                             Serial.printf("🔊 Starting ambient audio stream: %s (prebuffered %u packets)\n", 
                                          ambientSound.name.c_str(), queueDepth);
+                        } else if (isPlayingAlarm) {
+                            Serial.printf("🔔 Starting alarm audio playback (prebuffered %u packets)\n", queueDepth);
                         } else {
                             Serial.printf("🔊 Starting audio playback with %u packets prebuffered\n", queueDepth);
                         }
@@ -2134,6 +2350,42 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
         return;
     }
     
+    // Handle alarm set from server
+    if (doc["type"].is<const char*>() && doc["type"] == "setAlarm") {
+        uint32_t alarmID = doc["alarmID"].as<uint32_t>();
+        time_t triggerTime = doc["triggerTime"].as<long long>() / 1000;  // Convert ms to seconds
+        
+        // Find empty slot
+        int slot = -1;
+        for (int i = 0; i < MAX_ALARMS; i++) {
+            if (!alarms[i].enabled) {
+                slot = i;
+                break;
+            }
+        }
+        
+        if (slot >= 0) {
+            alarms[slot].alarmID = alarmID;
+            alarms[slot].triggerTime = triggerTime;
+            alarms[slot].enabled = true;
+            alarms[slot].triggered = false;
+            alarms[slot].snoozed = false;
+            alarms[slot].snoozeUntil = 0;
+            
+            // Format time for logging
+            struct tm timeinfo;
+            localtime_r(&triggerTime, &timeinfo);
+            char timeStr[20];
+            strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+            
+            Serial.printf("⏰ Alarm set: ID=%u, time=%s (slot %d)\n", alarmID, timeStr, slot);
+            alarmState.active = true;
+        } else {
+            Serial.println("⚠️  No alarm slots available!");
+        }
+        return;
+    }
+    
     // Handle timer cancelled
     if (doc["type"].is<const char*>() && doc["type"] == "timerCancelled") {
         Serial.println("⏱️  Timer cancelled");
@@ -2170,6 +2422,119 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
         lastAudioChunkTime = millis();  // Reset audio timeout
         processingStartTime = 0;  // Clear processing timeout
         Serial.println("✓ Ready for audio notification from Gemini...");
+        return;
+    }
+    
+    // Handle cancel alarm from server
+    if (doc["type"].is<const char*>() && doc["type"] == "cancelAlarm") {
+        String which = doc["which"].as<String>();
+        Serial.printf("🚫 Cancel alarm request: %s\n", which.c_str());
+        
+        if (which == "all") {
+            // Cancel all alarms
+            int cancelledCount = 0;
+            for (int i = 0; i < MAX_ALARMS; i++) {
+                if (alarms[i].enabled) {
+                    alarms[i].alarmID = 0;
+                    alarms[i].triggerTime = 0;
+                    alarms[i].enabled = false;
+                    alarms[i].triggered = false;
+                    alarms[i].snoozed = false;
+                    alarms[i].snoozeUntil = 0;
+                    cancelledCount++;
+                }
+            }
+            Serial.printf("✓ Cancelled %d alarm(s)\n", cancelledCount);
+            alarmState.active = false;
+        } else {
+            // Cancel next alarm (earliest one)
+            time_t earliestTime = 0;
+            int earliestSlot = -1;
+            
+            struct tm timeinfo;
+            if (getLocalTime(&timeinfo)) {
+                time_t now = mktime(&timeinfo);
+                
+                for (int i = 0; i < MAX_ALARMS; i++) {
+                    if (alarms[i].enabled && alarms[i].triggerTime > now) {
+                        if (earliestSlot == -1 || alarms[i].triggerTime < earliestTime) {
+                            earliestTime = alarms[i].triggerTime;
+                            earliestSlot = i;
+                        }
+                    }
+                }
+                
+                if (earliestSlot >= 0) {
+                    uint32_t cancelledID = alarms[earliestSlot].alarmID;
+                    
+                    // Clear the slot
+                    alarms[earliestSlot].alarmID = 0;
+                    alarms[earliestSlot].triggerTime = 0;
+                    alarms[earliestSlot].enabled = false;
+                    alarms[earliestSlot].triggered = false;
+                    alarms[earliestSlot].snoozed = false;
+                    alarms[earliestSlot].snoozeUntil = 0;
+                    
+                    Serial.printf("✓ Cancelled next alarm ID=%u from slot %d\n", cancelledID, earliestSlot);
+                    
+                    // Check if any more alarms are active
+                    bool hasActiveAlarms = false;
+                    for (int i = 0; i < MAX_ALARMS; i++) {
+                        if (alarms[i].enabled) {
+                            hasActiveAlarms = true;
+                            break;
+                        }
+                    }
+                    if (!hasActiveAlarms) {
+                        alarmState.active = false;
+                    }
+                } else {
+                    Serial.println("⚠️  No active alarms to cancel");
+                }
+            }
+        }
+        return;
+    }
+    
+    // Handle list alarms request
+    if (doc["type"].is<const char*>() && doc["type"] == "listAlarms") {
+        Serial.println("📋 List alarms request");
+        
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo)) {
+            time_t now = mktime(&timeinfo);
+            
+            // Build alarm list
+            JsonDocument responseDoc;
+            responseDoc["type"] = "alarmList";
+            JsonArray alarmArray = responseDoc["alarms"].to<JsonArray>();
+            
+            for (int i = 0; i < MAX_ALARMS; i++) {
+                // List all enabled alarms (don't filter by time - let Gemini handle past alarms)
+                if (alarms[i].enabled) {
+                    JsonObject alarmObj = alarmArray.add<JsonObject>();
+                    alarmObj["alarmID"] = alarms[i].alarmID;
+                    alarmObj["triggerTime"] = (long long)alarms[i].triggerTime * 1000; // Convert to ms
+                    
+                    // Format time string for logging
+                    struct tm alarmTimeinfo;
+                    localtime_r(&alarms[i].triggerTime, &alarmTimeinfo);
+                    char timeStr[32];
+                    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M", &alarmTimeinfo);
+                    alarmObj["formattedTime"] = timeStr;
+                    
+                    // Add flag for whether alarm is in the past
+                    alarmObj["isPast"] = (alarms[i].triggerTime <= now);
+                    
+                    Serial.printf("  Alarm %u: %s (isPast=%d)\n", alarms[i].alarmID, timeStr, (alarms[i].triggerTime <= now));
+                }
+            }
+            
+            String responseMsg;
+            serializeJson(responseDoc, responseMsg);
+            webSocket.sendTXT(responseMsg);
+            Serial.printf("📤 Sent alarm list: %d alarm(s)\n", alarmArray.size());
+        }
         return;
     }
     
@@ -2337,15 +2702,25 @@ void updateLEDs() {
     static uint8_t brightness = 100;
     
     // Smooth the audio level with exponential moving average
-    const float smoothing = 0.15f;  // Lower = more smoothing (was 0.3)
+    const float smoothing = 0.18f;  // Balanced response time
     smoothedAudioLevel = smoothedAudioLevel * (1.0f - smoothing) + currentAudioLevel * smoothing;
     
     // Faster decay when no audio to prevent LEDs lingering after speech ends
     if (currentAudioLevel == 0) {
-        smoothedAudioLevel *= 0.85f;  // Faster decay (was 0.95)
-        // Force to zero when very low to prevent lingering
-        if (smoothedAudioLevel < 50) {
+        smoothedAudioLevel *= 0.60f;  // Very fast decay
+        // Force to zero when low to prevent lingering
+        if (smoothedAudioLevel < 20) {
             smoothedAudioLevel = 0;
+        }
+    }
+    
+    // When transitioning away from AUDIO_REACTIVE, quickly fade out any residual levels
+    if (currentLEDMode != LED_AUDIO_REACTIVE && currentLEDMode != LED_RECORDING && 
+        currentLEDMode != LED_AMBIENT_VU && smoothedAudioLevel > 0) {
+        smoothedAudioLevel *= 0.4f;  // Very rapid fade
+        if (smoothedAudioLevel < 5) {
+            smoothedAudioLevel = 0;
+            currentAudioLevel = 0;
         }
     }
 
@@ -3189,13 +3564,13 @@ void updateLEDs() {
                     
                     uint32_t now = millis();
                     
-                    // Get RGB values for current and previous colors at 25% brightness
+                    // Get RGB values for current and previous colors at 50% brightness
                     auto getColorRGB = [](LampState::Color color) -> CRGB {
                         switch (color) {
-                            case LampState::RED:   return CRGB(64, 0, 0);    // 25% red
-                            case LampState::GREEN: return CRGB(0, 64, 0);    // 25% green
-                            case LampState::BLUE:  return CRGB(0, 0, 64);    // 25% blue
-                            default:               return CRGB(64, 64, 64);  // 25% white
+                            case LampState::RED:   return CRGB(128, 0, 0);    // 50% red
+                            case LampState::GREEN: return CRGB(0, 128, 0);    // 50% green
+                            case LampState::BLUE:  return CRGB(0, 0, 128);    // 50% blue
+                            default:               return CRGB(128, 128, 128);  // 50% white
                         }
                     };
                     
@@ -3261,6 +3636,75 @@ void updateLEDs() {
                         } else {
                             // Not lit yet (initial lighting)
                             leds[i] = CRGB::Black;
+                        }
+                    }
+                } else {
+                    fill_solid(leds, NUM_LEDS, CRGB::Black);
+                }
+            }
+            break;
+            
+        case LED_ALARM:
+            // Alarm ringing - pulsing orange/red from center outward
+            {
+                if (alarmState.ringing) {
+                    const uint32_t PULSE_DURATION_MS = 1500;  // 1.5 seconds per pulse cycle
+                    const float MAX_RADIUS = 8.0f;  // Maximum pulse radius (extends beyond sphere)
+                    
+                    uint32_t now = millis();
+                    uint32_t elapsed = now - alarmState.pulseStartTime;
+                    
+                    // Reset pulse if cycle complete
+                    if (elapsed >= PULSE_DURATION_MS) {
+                        alarmState.pulseStartTime = now;
+                        elapsed = 0;
+                    }
+                    
+                    // Calculate current pulse radius (0 to MAX_RADIUS)
+                    float progress = (float)elapsed / PULSE_DURATION_MS;
+                    alarmState.pulseRadius = progress * MAX_RADIUS;
+                    
+                    // Sphere center point (in LED grid space)
+                    const float centerX = LED_COLUMNS / 2.0f;
+                    const float centerY = LEDS_PER_COLUMN / 2.0f;
+                    
+                    // Render pulse effect
+                    for (int col = 0; col < LED_COLUMNS; col++) {
+                        for (int row = 0; row < LEDS_PER_COLUMN; row++) {
+                            int ledIndex = col * LEDS_PER_COLUMN + row;
+                            
+                            // Calculate distance from center
+                            float dx = col - centerX;
+                            float dy = row - centerY;
+                            float distance = sqrt(dx * dx + dy * dy);
+                            
+                            // Calculate brightness based on distance from pulse wavefront
+                            float wavefront = alarmState.pulseRadius;
+                            float distanceFromWave = abs(distance - wavefront);
+                            
+                            // Make wave thicker and brighter at the front
+                            const float WAVE_THICKNESS = 2.5f;
+                            float intensity = 0.0f;
+                            
+                            if (distanceFromWave < WAVE_THICKNESS) {
+                                // Inside the wave - bright
+                                intensity = 1.0f - (distanceFromWave / WAVE_THICKNESS);
+                                intensity = intensity * intensity;  // Ease curve
+                            } else if (distance < wavefront) {
+                                // Behind the wave - dim glow
+                                intensity = 0.2f;
+                            }
+                            
+                            // Color: orange to red gradient based on intensity
+                            uint8_t red = 255;
+                            uint8_t green = (uint8_t)(120 * (1.0f - intensity * 0.5f));  // More orange at edges, more red at center
+                            uint8_t blue = 0;
+                            
+                            leds[ledIndex] = CRGB(
+                                (uint8_t)(red * intensity),
+                                (uint8_t)(green * intensity),
+                                blue
+                            );
                         }
                     }
                 } else {

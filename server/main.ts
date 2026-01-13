@@ -811,6 +811,10 @@ Deno.serve({
         // Log message type for diagnostics (skip binary audio data to reduce noise)
         if (typeof event.data === "string") {
           const msgType = data.type || data.action || "unknown";
+          // Special logging for pomodoro status response
+          if (msgType === "pomodoroStatusResponse") {
+            console.log(`[${deviceId}] 🍅📨 POMODORO STATUS RESPONSE:`, JSON.stringify(data));
+          }
           // Only log if not a realtimeInput (audio) message to reduce spam
           if (msgType !== "unknown" || !data.realtimeInput) {
             console.log(`[${deviceId}] 📨 ESP32 message: ${msgType}`);
@@ -1399,7 +1403,7 @@ async function connectToGemini(connection: ClientConnection) {
             },
             {
               name: "get_pomodoro_status",
-              description: "Get the current Pomodoro timer status (session type, time remaining, session count). Use when user asks 'how much time left', 'what session am I in', 'pomodoro status', etc.",
+              description: "Get the current Pomodoro timer status including whether any timer is running, session type, time remaining, and cycle number. ALWAYS use this function when user asks about Pomodoro timers, whether phrased as 'is there a timer', 'are any timers running', 'how much time left', 'what session am I in', 'pomodoro status', etc. Returns accurate real-time status from device.",
               parameters: {
                 type: "OBJECT",
                 properties: {},
@@ -1675,23 +1679,28 @@ async function connectToGemini(connection: ClientConnection) {
               // Request status from ESP32 and wait for response
               const statusPromise = new Promise<any>((resolve) => {
                 const timeout = setTimeout(() => {
+                  console.error(`[${connection.deviceId}] ⚠️ Pomodoro status timeout (5s) - device not responding or response lost`);
                   resolve({
-                    success: false,
-                    message: "Timeout waiting for Pomodoro status from device"
+                    success: true,
+                    active: false,
+                    message: "No Pomodoro timer is currently running"
                   });
-                }, 2000);
+                }, 5000);  // Increased from 2s to 5s
                 
                 connection.pomodoroStatusResolver = (status: any) => {
                   clearTimeout(timeout);
+                  console.log(`[${connection.deviceId}] ✓ Pomodoro status resolved:`, status);
                   resolve(status);
                 };
               });
               
+              console.log(`[${connection.deviceId}] 📤 Sending pomodoroStatusRequest to ESP32`);
               connection.socket.send(JSON.stringify({
                 type: "pomodoroStatusRequest"
               }));
               
               functionResult = await statusPromise;
+              console.log(`[${connection.deviceId}] 📊 Pomodoro status result:`, functionResult);
             }
             
             // Send function response back to Gemini

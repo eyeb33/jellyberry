@@ -6,7 +6,7 @@ Complete documentation of all LED modes, controls, animations, and voice interac
 
 ## Mode Cycling (Button 2)
 Press **Button 2** to cycle through modes in this order:
-1. Idle → Ambient → Pomodoro → Meditation → Clock → Lamp → Idle
+1. Idle → Ambient VU → Nature Sounds → Pomodoro → Meditation → Clock → Lamp → Idle
 
 ---
 
@@ -43,7 +43,7 @@ Press **Button 2** to cycle through modes in this order:
 
 ### Controls
 - **Button 1 Short Press:** Talk to Gemini (ambient continues in background)
-- **Button 2:** Switch to Pomodoro mode
+- **Button 2:** Switch to Nature Sounds mode
 
 ### Voice Commands
 - "Play rain sounds"
@@ -503,7 +503,7 @@ Press **Button 2** to cycle through modes in this order:
 ## Mode Transition Summary
 
 ```
-IDLE (Button 2) → AMBIENT (Button 2) → POMODORO (Button 2) → MEDITATION (Button 2) → CLOCK (Button 2) → LAMP (Button 2) → IDLE
+IDLE (Button 2) → AMBIENT VU (Button 2) → NATURE SOUNDS (Button 2) → POMODORO (Button 2) → MEDITATION (Button 2) → CLOCK (Button 2) → LAMP (Button 2) → IDLE
 
 Any Mode + Button 1 Short Press → RECORDING → PROCESSING → AUDIO_REACTIVE → CONVERSATION_WINDOW → Return to Original Mode
 

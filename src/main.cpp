@@ -211,6 +211,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length);
 bool detectVoiceActivity(int16_t* samples, size_t count);
 void sendAudioChunk(uint8_t* data, size_t length);
 void playStartupSound();
+void playZenBell();
 void playShutdownSound();
 void playVolumeChime();
 void startMarquee(String text, CRGB color, LEDMode nextMode);
@@ -765,13 +766,13 @@ void loop() {
                     pomodoroState.currentSession = PomodoroState::FOCUS;
                     pomodoroState.sessionCount = 0;
                     pomodoroState.totalSeconds = 25 * 60;  // 25 minute focus
-                    pomodoroState.startTime = 0;  // Not started yet
+                    pomodoroState.startTime = 0;  // Will start after marquee
                     pomodoroState.pausedTime = 0;
                     pomodoroState.active = true;
-                    pomodoroState.paused = true;  // Start paused, waiting for user to press button 1
+                    pomodoroState.paused = true;  // Will auto-start after marquee
                 }
                 
-                Serial.println("🍅 Pomodoro mode activated (paused)");
+                Serial.println("🍅 Pomodoro mode activated (will auto-start after marquee)");
                 startMarquee("POMODORO", CRGB(255, 100, 0), LED_POMODORO);  // Orange for pomodoro
             } else if (modeToCheck == LED_POMODORO) {
                 // Exit Pomodoro and go to Meditation
@@ -976,10 +977,11 @@ void loop() {
             lastAmbientCycle = millis();
         }
         
-        // Pomodoro mode: Button 1 controls pause/play and long-press reset
+        // Pomodoro mode: Button 1 long press = pause/resume, short press = Gemini
+        // Button 2 cycles modes as usual
         static uint32_t button1PressStart = 0;
         static uint32_t lastPomodoroAction = 0;
-        const uint32_t LONG_PRESS_DURATION = 2000;  // 2 seconds for reset
+        const uint32_t LONG_PRESS_DURATION = 2000;  // 2 seconds
         const uint32_t ACTION_DEBOUNCE = 500;  // 500ms between actions
         
         if (currentLEDMode == LED_POMODORO && pomodoroState.active) {
@@ -988,48 +990,47 @@ void loop() {
                 button1PressStart = millis();
             }
             
-            // On button 1 release, check if it was a long press or short press
+            // On button 1 release, check duration
             if (!startTouch && startPressed && (millis() - lastPomodoroAction) > ACTION_DEBOUNCE) {
                 uint32_t pressDuration = millis() - button1PressStart;
                 
                 if (pressDuration >= LONG_PRESS_DURATION) {
-                    // Long press: Reset entire Pomodoro cycle
-                    Serial.println("🔄 Pomodoro cycle reset");
-                    pomodoroState.currentSession = PomodoroState::FOCUS;
-                    pomodoroState.sessionCount = 0;
-                    pomodoroState.totalSeconds = 25 * 60;
-                    pomodoroState.startTime = 0;
-                    pomodoroState.pausedTime = 0;
-                    pomodoroState.paused = true;  // Reset to paused state
-                    
-                    // Play reset chime (quick descending tone)
-                    playShutdownSound();
-                    lastPomodoroAction = millis();
-                } else {
-                    // Short press: Toggle pause/play
+                    // Long press: Toggle pause/resume
                     if (pomodoroState.paused) {
-                        // Resume: start or resume timer
-                        if (pomodoroState.pausedTime > 0) {
-                            // Resuming from pause - restore remaining time
-                            pomodoroState.totalSeconds = pomodoroState.pausedTime;
-                            pomodoroState.pausedTime = 0;
+                        // Resume from paused state
+                        // Calculate how much time has already elapsed before pause
+                        int sessionDuration;
+                        if (pomodoroState.currentSession == PomodoroState::FOCUS) {
+                            sessionDuration = 25 * 60;  // 25 minutes
+                        } else if (pomodoroState.currentSession == PomodoroState::SHORT_BREAK) {
+                            sessionDuration = 5 * 60;   // 5 minutes
+                        } else {
+                            sessionDuration = 15 * 60;  // 15 minutes
                         }
-                        pomodoroState.startTime = millis();
+                        
+                        // Restore original session duration
+                        pomodoroState.totalSeconds = sessionDuration;
+                        
+                        // Adjust startTime so elapsed time accounts for time already consumed
+                        int timeAlreadyElapsed = sessionDuration - pomodoroState.pausedTime;
+                        pomodoroState.startTime = millis() - (timeAlreadyElapsed * 1000);
+                        pomodoroState.pausedTime = 0;
                         pomodoroState.paused = false;
-                        Serial.println("▶️  Pomodoro resumed");
-                        playVolumeChime();  // Brief beep
-                        lastPomodoroAction = millis();
+                        
+                        Serial.printf("▶️  Pomodoro resumed from %d seconds remaining (long press)\n", sessionDuration - timeAlreadyElapsed);
+                        // No sound on resume - user will source alternative
                     } else {
-                        // Pause: save remaining time
+                        // Pause and save current position
                         uint32_t elapsed = (millis() - pomodoroState.startTime) / 1000;
                         pomodoroState.pausedTime = max(0, pomodoroState.totalSeconds - (int)elapsed);
                         pomodoroState.startTime = 0;
                         pomodoroState.paused = true;
-                        Serial.printf("⏸️  Pomodoro paused (%d seconds remaining)\n", pomodoroState.pausedTime);
-                        playVolumeChime();  // Brief beep
-                        lastPomodoroAction = millis();
+                        Serial.printf("⏸️  Pomodoro paused at %d seconds remaining (long press)\n", pomodoroState.pausedTime);
+                        // No sound on pause - user will source alternative
                     }
+                    lastPomodoroAction = millis();
                 }
+                // Short press falls through to recording trigger below
             }
         }
         
@@ -1106,8 +1107,8 @@ void loop() {
         
         // Interrupt feature: START button during active playback stops audio and starts recording
         // Only interrupt if we've received audio recently (within 500ms) and turn is not complete
-        // Skip if in Pomodoro or Meditation mode - button 1 has different function there
-        if (currentLEDMode != LED_POMODORO && currentLEDMode != LED_MEDITATION && startTouch && !startPressed && isPlayingResponse && !turnComplete && 
+        // Note: Pomodoro now allowed - button 1 can interrupt responses during Pomodoro
+        if (currentLEDMode != LED_MEDITATION && startTouch && !startPressed && isPlayingResponse && !turnComplete && 
             (millis() - lastAudioChunkTime) < 500) {
             Serial.println("⏸️  Interrupted response - starting new recording");
             responseInterrupted = true;  // Flag to ignore remaining audio chunks
@@ -1218,8 +1219,27 @@ void loop() {
                          colorNames[lampState.currentColor]);
         }
         // Start recording on rising edge (normal case - not interrupting)
-        // Block if: recording active, playing response, OR in ambient sound mode, OR conversation window is open, OR in Pomodoro/Meditation/Ambient/Lamp mode
-        else if (currentLEDMode != LED_POMODORO && currentLEDMode != LED_MEDITATION && currentLEDMode != LED_AMBIENT && currentLEDMode != LED_LAMP && startTouch && !startPressed && !recordingActive && !isPlayingResponse && !isPlayingAmbient && !conversationMode) {
+        // Block if: recording active, playing response, OR in ambient sound mode, OR conversation window is open, OR in Meditation/Ambient/Lamp mode
+        // Special handling for Pomodoro: only trigger on button release after short press
+        else if (currentLEDMode != LED_MEDITATION && currentLEDMode != LED_AMBIENT && currentLEDMode != LED_LAMP && !recordingActive && !isPlayingResponse && !isPlayingAmbient && !conversationMode) {
+            // Pomodoro mode: only start recording on button release after SHORT press
+            bool shouldStartRecording = false;
+            if (currentLEDMode == LED_POMODORO) {
+                // Wait for button release
+                if (!startTouch && startPressed && (millis() - lastPomodoroAction) > ACTION_DEBOUNCE) {
+                    uint32_t pressDuration = millis() - button1PressStart;
+                    // Only start recording if SHORT press (long press handled above for pause/resume)
+                    if (pressDuration < LONG_PRESS_DURATION) {
+                        shouldStartRecording = true;
+                        Serial.println("🎤 Short press detected in Pomodoro - starting Gemini");
+                    }
+                }
+            } else {
+                // Other modes: start recording on button press as usual
+                shouldStartRecording = (startTouch && !startPressed);
+            }
+            
+            if (shouldStartRecording) {
             // Additional safety: don't start recording if alarm is ringing
             if (alarmState.ringing) {
                 Serial.println("⚠️  Cannot start recording - alarm is ringing");
@@ -1232,8 +1252,9 @@ void loop() {
             conversationRecording = false;  // Button press = normal recording timeout
             tideState.active = false;
             moonState.active = false;
-            // DON'T clear timer - let it run in background and return after interaction
+            // DON'T clear timer or Pomodoro - let them run in background and return after interaction
             // timerState.active = false;
+            // pomodoroState.paused = true;
             
             // CRITICAL: Cancel drain timer so Gemini responses can play
             if (ambientSound.drainUntil > 0) {
@@ -1252,6 +1273,7 @@ void loop() {
             lastVoiceActivityTime = millis();
             currentLEDMode = LED_RECORDING;
             Serial.printf("🎤 Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
+            }  // End of shouldStartRecording block
         }
         startPressed = startTouch;
         
@@ -1300,7 +1322,10 @@ void loop() {
         processingStartTime = 0;
         
         // Return to visualizations if active, otherwise IDLE
-        if (timerState.active) {
+        if (pomodoroState.active) {
+            currentLEDMode = LED_POMODORO;
+            Serial.println("↩️  Timeout - returning to POMODORO display");
+        } else if (timerState.active) {
             currentLEDMode = LED_TIMER;
             Serial.println("↩️  Timeout - returning to TIMER display");
         } else if (moonState.active) {
@@ -1340,8 +1365,11 @@ void loop() {
             Serial.println("💬 Conversation window opened - speak anytime in next 10 seconds");
         } else {
             // Turn not complete - show visualizations or return to idle/ambient
-            // Priority: Timer > Moon > Tide > Ambient VU > Idle
-            if (timerState.active) {
+            // Priority: Pomodoro > Timer > Moon > Tide > Ambient VU > Idle
+            if (pomodoroState.active) {
+                currentLEDMode = LED_POMODORO;
+                Serial.println("✓ Audio playback complete - switching to POMODORO display");
+            } else if (timerState.active) {
                 currentLEDMode = LED_TIMER;
                 Serial.println("✓ Audio playback complete - switching to TIMER display");
             } else if (moonState.active) {
@@ -1389,7 +1417,7 @@ void loop() {
             }
             
             // Play completion chime
-            playStartupSound();
+            playZenBell();
             
             // Advance to next session
             if (pomodoroState.currentSession == PomodoroState::FOCUS) {
@@ -1576,8 +1604,11 @@ void loop() {
             Serial.println("💬 Conversation window expired");
             conversationMode = false;
             
-            // Priority: Timer > Moon > Tide > Idle
-            if (timerState.active) {
+            // Priority: Pomodoro > Timer > Moon > Tide > Idle
+            if (pomodoroState.active) {
+                currentLEDMode = LED_POMODORO;
+                Serial.println("↩️  Returning to POMODORO display");
+            } else if (timerState.active) {
                 currentLEDMode = LED_TIMER;
                 Serial.println("↩️  Returning to TIMER display");
             } else if (moonState.active) {
@@ -1818,6 +1849,21 @@ void playStartupSound() {
         size_t bytes_written;
         i2s_write(I2S_NUM_1, toneBuffer, numSamples * 4, &bytes_written, portMAX_DELAY);
     }
+}
+
+void playZenBell() {
+    // Request zen bell sound from server
+    if (!isWebSocketConnected) {
+        Serial.println("⚠️  Cannot play zen bell - WebSocket not connected");
+        return;
+    }
+    
+    JsonDocument bellDoc;
+    bellDoc["action"] = "requestZenBell";
+    String bellMsg;
+    serializeJson(bellDoc, bellMsg);
+    webSocket.sendTXT(bellMsg);
+    Serial.println("🔔 Requesting zen bell from server");
 }
 
 void playShutdownSound() {
@@ -3780,6 +3826,14 @@ void updateLEDs() {
                             serializeJson(ambientDoc, ambientMsg);
                             Serial.printf("📤 Ambient audio request: %s (seq %d)\n", ambientMsg.c_str(), ambientSound.sequence);
                             webSocket.sendTXT(ambientMsg);
+                        }
+                        
+                        // If switching to Pomodoro mode, auto-start the timer
+                        if (targetLEDMode == LED_POMODORO && pomodoroState.active && pomodoroState.paused) {
+                            pomodoroState.startTime = millis();
+                            pomodoroState.paused = false;
+                            Serial.println("▶️  Pomodoro timer auto-started");
+                            playZenBell();  // Play zen bell on start
                         }
                         
                         // If switching to meditation mode, start the breathing and audio now

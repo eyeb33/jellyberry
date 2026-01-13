@@ -874,6 +874,40 @@ Deno.serve({
           return;
         }
         
+        // Handle zen bell request from ESP32
+        if (data.action === "requestZenBell") {
+          console.log(`[${deviceId}] 🔔 Zen bell requested`);
+          
+          const bellPath = `./audio/zen_bell.pcm`;
+          
+          try {
+            // Read and send the zen bell PCM file (play once)
+            const audioData = await Deno.readFile(bellPath);
+            console.log(`[${deviceId}] ✓ Loaded zen_bell.pcm (${audioData.byteLength} bytes) - sending...`);
+            
+            // Stream with flow control - play once
+            const CHUNK_SIZE = 1024;
+            const CHUNKS_PER_BATCH = 5;
+            const BATCH_DELAY_MS = 100;
+            
+            for (let offset = 0; offset < audioData.byteLength; offset += CHUNK_SIZE) {
+              const chunk = audioData.slice(offset, offset + CHUNK_SIZE);
+              socket.send(chunk);
+              
+              // Flow control: batch chunks and add delays
+              if ((offset / CHUNK_SIZE) % CHUNKS_PER_BATCH === 0) {
+                await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
+              }
+            }
+            
+            console.log(`[${deviceId}] ✓ Zen bell sent (${audioData.byteLength} bytes)`);
+          } catch (err) {
+            console.error(`[${deviceId}] ⚠️ Failed to load zen bell:`, err);
+          }
+          
+          return;  // Don't pass to Gemini
+        }
+        
         // Handle ambient sound requests from ESP32 (check BEFORE setup to avoid misclassification)
         if (data.action === "requestAmbient") {
           const soundName = data.sound || "rain";

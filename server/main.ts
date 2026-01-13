@@ -67,6 +67,8 @@ interface ClientConnection {
   pendingFunctionCallId?: string;
   ambientStreamCancel?: (() => void) | null;
   ambientSequence?: number;  // Current ambient stream sequence number
+  alarmStreamCancel?: (() => void) | null;  // Cancel function for alarm streaming
+  pomodoroStatusResolver?: ((status: any) => void) | undefined;  // Promise resolver for Pomodoro status
   
   // Session tracking for diagnostics
   geminiConnectedAt?: number;  // Timestamp when Gemini connected
@@ -1095,6 +1097,32 @@ Deno.serve({
           return;
         }
         
+        // Handle Pomodoro status response from ESP32
+        if (data.type === "pomodoroStatusResponse") {
+          console.log(`[${deviceId}] Pomodoro status response received`);
+          if (connection.pomodoroStatusResolver) {
+            if (data.active) {
+              connection.pomodoroStatusResolver({
+                success: true,
+                active: true,
+                session: data.session,
+                timeRemaining: `${data.minutesRemaining}:${String(data.secondsRemaining).padStart(2, '0')}`,
+                paused: data.paused,
+                cycleNumber: data.cycleNumber,
+                message: `${data.session} session - ${data.minutesRemaining}:${String(data.secondsRemaining).padStart(2, '0')} remaining (${data.paused ? 'paused' : 'running'}), cycle ${data.cycleNumber} of 4`
+              });
+            } else {
+              connection.pomodoroStatusResolver({
+                success: true,
+                active: false,
+                message: "No Pomodoro timer is currently active"
+              });
+            }
+            connection.pomodoroStatusResolver = undefined;
+          }
+          return;
+        }
+        
         // Handle function response from ESP32 - forward to Gemini
         if (data.type === "functionResponse") {
           console.log(`[${deviceId}] Function response: ${data.name} =`, data.result);
@@ -1313,10 +1341,23 @@ async function connectToGemini(connection: ClientConnection) {
             },
             {
               name: "start_pomodoro",
-              description: "Start a Pomodoro timer session with 25-minute focus periods and breaks. Use when user says 'start pomodoro', 'begin focus session', 'help me focus', etc.",
+              description: "Start a Pomodoro timer session. Supports custom durations if specified, otherwise uses defaults (25-min focus, 5-min short break, 15-min long break). Use when user says 'start pomodoro', 'begin focus session', 'help me focus', or requests custom Pomodoro durations.",
               parameters: {
                 type: "OBJECT",
-                properties: {},
+                properties: {
+                  focus_minutes: {
+                    type: "INTEGER",
+                    description: "Duration of focus/work sessions in minutes (default: 25)"
+                  },
+                  short_break_minutes: {
+                    type: "INTEGER",
+                    description: "Duration of short breaks in minutes (default: 5)"
+                  },
+                  long_break_minutes: {
+                    type: "INTEGER",
+                    description: "Duration of long break in minutes (default: 15)"
+                  }
+                },
                 required: []
               }
             },
@@ -1572,13 +1613,25 @@ async function connectToGemini(connection: ClientConnection) {
                 }));
               }
             } else if (funcName === "start_pomodoro") {
-              console.log(`[${connection.deviceId}] Starting Pomodoro session`);
+              const focusMinutes = funcArgs.focus_minutes || 25;
+              const shortBreakMinutes = funcArgs.short_break_minutes || 5;
+              const longBreakMinutes = funcArgs.long_break_minutes || 15;
+              
+              console.log(`[${connection.deviceId}] Starting Pomodoro: ${focusMinutes}min focus, ${shortBreakMinutes}min short break, ${longBreakMinutes}min long break`);
+              
               connection.socket.send(JSON.stringify({
-                type: "pomodoroStart"
+                type: "pomodoroStart",
+                focusMinutes: focusMinutes,
+                shortBreakMinutes: shortBreakMinutes,
+                longBreakMinutes: longBreakMinutes
               }));
+              
+              const isCustom = funcArgs.focus_minutes || funcArgs.short_break_minutes || funcArgs.long_break_minutes;
               functionResult = {
                 success: true,
-                message: "Pomodoro timer started with a 25-minute focus session"
+                message: isCustom 
+                  ? `Pomodoro timer started with custom durations: ${focusMinutes}-minute focus sessions, ${shortBreakMinutes}-minute short breaks, and ${longBreakMinutes}-minute long break`
+                  : "Pomodoro timer started with standard durations: 25-minute focus sessions, 5-minute short breaks, and 15-minute long break"
               };
             } else if (funcName === "pause_pomodoro") {
               console.log(`[${connection.deviceId}] Pausing Pomodoro`);
@@ -1618,14 +1671,27 @@ async function connectToGemini(connection: ClientConnection) {
               };
             } else if (funcName === "get_pomodoro_status") {
               console.log(`[${connection.deviceId}] Getting Pomodoro status`);
+              
+              // Request status from ESP32 and wait for response
+              const statusPromise = new Promise<any>((resolve) => {
+                const timeout = setTimeout(() => {
+                  resolve({
+                    success: false,
+                    message: "Timeout waiting for Pomodoro status from device"
+                  });
+                }, 2000);
+                
+                connection.pomodoroStatusResolver = (status: any) => {
+                  clearTimeout(timeout);
+                  resolve(status);
+                };
+              });
+              
               connection.socket.send(JSON.stringify({
                 type: "pomodoroStatusRequest"
               }));
-              // Note: ESP32 will send back status, but for now return placeholder
-              functionResult = {
-                success: true,
-                message: "Pomodoro status requested from device"
-              };
+              
+              functionResult = await statusPromise;
             }
             
             // Send function response back to Gemini

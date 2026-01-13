@@ -139,7 +139,11 @@ struct PomodoroState {
     uint32_t pausedTime;     // Time remaining when paused (0 if not paused)
     bool active;             // Pomodoro mode active
     bool paused;             // Timer paused
-} pomodoroState = {PomodoroState::FOCUS, 0, 25 * 60, 0, 0, false, false};
+    // Custom durations (in minutes)
+    int focusDuration;       // Focus session duration (default: 25)
+    int shortBreakDuration;  // Short break duration (default: 5)
+    int longBreakDuration;   // Long break duration (default: 15)
+} pomodoroState = {PomodoroState::FOCUS, 0, 25 * 60, 0, 0, false, false, 25, 5, 15};
 
 // Meditation mode state
 struct MeditationState {
@@ -765,7 +769,7 @@ void loop() {
                 if (!pomodoroState.active) {
                     pomodoroState.currentSession = PomodoroState::FOCUS;
                     pomodoroState.sessionCount = 0;
-                    pomodoroState.totalSeconds = 25 * 60;  // 25 minute focus
+                    pomodoroState.totalSeconds = pomodoroState.focusDuration * 60;
                     pomodoroState.startTime = 0;  // Will start after marquee
                     pomodoroState.pausedTime = 0;
                     pomodoroState.active = true;
@@ -1001,11 +1005,11 @@ void loop() {
                         // Calculate how much time has already elapsed before pause
                         int sessionDuration;
                         if (pomodoroState.currentSession == PomodoroState::FOCUS) {
-                            sessionDuration = 25 * 60;  // 25 minutes
+                            sessionDuration = pomodoroState.focusDuration * 60;
                         } else if (pomodoroState.currentSession == PomodoroState::SHORT_BREAK) {
-                            sessionDuration = 5 * 60;   // 5 minutes
+                            sessionDuration = pomodoroState.shortBreakDuration * 60;
                         } else {
-                            sessionDuration = 15 * 60;  // 15 minutes
+                            sessionDuration = pomodoroState.longBreakDuration * 60;
                         }
                         
                         // Restore original session duration
@@ -1425,9 +1429,9 @@ void loop() {
                 
                 if (pomodoroState.sessionCount >= 4) {
                     // After 4 focus sessions, take a long break
-                    Serial.println("🍅 → 🟦 Focus complete! Starting long break (30 min)");
+                    Serial.printf("🍅 → 🟦 Focus complete! Starting long break (%d min)\n", pomodoroState.longBreakDuration);
                     pomodoroState.currentSession = PomodoroState::LONG_BREAK;
-                    pomodoroState.totalSeconds = 30 * 60;  // Changed from 15 to 30 minutes
+                    pomodoroState.totalSeconds = pomodoroState.longBreakDuration * 60;
                     startMarquee("LONG BREAK", CRGB(0, 100, 255), LED_POMODORO);
                     
                     // Start immediately (don't pause)
@@ -1436,9 +1440,9 @@ void loop() {
                     pomodoroState.paused = false;
                 } else {
                     // Normal short break after focus
-                    Serial.printf("🍅 → 🟩 Focus complete! Starting short break (5 min) [%d/4]\n", pomodoroState.sessionCount);
+                    Serial.printf("🍅 → 🟩 Focus complete! Starting short break (%d min) [%d/4]\n", pomodoroState.shortBreakDuration, pomodoroState.sessionCount);
                     pomodoroState.currentSession = PomodoroState::SHORT_BREAK;
-                    pomodoroState.totalSeconds = 5 * 60;
+                    pomodoroState.totalSeconds = pomodoroState.shortBreakDuration * 60;
                     startMarquee("SHORT BREAK", CRGB(0, 255, 0), LED_POMODORO);
                     
                     // Start immediately (don't pause)
@@ -1450,7 +1454,7 @@ void loop() {
                 // Long break complete - END OF CYCLE, return to paused state
                 Serial.println("🟦 → 🛑 Long break complete! Pomodoro cycle finished - press button to restart");
                 pomodoroState.currentSession = PomodoroState::FOCUS;
-                pomodoroState.totalSeconds = 25 * 60;
+                pomodoroState.totalSeconds = pomodoroState.focusDuration * 60;
                 pomodoroState.sessionCount = 0;  // Reset counter for next cycle
                 startMarquee("CYCLE DONE", CRGB(255, 255, 0), LED_POMODORO);  // Yellow = complete
                 
@@ -1460,9 +1464,9 @@ void loop() {
                 pomodoroState.paused = true;
             } else {
                 // Short break complete, return to focus
-                Serial.println("🟩 → 🍅 Break complete! Starting focus session (25 min)");
+                Serial.printf("🟩 → 🍅 Break complete! Starting focus session (%d min)\n", pomodoroState.focusDuration);
                 pomodoroState.currentSession = PomodoroState::FOCUS;
-                pomodoroState.totalSeconds = 25 * 60;
+                pomodoroState.totalSeconds = pomodoroState.focusDuration * 60;
                 startMarquee("FOCUS TIME", CRGB(255, 0, 0), LED_POMODORO);
                 
                 // Start immediately (don't pause)
@@ -2653,10 +2657,27 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
     
     // Handle Pomodoro commands
     if (doc["type"].is<const char*>() && doc["type"] == "pomodoroStart") {
+        // Get custom durations if provided, otherwise use current settings
+        if (doc["focusMinutes"].is<int>()) {
+            pomodoroState.focusDuration = doc["focusMinutes"].as<int>();
+            Serial.printf("🍅 Custom focus duration: %d minutes\n", pomodoroState.focusDuration);
+        }
+        if (doc["shortBreakMinutes"].is<int>()) {
+            pomodoroState.shortBreakDuration = doc["shortBreakMinutes"].as<int>();
+            Serial.printf("🍅 Custom short break: %d minutes\n", pomodoroState.shortBreakDuration);
+        }
+        if (doc["longBreakMinutes"].is<int>()) {
+            pomodoroState.longBreakDuration = doc["longBreakMinutes"].as<int>();
+            Serial.printf("🍅 Custom long break: %d minutes\n", pomodoroState.longBreakDuration);
+        }
+        
         Serial.println("🍅 Pomodoro started via voice command");
         currentLEDMode = LED_POMODORO;
         targetLEDMode = LED_POMODORO;
         pomodoroState.active = true;
+        pomodoroState.currentSession = PomodoroState::FOCUS;
+        pomodoroState.sessionCount = 0;
+        pomodoroState.totalSeconds = pomodoroState.focusDuration * 60;
         pomodoroState.paused = false;
         pomodoroState.startTime = millis();
         playVolumeChime();
@@ -2708,6 +2729,10 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
     
     if (doc["type"].is<const char*>() && doc["type"] == "pomodoroStatusRequest") {
         Serial.println("🍅 Pomodoro status requested");
+        
+        JsonDocument statusDoc;
+        statusDoc["type"] = "pomodoroStatusResponse";
+        
         if (pomodoroState.active) {
             uint32_t secondsRemaining;
             if (pomodoroState.paused) {
@@ -2720,11 +2745,25 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
             int seconds = secondsRemaining % 60;
             const char* sessionName = (pomodoroState.currentSession == PomodoroState::FOCUS) ? "Focus" :
                                      (pomodoroState.currentSession == PomodoroState::SHORT_BREAK) ? "Short Break" : "Long Break";
+            
+            statusDoc["active"] = true;
+            statusDoc["session"] = sessionName;
+            statusDoc["minutesRemaining"] = minutes;
+            statusDoc["secondsRemaining"] = seconds;
+            statusDoc["paused"] = pomodoroState.paused;
+            statusDoc["cycleNumber"] = pomodoroState.sessionCount + 1;
+            
             Serial.printf("🍅 Status: %s session, %d:%02d remaining, %s, cycle %d/4\n",
                          sessionName, minutes, seconds, pomodoroState.paused ? "paused" : "running", pomodoroState.sessionCount + 1);
         } else {
+            statusDoc["active"] = false;
             Serial.println("🍅 Pomodoro not active");
         }
+        
+        String statusMsg;
+        serializeJson(statusDoc, statusMsg);
+        webSocket.sendTXT(statusMsg);
+        Serial.println("📤 Sent Pomodoro status to server");
         return;
     }
     

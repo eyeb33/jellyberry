@@ -62,7 +62,7 @@ Edit `src/Config.h` and update:
 ```cpp
 #define WIFI_SSID "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
-#define GEMINI_API_KEY "AIzaSyDV0Qa53W3S9-jC7xsi0jtgm7DsVRF64Kk"
+#define GEMINI_API_KEY "YOUR_GEMINI_API_KEY_HERE"
 ```
 
 ### 4. Install Dependencies

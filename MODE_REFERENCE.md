@@ -390,10 +390,13 @@ Press **Button 2** to cycle through modes in this order:
 **Not a selectable mode** - Plays when entering certain modes
 
 ### Visual
-- **Animation:** Scrolling text from right to left
+- **Animation:** Scrolling text clockwise around full circumference
+- **Display:** Uses all 12 LED strips (full 360° shell)
+- **Font:** Custom 3×8 chunky glyphs, centered at rows 2-9
+- **Spacing:** 4 columns per character (3 for glyph + 1 column spacing)
 - **Color:** Mode-specific (Pomodoro=Orange, Meditation=Purple, etc.)
-- **Speed:** 100ms per pixel scroll
-- **Font:** 5x7 pixel font
+- **Speed:** ~4 columns/second (250ms update interval default)
+- **Direction:** Right-to-left scroll (appears to move clockwise)
 
 ### Marquee Messages
 - "POMODORO" - Orange

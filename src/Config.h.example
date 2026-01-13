@@ -81,4 +81,8 @@
 #define CORE_0 0
 #define CORE_1 1
 
+// Debug Configuration
+// Uncomment to enable verbose debug logging (WARNING: may cause timing jitter in audio/LEDs)
+// #define DEBUG_LOGS
+
 #endif // CONFIG_H

@@ -12,6 +12,8 @@
 #include "Config.h"
 #include "display_mapping.h"
 #include "front_text_marquee.h"
+#include "SeaGooseberryVisualizer.h"
+#include "EyeAnimationVisualizer.h"
 
 // Debug logging macro - controlled by Config.h DEBUG_LOGS flag
 #ifdef DEBUG_LOGS
@@ -34,6 +36,12 @@ CRGB leds[NUM_LEDS];
 
 // Front text marquee system
 FrontTextMarquee frontMarquee;
+
+// Sea Gooseberry visualizer
+SeaGooseberryVisualizer seaGooseberry;
+
+// Eye Animation visualizer
+EyeAnimationVisualizer eyeAnimation;
 
 bool isWebSocketConnected = false;
 bool recordingActive = false;
@@ -86,7 +94,7 @@ struct AudioChunk {
     size_t length;
 };
 
-enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU, LED_AMBIENT, LED_POMODORO, LED_MEDITATION, LED_CLOCK, LED_LAMP, LED_ALARM, LED_CONVERSATION_WINDOW, LED_MARQUEE };
+enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU, LED_AMBIENT, LED_POMODORO, LED_MEDITATION, LED_CLOCK, LED_LAMP, LED_SEA_GOOSEBERRY, LED_EYES, LED_ALARM, LED_CONVERSATION_WINDOW, LED_MARQUEE };
 LEDMode currentLEDMode = LED_IDLE;  // Start directly in idle mode
 LEDMode targetLEDMode = LED_IDLE;  // Mode to switch to after marquee finishes
 bool ambientVUMode = false;  // Toggle for ambient sound VU meter mode
@@ -885,12 +893,30 @@ void loop() {
                 DEBUG_PRINTLN("💡 Lamp mode activated");
                 startMarquee("LAMP", CRGB::White, LED_LAMP);
             } else if (modeToCheck == LED_LAMP) {
-                // Exit Lamp and return to IDLE
+                // Exit Lamp and go to Sea Gooseberry mode
                 DEBUG_PRINTLN("⏹️  Lamp mode stopped");
                 
                 // Clear lamp state
                 lampState.active = false;
                 lampState.fullyLit = false;
+                
+                // Initialize Sea Gooseberry visualizer
+                seaGooseberry.begin();
+                
+                DEBUG_PRINTLN("🌊 Sea Gooseberry mode activated");
+                startMarquee("SEA JELLY", CRGB(100, 200, 255), LED_SEA_GOOSEBERRY);
+            } else if (modeToCheck == LED_SEA_GOOSEBERRY) {
+                // Exit Sea Gooseberry and go to Eye Animation mode
+                DEBUG_PRINTLN("⏹️  Sea Gooseberry mode stopped");
+                
+                // Initialize Eye Animation visualizer
+                eyeAnimation.begin();
+                
+                DEBUG_PRINTLN("👁️  Eye Animation mode activated");
+                startMarquee("EYES", CRGB::White, LED_EYES);
+            } else if (modeToCheck == LED_EYES) {
+                // Exit Eye Animation and return to IDLE
+                DEBUG_PRINTLN("⏹️  Eye Animation mode stopped");
                 
                 DEBUG_PRINTLN("💤 Returning to IDLE mode");
                 currentLEDMode = LED_IDLE;
@@ -1400,6 +1426,16 @@ void loop() {
                 xSemaphoreGive(ledMutex);
             }
         }
+    }
+    
+    // Update Sea Gooseberry animation (non-blocking)
+    if (currentLEDMode == LED_SEA_GOOSEBERRY) {
+        seaGooseberry.update(millis());
+    }
+    
+    // Update Eye Animation (non-blocking)
+    if (currentLEDMode == LED_EYES) {
+        eyeAnimation.update(millis());
     }
     
     // Check for Pomodoro session completion and auto-advance
@@ -3367,10 +3403,10 @@ void updateLEDs() {
                     int litRows;
                     if (isBreakSession) {
                         // Breaks: count UP (filling = recharging energy)
-                        litRows = (int)(progress * LEDS_PER_COLUMN);
+                        litRows = (int)ceil(progress * LEDS_PER_COLUMN);
                     } else {
                         // Focus: count DOWN (draining = time running out)
-                        litRows = (int)((1.0 - progress) * LEDS_PER_COLUMN);
+                        litRows = (int)ceil((1.0 - progress) * LEDS_PER_COLUMN);
                     }
                     litRows = constrain(litRows, 0, LEDS_PER_COLUMN);
                     
@@ -3413,17 +3449,27 @@ void updateLEDs() {
                             int ledIndex = col * LEDS_PER_COLUMN + row;
                             if (ledIndex >= NUM_LEDS) continue;
                             
+                            // Determine if this LED should be lit
+                            // LEDs stay lit from bottom (0) up to and including the active LED
+                            bool shouldBeLit = (row <= activeLED);
+                            
+                            if (!shouldBeLit) {
+                                leds[ledIndex] = CRGB::Black;
+                                continue;
+                            }
+                            
+                            // All lit LEDs get brightness treatment
                             float ledBrightness;
                             
                             if (pomodoroState.paused) {
                                 // When paused: all LEDs breathe together at same brightness
                                 ledBrightness = activePulse;
                             } else {
-                                // When running: active LED breathes, others stay at 5%
+                                // When running: active LED breathes, others stay at 10%
                                 if (row == activeLED) {
                                     ledBrightness = activePulse;  // 40-100% breathing
                                 } else {
-                                    ledBrightness = 0.05;  // Constant 5% for inactive LEDs (barely visible background)
+                                    ledBrightness = 0.10;  // 10% for inactive LEDs (visible background)
                                 }
                             }
                             
@@ -3715,6 +3761,22 @@ void updateLEDs() {
                 } else {
                     fill_solid(leds, NUM_LEDS, CRGB::Black);
                 }
+            }
+            break;
+            
+        case LED_SEA_GOOSEBERRY:
+            // Sea Gooseberry Mode - organic downward-traveling iridescent waves
+            // Mimics real comb jelly bioluminescence with phase-shifted rainbow colors
+            {
+                seaGooseberry.render(leds, NUM_LEDS);
+            }
+            break;
+            
+        case LED_EYES:
+            // Eye Animation Mode - expressive robot eyes
+            // Uses strips 2-3 for left eye, 11-12 for right eye
+            {
+                eyeAnimation.render(leds);
             }
             break;
             

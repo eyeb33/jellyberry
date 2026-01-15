@@ -6,7 +6,7 @@ Complete documentation of all LED modes, controls, animations, and voice interac
 
 ## Mode Cycling (Button 2)
 Press **Button 2** to cycle through modes in this order:
-1. Idle → Ambient VU → Nature Sounds → Pomodoro → Meditation → Clock → Lamp → Idle
+1. Idle → Ambient VU → Nature Sounds → Pomodoro → Meditation → Clock → Lamp → Sea Gooseberry → Idle
 
 ---
 
@@ -195,6 +195,52 @@ Press **Button 2** to cycle through modes in this order:
 
 ### Notes
 - Simple static lighting mode for ambient illumination
+
+---
+
+## 🌊 SEA GOOSEBERRY Mode
+
+**Marquee:** "SEA JELLY"
+
+### Visual
+- **Animation:** Living comb jelly drifting in dark water
+- **Effect:** Multiple downward-traveling iridescent waves along vertical "comb rows"
+- **Colors:** Soft rainbow gradients (blue, cyan, green, magenta)
+- **Pattern:** 8 primary bright ribs + 4 dimmer in-between strips
+- **Motion:** Organic, phase-shifted waves rotating around the sphere
+- **Breathing:** Slow 30-second global brightness modulation
+
+### Biology Inspiration
+Mimics real sea gooseberries (Pleurobrachia spp.) - transparent comb jellies with 8 meridional rows of beating cilia. The cilia refract light to create traveling waves of rainbow color flowing from pole to pole.
+
+### Technical Details
+- **8 Primary Comb Rows:** Strips 0, 2, 3, 5, 6, 8, 9, 11 (bright, like real comb plates)
+- **4 Dimmer Ribs:** Strips 1, 4, 7, 10 (40% brightness, in-between glow)
+- **Wave System:** 2 overlapping waves with different speeds for depth
+- **Phase Offsets:** Each rib slightly ahead/behind neighbors (rotation effect)
+- **Speed Variation:** ±10% per rib for organic, non-mechanical feel
+- **Hue Variation:** ±10% per rib for color diversity
+- **Wave Speed:** ~1.5 seconds per full downward travel (adjustable)
+- **Brightness:** 60% default, ±30% breathing modulation
+
+### Animation Characteristics
+- **Non-blocking:** Updates via time deltas, no blocking delay() calls
+- **Smooth:** HSV color interpolation with easing curves
+- **Relaxing:** Slow, drifting motion like a real creature hovering
+- **Never harsh:** No strobing or white flashes, only soft iridescent gradients
+
+### Controls
+- **Button 1 Short Press:** Talk to Gemini (animation continues in background)
+  - Returns to Sea Gooseberry after 10s conversation window
+- **Button 2:** Exit to Idle mode
+
+### Voice Commands
+- All standard Gemini functions available (animation plays during responses)
+
+### Notes
+- Most scientifically accurate mode - closely models real comb jelly bioluminescence
+- Optimized for ESP32-S3 performance with minimal CPU overhead
+- Perfect for meditation, relaxation, or just watching nature's light show
 
 ---
 

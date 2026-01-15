@@ -100,7 +100,7 @@ LEDMode targetLEDMode = LED_IDLE;  // Mode to switch to after marquee finishes
 bool ambientVUMode = false;  // Toggle for ambient sound VU meter mode
 
 // Ambient sound type (for cycling within AMBIENT mode)
-enum AmbientSoundType { SOUND_RAIN, SOUND_OCEAN, SOUND_RAINFOREST };
+enum AmbientSoundType { SOUND_RAIN, SOUND_OCEAN, SOUND_RAINFOREST, SOUND_FIRE };
 AmbientSoundType currentAmbientSoundType = SOUND_RAIN;
 
 // Tide visualization state
@@ -133,7 +133,7 @@ SemaphoreHandle_t ledMutex = NULL;
 
 // Ambient sound state
 struct AmbientSound {
-    String name;  // "rain", "ocean", "rainforest"
+    String name;  // "rain", "ocean", "rainforest", "fire"
     bool active;
     uint16_t sequence;  // Increments each time we request a new sound
     uint16_t discardedCount;  // Count discarded chunks to reduce log spam
@@ -976,7 +976,12 @@ void loop() {
                 ambientSound.name = "rainforest";
                 DEBUG_PRINT("🌿 Ambient: Switching to Rainforest (seq %d)\n", ambientSound.sequence + 1);
                 startMarquee("FOREST", CRGB(50, 255, 50), LED_AMBIENT);  // Green
-            } else {  // SOUND_RAINFOREST
+            } else if (currentAmbientSoundType == SOUND_RAINFOREST) {
+                currentAmbientSoundType = SOUND_FIRE;
+                ambientSound.name = "fire";
+                DEBUG_PRINT("🔥 Ambient: Switching to Fire (seq %d)\n", ambientSound.sequence + 1);
+                startMarquee("FIRE", CRGB(255, 100, 0), LED_AMBIENT);  // Orange
+            } else {  // SOUND_FIRE
                 currentAmbientSoundType = SOUND_RAIN;
                 ambientSound.name = "rain";
                 DEBUG_PRINT("🌧️  Ambient: Switching to Rain (seq %d)\n", ambientSound.sequence + 1);
@@ -2060,6 +2065,8 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                         currentAmbientSoundType = SOUND_OCEAN;
                     } else if (ambientSound.name == "rainforest") {
                         currentAmbientSoundType = SOUND_RAINFOREST;
+                    } else if (ambientSound.name == "fire") {
+                        currentAmbientSoundType = SOUND_FIRE;
                     }
                     
                     // Request the ambient sound again
@@ -3404,6 +3411,120 @@ void updateLEDs() {
                         uint8_t hue = 96 + (i * 2);  // Green range 96-114
                         uint8_t sat = 220 + (i * 3);  // Varying saturation
                         leds[i] = CHSV(hue, sat, brightness);
+                    }
+                }
+            }
+            
+            // Fire mode visualization (after rainforest check)
+            if (currentAmbientSoundType == SOUND_FIRE) {
+                // Rising/falling flames with sparks
+                static float flameHeights[12];  // Per-strip flame height (0.0-1.0)
+                static float flamePhases[12];   // Per-strip phase offset
+                static float sparkPositions[12]; // Per-strip spark position (-1 = none)
+                static float sparkBrightness[12]; // Per-strip spark brightness
+                static bool fireInitialized = false;
+                
+                // Initialize on first run
+                if (!fireInitialized) {
+                    for (int s = 0; s < 12; s++) {
+                        flameHeights[s] = 0.3f + (random(0, 300) / 1000.0f);  // 0.3-0.6
+                        flamePhases[s] = random(0, 1000) / 1000.0f;  // 0.0-1.0
+                        sparkPositions[s] = -1.0f;  // No spark
+                        sparkBrightness[s] = 0.0f;
+                    }
+                    fireInitialized = true;
+                }
+                
+                // Update flame heights (organic sine wave motion)
+                float globalTime = millis() / 1000.0f;
+                for (int s = 0; s < 12; s++) {
+                    // Each strip has its own frequency and phase (slower for relaxation)
+                    float frequency = 0.3f + (s * 0.03f);  // 0.3-0.63 Hz variation (was 0.5-1.1)
+                    float targetHeight = 0.35f + 0.12f * sin((globalTime * frequency) + flamePhases[s]);  // 0.23-0.47 (reduced amplitude)
+                    
+                    // Smooth approach to target (slower for gentler motion)
+                    flameHeights[s] += (targetHeight - flameHeights[s]) * 0.05f;
+                    
+                    // Spawn new sparks occasionally (2% chance per frame from flame tip, reduced from 5%)
+                    if (sparkPositions[s] < 0.0f && random(100) < 2 && flameHeights[s] > 0.3f) {
+                        sparkPositions[s] = flameHeights[s] * 12.0f;  // Start at flame tip
+                        sparkBrightness[s] = 1.0f;
+                    }
+                    
+                    // Update existing sparks (float upward and fade)
+                    if (sparkPositions[s] >= 0.0f) {
+                        sparkPositions[s] += 0.18f + (random(0, 70) / 1000.0f);  // 0.18-0.25 LEDs/frame
+                        sparkBrightness[s] -= 0.12f;  // Fade over ~8 frames
+                        
+                        // Remove if reached top or fully faded
+                        if (sparkPositions[s] >= 12.0f || sparkBrightness[s] <= 0.0f) {
+                            sparkPositions[s] = -1.0f;
+                            sparkBrightness[s] = 0.0f;
+                        }
+                    }
+                }
+                
+                // Clear all LEDs first
+                fill_solid(leds, NUM_LEDS, CRGB::Black);
+                
+                // Render flames for each strip
+                for (int strip = 0; strip < 12; strip++) {
+                    int maxFlameRow = (int)(flameHeights[strip] * 12.0f);
+                    maxFlameRow = constrain(maxFlameRow, 0, 6);  // Cap at row 6 (max flame height)
+                    
+                    for (int row = 0; row < 12; row++) {
+                        // LED index: strip * 12 + row (all wired bottom-up)
+                        int ledIdx = strip * 12 + row;
+                        if (ledIdx < 0 || ledIdx >= NUM_LEDS) continue;
+                        
+                        // Check if spark is at this position
+                        bool isSpark = false;
+                        if (sparkPositions[strip] >= 0.0f) {
+                            int sparkRow = (int)sparkPositions[strip];
+                            if (row == sparkRow && sparkBrightness[strip] > 0.0f) {
+                                isSpark = true;
+                                // Bright yellow-orange spark
+                                uint8_t sparkHue = 25 + random(0, 10);  // 25-35 (yellow-orange)
+                                uint8_t sparkBr = (uint8_t)(255 * sparkBrightness[strip]);
+                                leds[ledIdx] = CHSV(sparkHue, 220, sparkBr);
+                            }
+                        }
+                        
+                        // Render flame if below max height and not spark
+                        if (!isSpark && row <= maxFlameRow) {
+                            // Progress from bottom (0.0) to tip (1.0)
+                            float progress = (float)row / (float)maxFlameRow;
+                            
+                            // Color gradient: deep red → orange → yellow-orange
+                            uint8_t hue;
+                            if (progress < 0.4f) {
+                                // Bottom 40%: Deep red (0-5)
+                                hue = 0 + (uint8_t)(progress * 2.5f * 5.0f);
+                            } else if (progress < 0.7f) {
+                                // Mid 30%: Red to orange (5-15)
+                                hue = 5 + (uint8_t)((progress - 0.4f) * 3.33f * 10.0f);
+                            } else {
+                                // Top 30%: Orange to yellow-orange (15-25)
+                                hue = 15 + (uint8_t)((progress - 0.7f) * 3.33f * 10.0f);
+                            }
+                            
+                            // Subtle hue variation (±1 for gentle organic feel)
+                            hue += random(-1, 2);
+                            
+                            // Brightness gradient: dimmer at base, brighter at tips
+                            uint8_t brightness;
+                            if (progress < 0.5f) {
+                                brightness = 150 + (uint8_t)(progress * 2.0f * 50.0f);  // 150-200
+                            } else {
+                                brightness = 200 + (uint8_t)((progress - 0.5f) * 2.0f * 55.0f);  // 200-255
+                            }
+                            
+                            // Gentle brightness variation (±5 for subtle glow)
+                            brightness += random(-5, 6);
+                            brightness = constrain(brightness, 100, 255);
+                            
+                            leds[ledIdx] = CHSV(hue, 255, brightness);
+                        }
                     }
                 }
             }

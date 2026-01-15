@@ -3252,37 +3252,74 @@ void updateLEDs() {
             // Single ambient mode with different visualizations based on current sound
             {
                 if (currentAmbientSoundType == SOUND_RAIN) {
-                    // Falling rain effect - random blue drops falling down
+                    // Falling rain effect - drops hit and run down like on a window
                     static uint32_t lastDrop = 0;
-                    static uint8_t dropBrightness[144] = {0};  // Track drop brightness (max LEDs)
+                    static float dropPosition[144] = {-1.0f};  // Vertical position of each drop (0=top, 12=bottom, -1=inactive)
+                    static float dropSpeed[144] = {0.0f};  // Speed of each drop (randomized)
                     static bool rainInitialized = false;
                     
                     // Reset on first entry to rain mode
                     if (!rainInitialized) {
-                        memset(dropBrightness, 0, sizeof(dropBrightness));
+                        for (int i = 0; i < 144; i++) {
+                            dropPosition[i] = -1.0f;
+                            dropSpeed[i] = 0.0f;
+                        }
                         lastDrop = millis();
                         rainInitialized = true;
                     }
                     
-                    // Fade all LEDs
-                    for (int i = 0; i < NUM_LEDS; i++) {
-                        leds[i].fadeToBlackBy(40);
-                    }
+                    // Clear all LEDs
+                    fill_solid(leds, NUM_LEDS, CRGB::Black);
                     
-                    // Add new drops randomly
+                    // Add new drops randomly at random strips
                     if (millis() - lastDrop > RAIN_DROP_SPAWN_INTERVAL_MS) {
                         if (random(100) < RAIN_DROP_SPAWN_CHANCE) {  // 30% chance each 100ms
-                            int pos = random(NUM_LEDS);
-                            dropBrightness[pos] = 255;
+                            int strip = random(LED_COLUMNS);  // Random strip
+                            // Only spawn if this strip doesn't already have an active drop
+                            if (dropPosition[strip] < 0.0f) {
+                                dropPosition[strip] = 0.0f;  // Start at top of strip
+                                dropSpeed[strip] = 0.08f + (random(0, 100) / 1000.0f);  // Random speed 0.08-0.18
+                            }
                         }
                         lastDrop = millis();
                     }
                     
-                    // Render drops
-                    for (int i = 0; i < NUM_LEDS; i++) {
-                        if (dropBrightness[i] > 0) {
-                            leds[i] = CHSV(160, 255, dropBrightness[i]);  // Blue
-                            dropBrightness[i] = dropBrightness[i] * RAIN_DROP_FADE_RATE;  // Fade out
+                    // Update and render drops running down
+                    for (int strip = 0; strip < LED_COLUMNS; strip++) {
+                        if (dropPosition[strip] >= 0.0f) {
+                            // Drop is active - move it down at its own speed
+                            dropPosition[strip] += dropSpeed[strip];
+                            
+                            // If reached bottom, deactivate
+                            if (dropPosition[strip] >= (float)LEDS_PER_COLUMN) {
+                                dropPosition[strip] = -1.0f;
+                                dropSpeed[strip] = 0.0f;
+                                continue;
+                            }
+                            
+                            // Render the drop with a 2-3 LED trail
+                            int currentLED = (int)dropPosition[strip];
+                            
+                            // Initial impact flash (first LED, very bright white-blue)
+                            if (dropPosition[strip] < 0.5f && currentLED == 0) {
+                                int ledIdx = strip * LEDS_PER_COLUMN + currentLED;
+                                leds[ledIdx] = CRGB(200, 220, 255);  // Bright white-blue flash
+                            }
+                            // Main drop (brightest blue)
+                            else if (currentLED < LEDS_PER_COLUMN) {
+                                int ledIdx = strip * LEDS_PER_COLUMN + currentLED;
+                                leds[ledIdx] = CHSV(160, 255, 255);  // Bright blue
+                            }
+                            
+                            // Trail (fading)
+                            if (currentLED > 0 && currentLED - 1 < LEDS_PER_COLUMN) {
+                                int ledIdx = strip * LEDS_PER_COLUMN + (currentLED - 1);
+                                leds[ledIdx] = CHSV(160, 255, 150);  // Dimmer
+                            }
+                            if (currentLED > 1 && currentLED - 2 < LEDS_PER_COLUMN) {
+                                int ledIdx = strip * LEDS_PER_COLUMN + (currentLED - 2);
+                                leds[ledIdx] = CHSV(160, 255, 80);  // Even dimmer
+                            }
                         }
                     }
                 } else if (currentAmbientSoundType == SOUND_OCEAN) {

@@ -3401,16 +3401,116 @@ void updateLEDs() {
                             }
                         }
                     }
-                } else {  // SOUND_RAINFOREST
-                    // Pulsing green canopy - gentle breathing effect
-                    float pulse = 0.6 + 0.4 * sin(millis() / 3000.0);  // 0.6 to 1.0
-                    uint8_t brightness = (uint8_t)(200 * pulse);
+                } else if (currentAmbientSoundType == SOUND_RAINFOREST) {
+                    // Tropical rainforest at dusk/night with fireflies and animal eyes
+                    static float fireflyPositions[6][3];  // 6 fireflies: [strip, row, brightness]
+                    static uint32_t fireflyTimers[6];
+                    static float eyePair[3];  // 1 pair: [strip, row, timer]
+                    static bool rainforestInitialized = false;
                     
-                    for (int i = 0; i < NUM_LEDS; i++) {
-                        // Green with slight variation per LED
-                        uint8_t hue = 96 + (i * 2);  // Green range 96-114
-                        uint8_t sat = 220 + (i * 3);  // Varying saturation
-                        leds[i] = CHSV(hue, sat, brightness);
+                    if (!rainforestInitialized) {
+                        for (int i = 0; i < 6; i++) {
+                            fireflyPositions[i][0] = -1.0f;  // inactive
+                            fireflyTimers[i] = 0;
+                        }
+                        eyePair[0] = -1.0f;  // inactive
+                        rainforestInitialized = true;
+                    }
+                    
+                    uint32_t now = millis();
+                    
+                    // Update fireflies
+                    for (int i = 0; i < 6; i++) {
+                        if (fireflyPositions[i][0] < 0.0f) {
+                            // Spawn new firefly (3% chance per frame)
+                            if (random(100) < 3) {
+                                fireflyPositions[i][0] = random(0, 12);  // strip
+                                fireflyPositions[i][1] = random(3, 10);  // row (mid-height)
+                                fireflyPositions[i][2] = 1.0f;  // full brightness
+                                fireflyTimers[i] = now + 2000 + random(0, 1000);  // 2-3s lifespan
+                            }
+                        } else {
+                            // Fade and drift
+                            fireflyPositions[i][2] -= 0.008f;  // fade slowly
+                            fireflyPositions[i][1] += random(-1, 2) * 0.05f;  // subtle drift
+                            
+                            if (now > fireflyTimers[i] || fireflyPositions[i][2] <= 0.0f) {
+                                fireflyPositions[i][0] = -1.0f;  // deactivate
+                            }
+                        }
+                    }
+                    
+                    // Update single animal eye pair
+                    if (eyePair[0] < 0.0f) {
+                        // Spawn new pair (0.5% chance per frame - rare)
+                        if (random(1000) < 5) {
+                            int strip = random(0, 9);  // leave room for pair
+                            eyePair[0] = strip;  // first eye strip
+                            eyePair[1] = random(5, 8);  // row (mid-height)
+                            eyePair[2] = now + 3000 + random(0, 2000);  // 3-5s duration (longer)
+                        }
+                    } else {
+                        if (now > (uint32_t)eyePair[2]) {
+                            eyePair[0] = -1.0f;  // deactivate
+                        }
+                    }
+                    
+                    // Render base canopy (dark emerald green gradient)
+                    for (int strip = 0; strip < 12; strip++) {
+                        // Each strip breathes at slightly different rate
+                        float stripPhase = (strip * 0.2f);
+                        float pulse = 0.7 + 0.3 * sin((now / 5000.0) + stripPhase);  // 5s cycle
+                        
+                        for (int row = 0; row < 12; row++) {
+                            int ledIdx = strip * 12 + row;
+                            
+                            // Vertical gradient: dark forest floor to lighter canopy
+                            float verticalProgress = (float)row / 11.0f;
+                            uint8_t hue = 85 + (uint8_t)(verticalProgress * 15.0f);  // 85-100 (emerald to green)
+                            uint8_t sat = 255 - (uint8_t)(verticalProgress * 40.0f);  // 255-215
+                            uint8_t brightness = 60 + (uint8_t)(verticalProgress * 80.0f * pulse);  // 60-140 (dark)
+                            
+                            leds[ledIdx] = CHSV(hue, sat, brightness);
+                        }
+                    }
+                    
+                    // Render fireflies
+                    for (int i = 0; i < 6; i++) {
+                        if (fireflyPositions[i][0] >= 0.0f) {
+                            int strip = (int)fireflyPositions[i][0];
+                            int row = (int)fireflyPositions[i][1];
+                            if (row >= 0 && row < 12 && strip >= 0 && strip < 12) {
+                                int ledIdx = strip * 12 + row;
+                                uint8_t brightness = (uint8_t)(255 * fireflyPositions[i][2]);
+                                leds[ledIdx] = CHSV(70, 200, brightness);  // Yellow-green
+                            }
+                        }
+                    }
+                    
+                    // Render animal eye pair (2 LEDs each for visibility)
+                    if (eyePair[0] >= 0.0f) {
+                        int strip1 = (int)eyePair[0];
+                        int strip2 = strip1 + 3;  // 3 strips apart for clear separation
+                        int row = (int)eyePair[1];
+                        
+                        if (strip1 < 12 && strip2 < 12 && row >= 0 && row < 11) {
+                            // Blink effect
+                            uint32_t duration = (uint32_t)eyePair[2] - now;
+                            uint32_t totalDuration = 4000;  // ~4s average
+                            uint32_t age = totalDuration - duration;
+                            
+                            uint8_t brightness = 255;
+                            // Blink twice during display
+                            if ((age > 1000 && age < 1150) || (age > 2500 && age < 2650)) {
+                                brightness = 30;  // blink
+                            }
+                            
+                            // Each eye is 2 LEDs vertically
+                            leds[strip1 * 12 + row] = CHSV(30, 220, brightness);  // Amber
+                            leds[strip1 * 12 + row + 1] = CHSV(30, 220, brightness);  // Amber
+                            leds[strip2 * 12 + row] = CHSV(30, 220, brightness);  // Amber
+                            leds[strip2 * 12 + row + 1] = CHSV(30, 220, brightness);  // Amber
+                        }
                     }
                 }
             }
@@ -3527,8 +3627,9 @@ void updateLEDs() {
                         }
                     }
                 }
-            }
-            break;
+            }  // End of fire mode
+            
+            break;  // End of LED_AMBIENT case
             
         case LED_POMODORO:
             // Pomodoro timer visualization with hybrid countdown/countup
@@ -3583,9 +3684,9 @@ void updateLEDs() {
                         float breathe = sin(millis() / 3000.0 * PI);
                         activePulse = 0.30 + 0.70 * ((breathe + 1.0) / 2.0);
                     } else {
-                        // When running, only active LED breathes
+                        // When running, only active LED breathes (brighter for diffuser)
                         float breathe = sin(millis() / 2000.0 * PI);  // Faster 4-second cycle
-                        activePulse = 0.40 + 0.60 * ((breathe + 1.0) / 2.0);  // 40-100% range
+                        activePulse = 0.70 + 0.30 * ((breathe + 1.0) / 2.0);  // 70-100% range
                     }
                     
                     // Calculate which LED is currently "active" (the moving indicator)
@@ -3633,7 +3734,7 @@ void updateLEDs() {
                             } else {
                                 // When running: active LED breathes, others stay at 10%
                                 if (row == activeLED) {
-                                    ledBrightness = activePulse;  // 40-100% breathing
+                                    ledBrightness = activePulse;  // 70-100% breathing
                                 } else {
                                     ledBrightness = 0.10;  // 10% for inactive LEDs (visible background)
                                 }

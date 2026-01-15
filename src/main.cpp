@@ -3339,22 +3339,21 @@ void updateLEDs() {
                     // currentAudioLevel is the average amplitude from PCM playback
                     float instantLevel = (float)currentAudioLevel;
                     
-                    // Smooth the wave height for fluid motion (slower smoothing for ocean waves)
-                    smoothedWave = smoothedWave * 0.90f + instantLevel * 0.10f;
+                    // Smooth the wave height for gentler, more fluid motion
+                    smoothedWave = smoothedWave * 0.80f + instantLevel * 0.20f;  // Balanced smoothing
                     
                     // Debug log every 2 seconds
                     if (millis() - lastDebugLog > 2000) {
                         Serial.printf("🌊 Ocean: Level=%d, Smoothed=%.0f, Rows=%d/%d\n", 
                                      currentAudioLevel, smoothedWave, 
-                                     (int)(constrain(smoothedWave / 400.0f, 0.15f, 0.95f) * LEDS_PER_COLUMN), 
+                                     (int)(constrain(smoothedWave / 500.0f, 0.15f, 0.75f) * LEDS_PER_COLUMN), 
                                      LEDS_PER_COLUMN);
                         lastDebugLog = millis();
                     }
                     
-                    // Map audio level to wave height with dramatic swell
-                    // Ocean sound typically has levels 50-300 (based on PCM amplitude)
-                    // Use higher divisor for more dynamic range: low = 2 LEDs, high = 11 LEDs
-                    float normalizedWave = constrain(smoothedWave / 400.0f, 0.15f, 0.95f);
+                    // Map audio level to wave height with gentler range
+                    // Cap at 75% height so waves don't constantly fill the entire display
+                    float normalizedWave = constrain(smoothedWave / 500.0f, 0.15f, 0.75f);  // Gentler range (was /400 and 0.95)
                     
                     // Convert to number of rows (vertical wave on all columns)
                     int waveRows = (int)(normalizedWave * LEDS_PER_COLUMN);
@@ -3376,11 +3375,20 @@ void updateLEDs() {
                             if (ledIndex >= NUM_LEDS) continue;
                             
                             if (row < colWaveRows) {
-                                // Gradient from deep blue (bottom) to cyan (top)
-                                float progress = (float)row / (float)LEDS_PER_COLUMN;
-                                uint8_t hue = 160 + (uint8_t)(progress * 10);  // 160-170 range
-                                uint8_t brightness = 150 + (uint8_t)(progress * 105);  // Brighter at top
-                                leds[ledIndex] = CHSV(hue, 255, brightness);
+                                // Gradient from deep teal (bottom) to bright aquamarine (top)
+                                // Aquamarine colors: deep water (hue 170) to bright cyan-green (hue 140)
+                                float progress = (float)row / (float)colWaveRows;  // 0 at bottom, 1 at wave top
+                                
+                                // Hue: 170 (deep cyan-blue) -> 140 (bright aquamarine/turquoise)
+                                uint8_t hue = 170 - (uint8_t)(progress * 30);  // 170 -> 140
+                                
+                                // Saturation: fuller at bottom, slightly less at top for foam effect
+                                uint8_t saturation = 255 - (uint8_t)(progress * 40);  // 255 -> 215
+                                
+                                // Brightness: darker at bottom (deep water), brighter at top (surface/foam)
+                                uint8_t brightness = 80 + (uint8_t)(progress * 175);  // 80 -> 255
+                                
+                                leds[ledIndex] = CHSV(hue, saturation, brightness);
                             } else {
                                 leds[ledIndex] = CRGB::Black;
                             }

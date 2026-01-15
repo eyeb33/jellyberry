@@ -49,7 +49,7 @@ private:
     static constexpr int NUM_MAIN_RIBS = 8;  // Main bright ribs (strips 0,1,3,4,6,7,9,10)
     
     // Metachronal wave timing (1-2 seconds traverse as observed)
-    static constexpr float BASE_WAVE_SPEED = 0.00067f;  // ~1.5s per strip traverse
+    static constexpr float BASE_WAVE_SPEED = 0.00057f;  // ~1.75s per strip traverse (85% of original)
     static constexpr float PHASE_SHIFT_PER_STRIP = 0.08f;  // Phase offset for circulation
     static constexpr int NUM_WAVES_PER_STRIP = 2;  // 2 bands per rib with good spacing
     static constexpr float SPEED_VARIATION = 0.20f;  // ±20% per-rib speed variation
@@ -81,6 +81,8 @@ private:
         float speedVariation;   // Per-rib speed jitter (0.85-1.15)
         float hueOffset;        // Per-rib hue variation
         bool isDimRib;          // True for dimmer structural ribs
+        int waveCount;          // Number of waves on this strip (1-3, varies)
+        float waveSpacing;      // Random spacing between waves (0.3-0.5)
     };
     
     StripState strips[NUM_STRIPS];
@@ -89,6 +91,8 @@ private:
     float globalPhase;           // Master wave position (0.0-1.0, wraps)
     float breathingPhase;        // Slow breathing brightness (0.0-1.0)
     uint32_t lastUpdateMs;
+    uint32_t lastShuffleMs;      // Last time patterns were shuffled
+    uint32_t nextShuffleInterval; // Time until next shuffle (3-5 seconds)
     
     // Configuration
     float speedMultiplier;
@@ -96,6 +100,7 @@ private:
     
     // Helper functions
     void initializeStrips();
+    void shufflePatterns();      // Randomize strip patterns periodically
     int ledIndexForCoord(int strip, int height);  // Handle serpentine wiring
     CRGB getBandColor(float bandPhase, float ledPositionInBand, int stripIndex);  // Color with vertical gradient
     float getGaussianBrightness(float distance);  // Gaussian brightness curve

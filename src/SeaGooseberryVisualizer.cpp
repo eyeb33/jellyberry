@@ -7,6 +7,8 @@ SeaGooseberryVisualizer::SeaGooseberryVisualizer()
     : globalPhase(0.0f),
       breathingPhase(0.0f),
       lastUpdateMs(0),
+      lastShuffleMs(0),
+      nextShuffleInterval(3000 + random(0, 2000)),  // 3-5 seconds
       speedMultiplier(1.0f),
       brightnessMultiplier(0.5f)  // Medium-low brightness (30-60% range)
 {
@@ -31,14 +33,32 @@ void SeaGooseberryVisualizer::initializeStrips() {
     for (int s = 0; s < NUM_STRIPS; s++) {
         StripState& strip = strips[s];
         
-        // Phase offset for circulation effect with minimal randomization
-        strip.phaseOffset = s * PHASE_SHIFT_PER_STRIP + (random(0, 80) / 500.0f);  // Add 0-0.16 random offset
+        // Phase offset for circulation effect with increased randomization
+        strip.phaseOffset = s * PHASE_SHIFT_PER_STRIP + (random(0, 200) / 500.0f);  // Add 0-0.4 random offset (was 0-0.16)
         
-        // Per-rib speed variation ±12% for organic feel
-        strip.speedVariation = 0.88f + (random(0, 240) / 1000.0f);
+        // Per-rib speed variation with wider range and some slower waves mixed in
+        // 70% chance normal speed, 30% chance slower
+        if (random(100) < 30) {
+            strip.speedVariation = 0.50f + (random(0, 400) / 1000.0f);  // Slower: 0.50-0.90
+        } else {
+            strip.speedVariation = 0.85f + (random(0, 350) / 1000.0f);  // Normal: 0.85-1.20
+        }
         
-        // Per-rib hue offset for color variation (-10 to +10 to stay centered)
-        strip.hueOffset = random(-10, 10);
+        // Per-rib hue offset for more color variation
+        strip.hueOffset = random(-15, 15);  // ±15 (was ±10)
+        
+        // Random wave count (1-3 waves per strip for variety)
+        int waveChoice = random(100);
+        if (waveChoice < 30) {
+            strip.waveCount = 1;  // 30% single wave
+        } else if (waveChoice < 70) {
+            strip.waveCount = 2;  // 40% double wave
+        } else {
+            strip.waveCount = 3;  // 30% triple wave
+        }
+        
+        // Random spacing between waves
+        strip.waveSpacing = 0.3f + (random(0, 200) / 1000.0f);  // 0.3-0.5
         
         // Mark dimmer structural ribs (every third: 2, 5, 8, 11)
         strip.isDimRib = (s % 3 == 2);
@@ -72,6 +92,13 @@ void SeaGooseberryVisualizer::update(uint32_t nowMs) {
         breathingPhase -= 1.0f;
     }
     
+    // Periodically shuffle patterns to break repetition (every 3-5s)
+    if (nowMs - lastShuffleMs >= nextShuffleInterval) {
+        shufflePatterns();
+        lastShuffleMs = nowMs;
+        nextShuffleInterval = 3000 + random(0, 2000);  // Next shuffle in 3-5s
+    }
+    
     // Calculate current speed (constant, per-rib variation applied in render)
     float currentSpeed = BASE_WAVE_SPEED * speedMultiplier;
     
@@ -99,10 +126,10 @@ void SeaGooseberryVisualizer::render(CRGB* leds, int ledCount) {
         // Dim structural ribs have higher brightness (was too dim)
         float ribBrightness = strip.isDimRib ? 0.4f : 1.0f;
         
-        // Render 1-3 bands per rib (using 2)
-        for (int w = 0; w < NUM_WAVES_PER_STRIP; w++) {
+        // Render variable number of bands per rib (1-3, randomized)
+        for (int w = 0; w < strip.waveCount; w++) {
             // Calculate band center position (0.0-1.0 along strip)
-            float waveOffset = (float)w / (float)NUM_WAVES_PER_STRIP;
+            float waveOffset = (float)w * strip.waveSpacing;
             float bandPhase = globalPhase + strip.phaseOffset + waveOffset;
             bandPhase *= strip.speedVariation;  // Per-rib speed variation
             
@@ -199,4 +226,37 @@ float SeaGooseberryVisualizer::getGaussianBrightness(float distance) {
     if (brightness < 0.10f) brightness = 0.0f;
     
     return brightness;
+}
+
+// Shuffle patterns periodically to break repetitive patterns
+void SeaGooseberryVisualizer::shufflePatterns() {
+    for (int s = 0; s < NUM_STRIPS; s++) {
+        StripState& strip = strips[s];
+        
+        // Re-randomize wave count (1-3 waves)
+        int waveChoice = random(100);
+        if (waveChoice < 30) {
+            strip.waveCount = 1;  // 30% single wave
+        } else if (waveChoice < 70) {
+            strip.waveCount = 2;  // 40% double wave
+        } else {
+            strip.waveCount = 3;  // 30% triple wave
+        }
+        
+        // Re-randomize spacing
+        strip.waveSpacing = 0.3f + (random(0, 200) / 1000.0f);  // 0.3-0.5
+        
+        // Add random phase jump (0-0.3)
+        strip.phaseOffset += random(0, 300) / 1000.0f;
+        if (strip.phaseOffset > 1.0f) strip.phaseOffset -= 1.0f;
+        
+        // Occasionally swap speed ranges
+        if (random(100) < 40) {
+            if (random(100) < 30) {
+                strip.speedVariation = 0.50f + (random(0, 400) / 1000.0f);  // Slower: 0.50-0.90
+            } else {
+                strip.speedVariation = 0.85f + (random(0, 350) / 1000.0f);  // Normal: 0.85-1.20
+            }
+        }
+    }
 }

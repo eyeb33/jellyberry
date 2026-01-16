@@ -218,6 +218,17 @@ struct AlarmState {
     bool wasPlayingResponse; // If playing response when alarm triggered
 } alarmState = {false, 0, 0, 0.0f, false, LED_IDLE, false, false};
 
+// Day/Night brightness control
+struct DayNightData {
+    bool valid;            // Have we received sunrise/sunset times?
+    uint32_t sunriseTime;  // Unix timestamp of today's sunrise
+    uint32_t sunsetTime;   // Unix timestamp of today's sunset
+    uint32_t lastUpdate;   // When we last received this data
+    bool isDaytime;        // Current day/night state
+    uint8_t currentBrightness; // Active brightness level
+};
+DayNightData dayNightData = {false, 0, 0, 0, true, LED_BRIGHTNESS_DAY};
+
 // ============== FORWARD DECLARATIONS ==============
 void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length);
 void websocketTask(void * parameter);
@@ -268,6 +279,35 @@ void clearAudioAndLEDs() {
     }
     
     delay(50);  // Let everything settle
+}
+
+// ============== DAY/NIGHT BRIGHTNESS CONTROL ==============
+void updateDayNightBrightness() {
+    if (!dayNightData.valid) {
+        return;  // No sunrise/sunset data yet, keep default
+    }
+    
+    // Get current time
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) {
+        return;  // Can't get time
+    }
+    time_t now = mktime(&timeinfo);
+    
+    // Check if we're between sunrise and sunset
+    bool shouldBeDaytime = (now >= dayNightData.sunriseTime && now < dayNightData.sunsetTime);
+    
+    // Only update if state changed
+    if (shouldBeDaytime != dayNightData.isDaytime) {
+        dayNightData.isDaytime = shouldBeDaytime;
+        dayNightData.currentBrightness = shouldBeDaytime ? LED_BRIGHTNESS_DAY : LED_BRIGHTNESS_NIGHT;
+        FastLED.setBrightness(dayNightData.currentBrightness);
+        
+        Serial.printf("🌅 Brightness changed to %s mode (%d/255 = %.0f%%)\n",
+                     shouldBeDaytime ? "DAY" : "NIGHT",
+                     dayNightData.currentBrightness,
+                     (dayNightData.currentBrightness / 255.0) * 100);
+    }
 }
 
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
@@ -326,7 +366,7 @@ void setup() {
     // Initialize LED strip (144 LEDs on GPIO 1)
     Serial.write("LED_INIT_START\r\n", 16);
     FastLED.addLeds<LED_CHIPSET, LED_DATA_PIN, LED_COLOR_ORDER>(leds, NUM_LEDS);
-    FastLED.setBrightness(LED_BRIGHTNESS);
+    FastLED.setBrightness(LED_BRIGHTNESS_DAY);  // Start with day brightness until we know otherwise
     FastLED.setDither(0);  // Disable dithering to prevent flickering
     FastLED.setMaxRefreshRate(400);  // Limit refresh rate for stability (default is 400Hz)
     FastLED.setCorrection(TypicalLEDStrip);  // Color correction for consistent output
@@ -481,10 +521,17 @@ void loop() {
     static uint32_t lastPrint = 0;
     static uint32_t lastWiFiCheck = 0;
     static uint32_t lastAlarmCheck = 0;
+    static uint32_t lastBrightnessCheck = 0;
     
     if (millis() - lastPrint > 5000) {
         Serial.write("LOOP_TICK\r\n", 11);
         lastPrint = millis();
+    }
+    
+    // Update day/night brightness every 60 seconds
+    if (millis() - lastBrightnessCheck > 60000) {
+        updateDayNightBrightness();
+        lastBrightnessCheck = millis();
     }
     
     // Monitor WiFi signal strength every 30 seconds
@@ -2418,6 +2465,30 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
                       tideState.state.c_str(), 
                       tideState.waterLevel * 100,
                       tideState.nextChangeMinutes);
+        return;
+    }
+    
+    // Handle sunrise/sunset data from server
+    if (doc["type"].is<const char*>() && doc["type"] == "sunData") {
+        dayNightData.sunriseTime = doc["sunrise"].as<long long>() / 1000;  // Convert ms to seconds
+        dayNightData.sunsetTime = doc["sunset"].as<long long>() / 1000;
+        dayNightData.valid = true;
+        dayNightData.lastUpdate = millis();
+        
+        // Immediately update brightness
+        updateDayNightBrightness();
+        
+        // Log the times
+        struct tm sunriseInfo, sunsetInfo;
+        localtime_r((time_t*)&dayNightData.sunriseTime, &sunriseInfo);
+        localtime_r((time_t*)&dayNightData.sunsetTime, &sunsetInfo);
+        char sunriseStr[10], sunsetStr[10];
+        strftime(sunriseStr, sizeof(sunriseStr), "%H:%M", &sunriseInfo);
+        strftime(sunsetStr, sizeof(sunsetStr), "%H:%M", &sunsetInfo);
+        
+        Serial.printf("🌅 Sunrise/sunset received: %s / %s (brightness: %s mode)\n",
+                     sunriseStr, sunsetStr,
+                     dayNightData.isDaytime ? "DAY" : "NIGHT");
         return;
     }
     

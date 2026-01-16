@@ -493,7 +493,7 @@ async function fetchWeatherData() {
   
   try {
     // Using Brighton coordinates (same as tide data)
-    const url = `https://api.open-meteo.com/v1/forecast?latitude=${BRIGHTON_LAT}&longitude=${BRIGHTON_LNG}&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,rain,weather_code,wind_speed_10m&hourly=temperature_2m,precipitation_probability,weather_code&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,weather_code&timezone=Europe/London&forecast_days=3`;
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${BRIGHTON_LAT}&longitude=${BRIGHTON_LNG}&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,rain,weather_code,wind_speed_10m&hourly=temperature_2m,precipitation_probability,weather_code&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,weather_code,sunrise,sunset&timezone=Europe/London&forecast_days=3`;
     
     const response = await fetch(url);
     
@@ -765,6 +765,39 @@ function getMoonPhase() {
   }
 }
 
+// Send sunrise/sunset data to ESP32 for day/night brightness control
+function sendSunriseSunsetData(connection: ClientConnection) {
+  const data = weatherDataCache;
+  
+  if (!data || !data.daily) {
+    console.log(`[${connection.deviceId}] ⏳ No weather data yet for sunrise/sunset`);
+    return;
+  }
+  
+  const sunrise = data.daily.sunrise[0];  // Today's sunrise (ISO string)
+  const sunset = data.daily.sunset[0];    // Today's sunset (ISO string)
+  
+  if (!sunrise || !sunset) {
+    console.log(`[${connection.deviceId}] ⚠️  Sunrise/sunset data not available in weather cache`);
+    return;
+  }
+  
+  // Convert to timestamps (milliseconds)
+  const sunriseTime = new Date(sunrise).getTime();
+  const sunsetTime = new Date(sunset).getTime();
+  
+  connection.socket.send(JSON.stringify({
+    type: "sunData",
+    sunrise: sunriseTime,
+    sunset: sunsetTime
+  }));
+  
+  const sunriseStr = new Date(sunrise).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+  const sunsetStr = new Date(sunset).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+  
+  console.log(`[${connection.deviceId}] 🌅 Sent sunrise/sunset times: ${sunriseStr} / ${sunsetStr}`);
+}
+
 // Initial weather data fetch
 console.log("🌤️  Fetching initial weather data...");
 fetchWeatherData().catch(err => console.error("❌ Failed to fetch initial weather data:", err));
@@ -799,6 +832,9 @@ Deno.serve({
     };
     
     connections.set(deviceId, connection);
+    
+    // Send sunrise/sunset times on connect
+    sendSunriseSunsetData(connection);
     
     // Connect to Gemini immediately when device connects
     connectToGemini(connection);

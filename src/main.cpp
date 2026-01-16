@@ -171,7 +171,7 @@ struct MeditationState {
     bool paused;             // Breathing paused
     bool streaming;          // Currently streaming meditation audio
     float savedVolume;       // User's volume before meditation
-} meditationState = {MeditationState::ROOT, MeditationState::INHALE, 0, false, true, false, 1.0f};
+} meditationState = {MeditationState::ROOT, MeditationState::INHALE, 0, false, false, false, 1.0f};
 
 // Clock display state
 struct ClockState {
@@ -864,7 +864,7 @@ void loop() {
                 // Initialize meditation state
                 meditationState.currentChakra = MeditationState::ROOT;
                 meditationState.phase = MeditationState::HOLD_BOTTOM;  // Start at 20% brightness
-                meditationState.phaseStartTime = 0;  // Don't start yet - wait for marquee
+                meditationState.phaseStartTime = 0;  // Don't start breathing yet - wait for marquee
                 meditationState.active = true;
                 meditationState.paused = true;  // Start paused until marquee completes
                 meditationState.streaming = false;
@@ -874,7 +874,7 @@ void loop() {
                 volumeMultiplier = 0.05f;  // 5% volume for meditation (low freq sounds)
                 DEBUG_PRINT("🔊 Volume: %.0f%% → 5%% for meditation\n", meditationState.savedVolume * 100);
                 
-                Serial.println("🧘 Meditation mode activated (waiting for marquee)");
+                Serial.println("🧘 Meditation mode - waiting for marquee to complete");
                 startMarquee("MEDITATION", CRGB(255, 0, 255), LED_MEDITATION);  // Magenta
             } else if (modeToCheck == LED_MEDITATION) {
                 // Exit Meditation and go to Clock
@@ -1156,17 +1156,33 @@ void loop() {
                 } else {
                     // Short press: Toggle pause/play
                     if (meditationState.paused) {
-                        // Resume breathing
+                        // Resume breathing and audio
                         meditationState.phaseStartTime = millis();
                         meditationState.paused = false;
-                        DEBUG_PRINTLN("▶️  Meditation resumed");
+                        
+                        // Resume audio playback
+                        if (!isPlayingAmbient && meditationState.streaming) {
+                            isPlayingAmbient = true;
+                            isPlayingResponse = true;
+                            lastAudioChunkTime = millis();
+                            DEBUG_PRINTLN("▶️  Meditation resumed (audio + breathing)");
+                        } else {
+                            DEBUG_PRINTLN("▶️  Meditation resumed (breathing only)");
+                        }
+                        
                         playVolumeChime();
                         lastMeditationAction = millis();
                     } else {
-                        // Pause breathing
+                        // Pause breathing and audio
                         meditationState.phaseStartTime = 0;
                         meditationState.paused = true;
-                        DEBUG_PRINTLN("⏸️  Meditation paused");
+                        
+                        // Pause audio by clearing I2S buffer (audio task will stop feeding)
+                        isPlayingAmbient = false;
+                        isPlayingResponse = false;
+                        i2s_zero_dma_buffer(I2S_NUM_1);
+                        
+                        DEBUG_PRINTLN("⏸️  Meditation paused (audio + breathing)");
                         playVolumeChime();
                         lastMeditationAction = millis();
                     }
@@ -3882,6 +3898,15 @@ void updateLEDs() {
                     }
                     
                     if (!meditationState.paused && meditationState.phaseStartTime > 0) {
+                        // Debug logging every 5 seconds
+                        static uint32_t lastMeditationDebug = 0;
+                        if (millis() - lastMeditationDebug > 5000) {
+                            Serial.printf("🧘 Meditation breathing: phase=%d, paused=%d, phaseStart=%u, active=%d\n",
+                                         meditationState.phase, meditationState.paused, 
+                                         meditationState.phaseStartTime, meditationState.active);
+                            lastMeditationDebug = millis();
+                        }
+                        
                         // Calculate phase progress
                         const uint32_t PHASE_DURATION = 4000;  // 4 seconds per phase
                         uint32_t phaseElapsed = millis() - meditationState.phaseStartTime;
@@ -3938,7 +3963,15 @@ void updateLEDs() {
                         
                         fill_solid(leds, NUM_LEDS, breathColor);
                     } else {
-                        // Paused: Show static chakra color at 30%
+                        // Paused or not started: Show static chakra color at 30%
+                        static uint32_t lastPauseDebug = 0;
+                        if (millis() - lastPauseDebug > 5000) {
+                            Serial.printf("🧘 Meditation PAUSED: paused=%d, phaseStart=%u, active=%d\n",
+                                         meditationState.paused, meditationState.phaseStartTime, 
+                                         meditationState.active);
+                            lastPauseDebug = millis();
+                        }
+                        
                         for (int i = 0; i < NUM_LEDS; i++) {
                             uint8_t r = (uint8_t)((displayColor.r * 77) / 255);  // 30% = 77/255
                             uint8_t g = (uint8_t)((displayColor.g * 77) / 255);

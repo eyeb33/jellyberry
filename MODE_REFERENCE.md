@@ -139,8 +139,12 @@ Press **Button 2** to cycle through modes in this order:
 
 ### Controls
 - **Button 1 Short Press:** Pause/Resume breathing animation
-- **Button 1 Long Press (2 seconds):** Next chakra (cycles 1→7→1)
-- **Button 2:** Exit meditation mode (restores volume)
+- **Button 1 Long Press (2+ seconds):** Advance to next chakra (Root → Sacral → Solar → Heart → Throat → Third Eye → Crown → Root)
+  - Stops current OM audio and starts new chakra's frequency
+  - Displays chakra name as marquee
+  - Plays volume chime for feedback
+- **Button 2 Long Press (2+ seconds):** Return to IDLE mode and start Gemini recording
+- **Button 2 Short Press:** Cycle to next mode (Clock)
 
 ### Voice Commands
 - Not available during meditation (Button 1 controls breathing/chakra)

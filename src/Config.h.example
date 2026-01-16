@@ -62,7 +62,7 @@
 
 // LED Configuration
 #define NUM_LEDS 72  // 6 LED strips × 12 LEDs each
-#define LED_BRIGHTNESS_DAY 87    // 34% brightness for daytime
+#define LED_BRIGHTNESS_DAY 100   // 39% brightness for daytime
 #define LED_BRIGHTNESS_NIGHT 43  // 17% brightness for nighttime
 #define LED_COLOR_ORDER GRB
 #define LED_CHIPSET WS2812B

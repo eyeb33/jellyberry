@@ -168,10 +168,9 @@ struct MeditationState {
     BreathPhase phase;
     uint32_t phaseStartTime;
     bool active;             // Meditation mode active
-    bool paused;             // Breathing paused
     bool streaming;          // Currently streaming meditation audio
     float savedVolume;       // User's volume before meditation
-} meditationState = {MeditationState::ROOT, MeditationState::INHALE, 0, false, false, false, 1.0f};
+} meditationState = {MeditationState::ROOT, MeditationState::INHALE, 0, false, false, 1.0f};
 
 // Clock display state
 struct ClockState {
@@ -678,7 +677,6 @@ void loop() {
             // Clear Meditation
             if (meditationState.active) {
                 meditationState.active = false;
-                meditationState.paused = false;
                 meditationState.phaseStartTime = 0;
                 meditationState.streaming = false;
                 volumeMultiplier = meditationState.savedVolume;  // Restore volume
@@ -866,13 +864,12 @@ void loop() {
                 meditationState.phase = MeditationState::HOLD_BOTTOM;  // Start at 20% brightness
                 meditationState.phaseStartTime = 0;  // Don't start breathing yet - wait for marquee
                 meditationState.active = true;
-                meditationState.paused = true;  // Start paused until marquee completes
                 meditationState.streaming = false;
                 
                 // Lower volume for meditation (prevents vibration/distortion)
                 meditationState.savedVolume = volumeMultiplier;
-                volumeMultiplier = 0.05f;  // 5% volume for meditation (low freq sounds)
-                DEBUG_PRINT("🔊 Volume: %.0f%% → 5%% for meditation\n", meditationState.savedVolume * 100);
+                volumeMultiplier = 0.50f;  // 50% volume for meditation (higher volume can reduce vibration with bass)
+                DEBUG_PRINT("🔊 Volume: %.0f%% → 50%% for meditation\n", meditationState.savedVolume * 100);
                 
                 Serial.println("🧘 Meditation mode - waiting for marquee to complete");
                 startMarquee("MEDITATION", CRGB(255, 0, 255), LED_MEDITATION);  // Magenta
@@ -882,7 +879,6 @@ void loop() {
                 
                 // Clear meditation state
                 meditationState.active = false;
-                meditationState.paused = false;
                 meditationState.phaseStartTime = 0;
                 meditationState.streaming = false;
                 volumeMultiplier = meditationState.savedVolume;  // Restore volume
@@ -968,7 +964,6 @@ void loop() {
                 DEBUG_PRINTLN("💤 Returning to IDLE mode");
                 currentLEDMode = LED_IDLE;
                 targetLEDMode = LED_IDLE;
-                meditationState.paused = false;
                 meditationState.phaseStartTime = 0;
                 meditationState.streaming = false;
                 
@@ -1103,32 +1098,42 @@ void loop() {
             }
         }
         
-        // Meditation mode: Button 1 controls pause/play and long-press chakra change
+        // Meditation mode: Button 1 = next chakra, Button 2 = next mode
         static uint32_t lastMeditationAction = 0;
         
         if (currentLEDMode == LED_MEDITATION && meditationState.active) {
-            // Detect button 1 press start (reuse button1PressStart from Pomodoro)
-            if (startTouch && !startPressed) {
-                button1PressStart = millis();
-            }
-            
-            // On button 1 release, check duration
-            if (!startTouch && startPressed && (millis() - lastMeditationAction) > ACTION_DEBOUNCE) {
-                uint32_t pressDuration = millis() - button1PressStart;
+            // Button 1: Advance to next chakra (or return to IDLE after Crown)
+            if (startTouch && !startPressed && (millis() - lastMeditationAction) > ACTION_DEBOUNCE) {
+                DEBUG_PRINTLN("🧘 Button 1: Advancing to next chakra");
                 
-                if (pressDuration >= LONG_PRESS_DURATION) {
-                    // Long press: Next chakra
-                    meditationState.currentChakra = (MeditationState::Chakra)((meditationState.currentChakra + 1) % 7);
-                    meditationState.phase = MeditationState::INHALE;
-                    meditationState.phaseStartTime = 0;
+                // Stop current audio
+                JsonDocument stopDoc;
+                stopDoc["action"] = "stopAmbient";
+                String stopMsg;
+                serializeJson(stopDoc, stopMsg);
+                webSocket.sendTXT(stopMsg);
+                
+                // Advance to next chakra
+                int nextChakra = (meditationState.currentChakra + 1) % 7;
+                
+                // If we wrapped back to Root (0), exit to IDLE instead
+                if (nextChakra == 0) {
+                    DEBUG_PRINTLN("🧘 Completed all chakras, returning to IDLE");
+                    meditationState.active = false;
+                    isPlayingAmbient = false;
+                    isPlayingResponse = false;
+                    i2s_zero_dma_buffer(I2S_NUM_1);
+                    startMarquee("IDLE", CRGB(128, 128, 255), LED_IDLE);
+                    playZenBell();
+                } else {
+                    // Continue to next chakra
+                    meditationState.currentChakra = (MeditationState::Chakra)nextChakra;
+                    meditationState.phase = MeditationState::HOLD_BOTTOM;
+                    meditationState.phaseStartTime = millis();
                     
-                    // Stop current audio
-                    JsonDocument stopDoc;
-                    stopDoc["action"] = "stopAmbient";
-                    String stopMsg;
-                    serializeJson(stopDoc, stopMsg);
-                    webSocket.sendTXT(stopMsg);
-                    ambientSound.drainUntil = millis() + 500;  // Short drain
+                    // Log chakra change (no marquee - keep breathing visualization continuous)
+                    Serial.printf("🧘 Advanced to %s chakra (color will smoothly transition)\n", 
+                                 CHAKRA_NAMES[meditationState.currentChakra]);
                     
                     // Request new chakra audio
                     JsonDocument reqDoc;
@@ -1140,53 +1145,18 @@ void loop() {
                     String reqMsg;
                     serializeJson(reqDoc, reqMsg);
                     webSocket.sendTXT(reqMsg);
-                    meditationState.streaming = true;
                     
-                    // Update ambient sound state
                     ambientSound.name = soundName;
+                    ambientSound.active = true;
+                    isPlayingAmbient = true;
+                    meditationState.streaming = true;
                     firstAudioChunk = true;
                     lastAudioChunkTime = millis();
                     
-                    // Show chakra name
-                    DEBUG_PRINT("🧘 Chakra changed to %s\n", CHAKRA_NAMES[meditationState.currentChakra]);
-                    startMarquee(CHAKRA_NAMES[meditationState.currentChakra], CRGB(255, 0, 255), LED_MEDITATION);
-                    
                     playVolumeChime();
-                    lastMeditationAction = millis();
-                } else {
-                    // Short press: Toggle pause/play
-                    if (meditationState.paused) {
-                        // Resume breathing and audio
-                        meditationState.phaseStartTime = millis();
-                        meditationState.paused = false;
-                        
-                        // Resume audio playback
-                        if (!isPlayingAmbient && meditationState.streaming) {
-                            isPlayingAmbient = true;
-                            isPlayingResponse = true;
-                            lastAudioChunkTime = millis();
-                            DEBUG_PRINTLN("▶️  Meditation resumed (audio + breathing)");
-                        } else {
-                            DEBUG_PRINTLN("▶️  Meditation resumed (breathing only)");
-                        }
-                        
-                        playVolumeChime();
-                        lastMeditationAction = millis();
-                    } else {
-                        // Pause breathing and audio
-                        meditationState.phaseStartTime = 0;
-                        meditationState.paused = true;
-                        
-                        // Pause audio by clearing I2S buffer (audio task will stop feeding)
-                        isPlayingAmbient = false;
-                        isPlayingResponse = false;
-                        i2s_zero_dma_buffer(I2S_NUM_1);
-                        
-                        DEBUG_PRINTLN("⏸️  Meditation paused (audio + breathing)");
-                        playVolumeChime();
-                        lastMeditationAction = millis();
-                    }
                 }
+                
+                lastMeditationAction = millis();
             }
         }
         
@@ -1550,17 +1520,16 @@ void loop() {
                     pomodoroState.paused = false;
                 }
             } else if (pomodoroState.currentSession == PomodoroState::LONG_BREAK) {
-                // Long break complete - END OF CYCLE, return to paused state
-                DEBUG_PRINTLN("🟦 → 🛑 Long break complete! Pomodoro cycle finished - press button to restart");
+                // Long break complete - END OF CYCLE, return to IDLE
+                DEBUG_PRINTLN("🟦 → 🛑 Long break complete! Pomodoro cycle finished - returning to IDLE");
+                pomodoroState.active = false;
                 pomodoroState.currentSession = PomodoroState::FOCUS;
                 pomodoroState.totalSeconds = pomodoroState.focusDuration * 60;
                 pomodoroState.sessionCount = 0;  // Reset counter for next cycle
-                startMarquee("CYCLE DONE", CRGB(255, 255, 0), LED_POMODORO);  // Yellow = complete
-                
-                // Stop and wait for user to press button
                 pomodoroState.startTime = 0;
-                pomodoroState.pausedTime = pomodoroState.totalSeconds;
-                pomodoroState.paused = true;
+                pomodoroState.pausedTime = 0;
+                pomodoroState.paused = false;
+                startMarquee("COMPLETE", CRGB(255, 255, 0), LED_IDLE);  // Return to IDLE with yellow completion
             } else {
                 // Short break complete, return to focus
                 DEBUG_PRINT("🟩 → 🍅 Break complete! Starting focus session (%d min)\n", pomodoroState.focusDuration);
@@ -2767,11 +2736,15 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
                 Serial.printf("🧘 Auto-advancing to %s chakra (color will smoothly transition)\n", CHAKRA_NAMES[meditationState.currentChakra]);
                 // DON'T show marquee - let LED color smoothly transition in breathing visualization
             } else {
-                // All chakras complete - show completion message
-                Serial.println("✨ Meditation sequence complete!");
+                // All chakras complete - return to IDLE
+                Serial.println("✨ Meditation sequence complete! Returning to IDLE");
+                meditationState.active = false;
                 meditationState.streaming = false;
-                meditationState.paused = true;
-                startMarquee("COMPLETE", CRGB(255, 255, 255), LED_MEDITATION);  // White for completion
+                isPlayingAmbient = false;
+                isPlayingResponse = false;
+                volumeMultiplier = meditationState.savedVolume;  // Restore volume
+                Serial.printf("🔊 Volume restored to %.0f%%\n", volumeMultiplier * 100);
+                startMarquee("COMPLETE", CRGB(255, 255, 255), LED_IDLE);  // Return to IDLE with white marquee
             }
         }
         return;
@@ -3897,16 +3870,7 @@ void updateLEDs() {
                         lastColor = currentColor;  // Update for next transition
                     }
                     
-                    if (!meditationState.paused && meditationState.phaseStartTime > 0) {
-                        // Debug logging every 5 seconds
-                        static uint32_t lastMeditationDebug = 0;
-                        if (millis() - lastMeditationDebug > 5000) {
-                            Serial.printf("🧘 Meditation breathing: phase=%d, paused=%d, phaseStart=%u, active=%d\n",
-                                         meditationState.phase, meditationState.paused, 
-                                         meditationState.phaseStartTime, meditationState.active);
-                            lastMeditationDebug = millis();
-                        }
-                        
+                    if (meditationState.phaseStartTime > 0) {
                         // Calculate phase progress
                         const uint32_t PHASE_DURATION = 4000;  // 4 seconds per phase
                         uint32_t phaseElapsed = millis() - meditationState.phaseStartTime;
@@ -3963,15 +3927,7 @@ void updateLEDs() {
                         
                         fill_solid(leds, NUM_LEDS, breathColor);
                     } else {
-                        // Paused or not started: Show static chakra color at 30%
-                        static uint32_t lastPauseDebug = 0;
-                        if (millis() - lastPauseDebug > 5000) {
-                            Serial.printf("🧘 Meditation PAUSED: paused=%d, phaseStart=%u, active=%d\n",
-                                         meditationState.paused, meditationState.phaseStartTime, 
-                                         meditationState.active);
-                            lastPauseDebug = millis();
-                        }
-                        
+                        // Not started yet (phaseStartTime = 0): Show static chakra color at 30%
                         for (int i = 0; i < NUM_LEDS; i++) {
                             uint8_t r = (uint8_t)((displayColor.r * 77) / 255);  // 30% = 77/255
                             uint8_t g = (uint8_t)((displayColor.g * 77) / 255);
@@ -4296,10 +4252,9 @@ void updateLEDs() {
                     }
                     
                     // If switching to meditation mode, start the breathing and audio now
-                    if (targetLEDMode == LED_MEDITATION && meditationState.active && meditationState.paused) {
+                    if (targetLEDMode == LED_MEDITATION && meditationState.active && meditationState.phaseStartTime == 0) {
                         // Start breathing animation
                         meditationState.phaseStartTime = millis();
-                        meditationState.paused = false;
                         
                         // Set ambient audio flags
                         ambientSound.name = "om001";

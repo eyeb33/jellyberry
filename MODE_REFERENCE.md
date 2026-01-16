@@ -135,23 +135,23 @@ Press **Button 2** to cycle through modes in this order:
 ### Audio
 - Chakra-specific Om chants (om001.pcm - om007.pcm)
 - Plays continuously during meditation
-- Volume automatically reduced to 5% (restored on exit)
+- Volume automatically reduced to 20% (restored on exit)
 
 ### Controls
-- **Button 1 Short Press:** Pause/Resume breathing animation
-- **Button 1 Long Press (2+ seconds):** Advance to next chakra (Root → Sacral → Solar → Heart → Throat → Third Eye → Crown → Root)
-  - Stops current OM audio and starts new chakra's frequency
+- **Button 1 Press:** Advance to next chakra (Root → Sacral → Solar → Heart → Throat → Third Eye → Crown)
+  - After Crown chakra completes, returns to IDLE mode
+  - Each chakra plays its corresponding OM frequency audio
   - Displays chakra name as marquee
-  - Plays volume chime for feedback
 - **Button 2 Long Press (2+ seconds):** Return to IDLE mode and start Gemini recording
 - **Button 2 Short Press:** Cycle to next mode (Clock)
 
 ### Voice Commands
-- Not available during meditation (Button 1 controls breathing/chakra)
+- Not available during meditation (Button 1 controls chakra progression)
 
 ### Notes
-- Volume lowered to 5% for meditation ambiance
+- Volume lowered to 20% for meditation ambiance
 - Audio stops and volume restores when exiting mode
+- Completes after all 7 chakras, then returns to IDLE
 
 ---
 

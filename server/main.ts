@@ -833,11 +833,13 @@ Deno.serve({
     
     connections.set(deviceId, connection);
     
-    // Send sunrise/sunset times on connect
-    sendSunriseSunsetData(connection);
-    
     // Connect to Gemini immediately when device connects
     connectToGemini(connection);
+    
+    // Send sunrise/sunset times after connection is established
+    socket.onopen = () => {
+      sendSunriseSunsetData(connection);
+    };
     
     // Handle messages from ESP32
     socket.onmessage = async (event) => {

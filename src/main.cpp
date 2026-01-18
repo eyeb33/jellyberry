@@ -635,15 +635,28 @@ void loop() {
         bool startTouch = digitalRead(TOUCH_PAD_START_PIN) == HIGH;
         bool stopTouch = digitalRead(TOUCH_PAD_STOP_PIN) == HIGH;
         
+        // Detect button edges BEFORE processing handlers
+        bool startRisingEdge = (startTouch && !startPressed);
+        bool startFallingEdge = (!startTouch && startPressed);
+        bool stopRisingEdge = (stopTouch && !stopPressed);
+        bool stopFallingEdge = (!stopTouch && stopPressed);
+        
+        // Update button states IMMEDIATELY (before handlers can block)
+        // This prevents double-triggering and state corruption
+        startPressed = startTouch;
+        stopPressed = stopTouch;
+        
         // Detect button 2 press start
-        if (stopTouch && !stopPressed) {
+        if (stopRisingEdge) {
             button2PressStart = millis();
+            Serial.println("🔘 Button 2 pressed (start)");
         }
         
         // Button 2 long-press: Return to IDLE and start Gemini recording
-        if (!stopTouch && stopPressed && !recordingActive && 
+        if (stopFallingEdge && !recordingActive && 
             (millis() - button2PressStart) >= BUTTON2_LONG_PRESS) {
-            DEBUG_PRINTLN("🏠 Button 2 long-press: Returning to IDLE + starting recording");
+            Serial.printf("🏠 Button 2 long-press (%lu ms): Returning to IDLE + starting recording\n",
+                         millis() - button2PressStart);
             
             // Stop any active mode
             if (isPlayingAmbient) {
@@ -676,6 +689,7 @@ void loop() {
             
             // Clear Meditation
             if (meditationState.active) {
+                Serial.println("🛑 CLEARING meditation state (button 2 long press)");
                 meditationState.active = false;
                 meditationState.phaseStartTime = 0;
                 meditationState.streaming = false;
@@ -718,7 +732,7 @@ void loop() {
         // STOP button short press: Cycle through modes
         // IDLE → AMBIENT_VU → AMBIENT → POMODORO → MEDITATION → IDLE
         // Allow during ambient modes, block only during Gemini responses (non-ambient)
-        if (stopTouch && !stopPressed && !recordingActive && 
+        if (stopRisingEdge && !recordingActive && 
             !(isPlayingResponse && !isPlayingAmbient)) {
             // Stop any current ambient playback
             if (isPlayingAmbient) {
@@ -868,8 +882,8 @@ void loop() {
                 
                 // Lower volume for meditation (prevents vibration/distortion)
                 meditationState.savedVolume = volumeMultiplier;
-                volumeMultiplier = 0.50f;  // 50% volume for meditation (higher volume can reduce vibration with bass)
-                DEBUG_PRINT("🔊 Volume: %.0f%% → 50%% for meditation\n", meditationState.savedVolume * 100);
+                volumeMultiplier = 0.10f;  // 10% volume for meditation
+                DEBUG_PRINT("🔊 Volume: %.0f%% → 10%% for meditation\n", meditationState.savedVolume * 100);
                 
                 Serial.println("🧘 Meditation mode - waiting for marquee to complete");
                 startMarquee("MEDITATION", CRGB(255, 0, 255), LED_MEDITATION);  // Magenta
@@ -996,8 +1010,10 @@ void loop() {
         
         // Ambient mode: Button 1 cycles between sounds (rain → ocean → rainforest)
         static uint32_t lastAmbientCycle = 0;
-        if (currentLEDMode == LED_AMBIENT && startTouch && !startPressed && 
+        if (currentLEDMode == LED_AMBIENT && startRisingEdge && 
             (millis() - lastAmbientCycle) > 500) {  // 500ms debounce
+            
+            lastAmbientCycle = millis();
             
             // Stop current audio
             JsonDocument stopDoc;
@@ -1038,7 +1054,6 @@ void loop() {
             lastAudioChunkTime = millis();
             
             // Request new sound from server (will be sent after marquee completes)
-            lastAmbientCycle = millis();
         }
         
         // Pomodoro mode: Button 1 long press = pause/resume, short press = Gemini
@@ -1050,12 +1065,12 @@ void loop() {
         
         if (currentLEDMode == LED_POMODORO && pomodoroState.active) {
             // Detect button 1 press start
-            if (startTouch && !startPressed) {
+            if (startRisingEdge) {
                 button1PressStart = millis();
             }
             
             // On button 1 release, check duration
-            if (!startTouch && startPressed && (millis() - lastPomodoroAction) > ACTION_DEBOUNCE) {
+            if (startFallingEdge && (millis() - lastPomodoroAction) > ACTION_DEBOUNCE) {
                 uint32_t pressDuration = millis() - button1PressStart;
                 
                 if (pressDuration >= LONG_PRESS_DURATION) {
@@ -1098,72 +1113,118 @@ void loop() {
             }
         }
         
-        // Meditation mode: Button 1 = next chakra, Button 2 = next mode
-        static uint32_t lastMeditationAction = 0;
-        
-        if (currentLEDMode == LED_MEDITATION && meditationState.active) {
-            // Button 1: Advance to next chakra (or return to IDLE after Crown)
-            if (startTouch && !startPressed && (millis() - lastMeditationAction) > ACTION_DEBOUNCE) {
-                DEBUG_PRINTLN("🧘 Button 1: Advancing to next chakra");
+        // MEDITATION MODE: Button 1 advances to next chakra (must come BEFORE interrupt/recording handlers)
+        // Same pattern as ambient mode sound cycling
+        bool meditationHandled = false;  // Flag to skip other handlers
+        if (currentLEDMode == LED_MEDITATION && meditationState.active && startRisingEdge) {
+            meditationHandled = true;  // Mark as handled to skip other button handlers
+            
+            Serial.printf("🧘 Button 1: Advancing from chakra %d (%s) | edge detected\n", 
+                         meditationState.currentChakra, CHAKRA_NAMES[meditationState.currentChakra]);
+            
+            // CRITICAL: Stop audio playback completely to prevent glitches
+            isPlayingAmbient = false;  // Stop audio task from playing queued packets
+            isPlayingResponse = false;
+            
+            // Stop current audio immediately
+            JsonDocument stopDoc;
+            stopDoc["action"] = "stopAmbient";
+            String stopMsg;
+            serializeJson(stopDoc, stopMsg);
+            webSocket.sendTXT(stopMsg);
+            
+            // Clear I2S hardware buffer
+            i2s_zero_dma_buffer(I2S_NUM_1);
+            
+            // Flush the software audio queue (removes buffered packets)
+            AudioChunk dummy;
+            while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {
+                // Drain all queued audio packets
+            }
+            Serial.printf("🗑️  Flushed audio queue for clean transition\n");
+            
+            // Set drain period to discard any stale packets still in flight
+            ambientSound.drainUntil = millis() + 500;  // 500ms drain window
+            
+            // Check if we can advance
+            if (meditationState.currentChakra < MeditationState::CROWN) {
+                // Advance to next chakra (breathing continues smoothly)
+                meditationState.currentChakra = (MeditationState::Chakra)(meditationState.currentChakra + 1);
                 
-                // Stop current audio
-                JsonDocument stopDoc;
-                stopDoc["action"] = "stopAmbient";
-                String stopMsg;
-                serializeJson(stopDoc, stopMsg);
-                webSocket.sendTXT(stopMsg);
+                Serial.printf("🧘 Advanced to chakra %d (%s) - breathing continues\n", 
+                             meditationState.currentChakra, CHAKRA_NAMES[meditationState.currentChakra]);
                 
-                // Advance to next chakra
-                int nextChakra = (meditationState.currentChakra + 1) % 7;
+                // Request new chakra sound (om001, om002, ..., om007)
+                char soundName[16];
+                sprintf(soundName, "om%03d", meditationState.currentChakra + 1);
                 
-                // If we wrapped back to Root (0), exit to IDLE instead
-                if (nextChakra == 0) {
-                    DEBUG_PRINTLN("🧘 Completed all chakras, returning to IDLE");
-                    meditationState.active = false;
-                    isPlayingAmbient = false;
-                    isPlayingResponse = false;
-                    i2s_zero_dma_buffer(I2S_NUM_1);
-                    startMarquee("IDLE", CRGB(128, 128, 255), LED_IDLE);
-                    playZenBell();
-                } else {
-                    // Continue to next chakra
-                    meditationState.currentChakra = (MeditationState::Chakra)nextChakra;
-                    meditationState.phase = MeditationState::HOLD_BOTTOM;
-                    meditationState.phaseStartTime = millis();
-                    
-                    // Log chakra change (no marquee - keep breathing visualization continuous)
-                    Serial.printf("🧘 Advanced to %s chakra (color will smoothly transition)\n", 
-                                 CHAKRA_NAMES[meditationState.currentChakra]);
-                    
-                    // Request new chakra audio
-                    JsonDocument reqDoc;
-                    reqDoc["action"] = "requestAmbient";
-                    char soundName[16];
-                    sprintf(soundName, "om%03d", meditationState.currentChakra + 1);
-                    reqDoc["sound"] = soundName;
-                    reqDoc["sequence"] = ++ambientSound.sequence;
-                    String reqMsg;
-                    serializeJson(reqDoc, reqMsg);
-                    webSocket.sendTXT(reqMsg);
-                    
-                    ambientSound.name = soundName;
-                    ambientSound.active = true;
-                    isPlayingAmbient = true;
-                    meditationState.streaming = true;
-                    firstAudioChunk = true;
-                    lastAudioChunkTime = millis();
-                    
-                    playVolumeChime();
+                JsonDocument reqDoc;
+                reqDoc["action"] = "requestAmbient";
+                reqDoc["sound"] = soundName;
+                reqDoc["sequence"] = ++ambientSound.sequence;
+                String reqMsg;
+                serializeJson(reqDoc, reqMsg);
+                webSocket.sendTXT(reqMsg);
+                
+                ambientSound.name = soundName;
+                ambientSound.active = true;
+                isPlayingAmbient = true;  // Re-enable playback for new sound
+                isPlayingResponse = false;
+                firstAudioChunk = true;
+                lastAudioChunkTime = millis();
+                
+                Serial.printf("✅ Chakra advance complete: %s ready to stream\n", soundName);
+            } else {
+                // At final chakra - complete meditation
+                Serial.println("🧘 At CROWN chakra - meditation complete");
+                
+                // Stop audio playback completely
+                isPlayingAmbient = false;
+                isPlayingResponse = false;
+                
+                // Clear I2S hardware buffer
+                i2s_zero_dma_buffer(I2S_NUM_1);
+                
+                // Flush software audio queue
+                AudioChunk dummy;
+                while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {
+                    // Drain all queued packets
                 }
                 
-                lastMeditationAction = millis();
+                // Clear meditation state completely
+                meditationState.active = false;
+                meditationState.phaseStartTime = 0;
+                meditationState.streaming = false;
+                meditationState.currentChakra = MeditationState::ROOT;  // Reset to start
+                meditationState.phase = MeditationState::HOLD_BOTTOM;
+                
+                // Restore volume
+                volumeMultiplier = meditationState.savedVolume;
+                Serial.printf("🔊 Volume restored to %.0f%%\n", volumeMultiplier * 100);
+                
+                // Clear ambient audio state
+                ambientSound.active = false;
+                ambientSound.name = "";
+                ambientSound.sequence++;
+                ambientSound.drainUntil = millis() + 1000;  // Drain for 1s
+                
+                // Clear LEDs (with mutex)
+                if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
+                    fill_solid(leds, NUM_LEDS, CRGB::Black);
+                    FastLED.show();
+                    xSemaphoreGive(ledMutex);
+                }
+                
+                Serial.println("✅ Meditation state fully cleared - returning to idle");
+                
+                // Return to idle with marquee (no sound)
+                startMarquee("COMPLETE", CRGB(255, 255, 255), LED_IDLE);
             }
         }
-        
         // Interrupt feature: START button during active playback stops audio and starts recording
         // Only interrupt if we've received audio recently (within 500ms) and turn is not complete
         // Note: Pomodoro now allowed - button 1 can interrupt responses during Pomodoro
-        if (currentLEDMode != LED_MEDITATION && startTouch && !startPressed && isPlayingResponse && !turnComplete && 
+        else if (!meditationHandled && currentLEDMode != LED_MEDITATION && startRisingEdge && isPlayingResponse && !turnComplete && 
             (millis() - lastAudioChunkTime) < 500) {
             DEBUG_PRINTLN("⏸️  Interrupted response - starting new recording");
             responseInterrupted = true;  // Flag to ignore remaining audio chunks
@@ -1177,7 +1238,7 @@ void loop() {
             DEBUG_PRINT("🎤 Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
         }
         // ALARM MODE: Button 1 or 2 dismisses alarm
-        else if (currentLEDMode == LED_ALARM && alarmState.ringing && (startTouch || stopTouch) && !startPressed && !stopPressed) {
+        else if (currentLEDMode == LED_ALARM && alarmState.ringing && (startRisingEdge || stopRisingEdge)) {
             DEBUG_PRINTLN("⏰ Alarm dismissed");
             
             // Clear alarm from memory
@@ -1250,7 +1311,7 @@ void loop() {
             playVolumeChime();  // Confirmation beep
         }
         // LAMP MODE: Button 1 cycles colors (WHITE → RED → GREEN → BLUE)
-        else if (currentLEDMode == LED_LAMP && lampState.active && startTouch && !startPressed) {
+        else if (!meditationHandled && currentLEDMode == LED_LAMP && lampState.active && startRisingEdge) {
             // Cycle to next color
             lampState.previousColor = lampState.currentColor;
             lampState.currentColor = (LampState::Color)((lampState.currentColor + 1) % 4);
@@ -1274,12 +1335,12 @@ void loop() {
         // Start recording on rising edge (normal case - not interrupting)
         // Block if: recording active, playing response, OR in ambient sound mode, OR conversation window is open, OR in Meditation/Ambient/Lamp mode
         // Special handling for Pomodoro: only trigger on button release after short press
-        else if (currentLEDMode != LED_MEDITATION && currentLEDMode != LED_AMBIENT && currentLEDMode != LED_LAMP && !recordingActive && !isPlayingResponse && !isPlayingAmbient && !conversationMode) {
+        else if (!meditationHandled && currentLEDMode != LED_MEDITATION && currentLEDMode != LED_AMBIENT && currentLEDMode != LED_LAMP && !recordingActive && !isPlayingResponse && !isPlayingAmbient && !conversationMode) {
             // Pomodoro mode: only start recording on button release after SHORT press
             bool shouldStartRecording = false;
             if (currentLEDMode == LED_POMODORO) {
                 // Wait for button release
-                if (!startTouch && startPressed && (millis() - lastPomodoroAction) > ACTION_DEBOUNCE) {
+                if (startFallingEdge && (millis() - lastPomodoroAction) > ACTION_DEBOUNCE) {
                     uint32_t pressDuration = millis() - button1PressStart;
                     // Only start recording if SHORT press (long press handled above for pause/resume)
                     if (pressDuration < LONG_PRESS_DURATION) {
@@ -1289,15 +1350,14 @@ void loop() {
                 }
             } else {
                 // Other modes: start recording on button press as usual
-                shouldStartRecording = (startTouch && !startPressed);
+                shouldStartRecording = startRisingEdge;
             }
             
             if (shouldStartRecording) {
             // Additional safety: don't start recording if alarm is ringing
             if (alarmState.ringing) {
                 DEBUG_PRINTLN("⚠️  Cannot start recording - alarm is ringing");
-                startPressed = true;
-                return;
+                return;  // Button state already updated above
             }
             
             // Clear all previous state
@@ -1328,7 +1388,6 @@ void loop() {
             DEBUG_PRINT("🎤 Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
             }  // End of shouldStartRecording block
         }
-        startPressed = startTouch;
         
         // Stop recording only on timeout (manual stop removed - rely on VAD)
         if (recordingActive && (millis() - recordingStartTime) > MAX_RECORDING_DURATION_MS) {
@@ -1340,7 +1399,6 @@ void loop() {
             }
             DEBUG_PRINT("⏹️  Recording stopped - Duration: %dms (max duration reached)\n", millis() - recordingStartTime);
         }
-        stopPressed = stopTouch;
         
         lastDebounceTime = millis();
     }
@@ -2161,43 +2219,32 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     lastBinaryRateLog = now;
                 }
                 
-                // Drain mode: silently discard all packets for 2s after stopping ambient
-                if (ambientSound.drainUntil > 0 && millis() < ambientSound.drainUntil) {
-                    // Silently discard - no logging to prevent spam
-                    static uint32_t drainCount = 0;
-                    static uint32_t lastDrainLog = 0;
-                    drainCount++;
-                    if (millis() - lastDrainLog > 1000) {
-                        Serial.printf("🚰 Draining buffered chunks... (%u drained so far)\n", drainCount);
-                        lastDrainLog = millis();
-                    }
-                    break;  // Discard this packet
-                }
-                
-                // Clear drain timer once period expires
-                if (ambientSound.drainUntil > 0 && millis() >= ambientSound.drainUntil) {
-                    Serial.println("✓ Drain complete - ready for new audio");
-                    ambientSound.drainUntil = 0;
-                }
-                
-                // Check for ambient magic header + sequence number
+                // Check for ambient magic header + sequence number FIRST
                 // Magic bytes 0xA5 0x5A are very unlikely to appear in PCM audio
-                if (length >= 4 && payload != nullptr && payload[0] == 0xA5 && payload[1] == 0x5A) {
-                    // This has ambient magic header - extract sequence number
-                    uint16_t chunkSequence = payload[2] | (payload[3] << 8);
+                bool isAmbientPacket = (length >= 4 && payload != nullptr && payload[0] == 0xA5 && payload[1] == 0x5A);
+                uint16_t chunkSequence = 0;
+                
+                if (isAmbientPacket) {
+                    // Extract sequence number
+                    chunkSequence = payload[2] | (payload[3] << 8);
                     
-                    if (ambientSound.active && chunkSequence == ambientSound.sequence) {
-                        // Valid ambient chunk - strip magic header + sequence
-                        payload += 4;
-                        length -= 4;
-                    } else {
-                        // Stale ambient chunk (wrong sequence or ambient not active)
+                    // Check if this is a stale packet (old sequence number)
+                    if (chunkSequence != ambientSound.sequence || !ambientSound.active) {
+                        // Stale ambient chunk - discard silently during drain period
+                        if (ambientSound.drainUntil > 0 && millis() < ambientSound.drainUntil) {
+                            // Silent discard during drain window
+                            static uint32_t drainCount = 0;
+                            drainCount++;
+                            break;
+                        }
+                        
+                        // After drain period: log and discard
                         // Rate-limit logging to prevent spam (max 1 every 10 seconds)
                         static uint32_t lastDiscardLog = 0;
                         static uint32_t discardsSinceLog = 0;
                         discardsSinceLog++;
                         
-                        if (millis() - lastDiscardLog > 10000) {  // Changed from 1000 to 10000 (10 seconds)
+                        if (millis() - lastDiscardLog > 10000) {
                             if (discardsSinceLog > 0) {
                                 Serial.printf("🚫 Discarded %u stale ambient chunks in last 10s (seq %d, active=%d, expected=%d)\n", 
                                              discardsSinceLog, chunkSequence, ambientSound.active, ambientSound.sequence);
@@ -2206,6 +2253,16 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                             lastDiscardLog = millis();
                         }
                         break;  // Discard this chunk
+                    }
+                    
+                    // Valid ambient chunk - strip magic header + sequence
+                    payload += 4;
+                    length -= 4;
+                    
+                    // Clear drain timer when we receive first packet of new sequence
+                    if (ambientSound.drainUntil > 0) {
+                        Serial.printf("✓ New sequence %d arrived - drain complete\n", chunkSequence);
+                        ambientSound.drainUntil = 0;
                     }
                 }
                 // else: Gemini audio (no magic header) - continue to play
@@ -2694,13 +2751,11 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
     }
     
     // Handle ambient stream completion
+    // Handle ambient stream completion
     if (doc["type"].is<const char*>() && doc["type"] == "ambientComplete") {
         String soundName = doc["sound"].as<String>();
         uint16_t sequence = doc["sequence"].as<uint16_t>();
         Serial.printf("🎵 Ambient track complete: %s (seq %d)\n", soundName.c_str(), sequence);
-        Serial.printf("🧘 Meditation state: active=%d, streaming=%d, mode=%d, chakra=%d, currentSound=%s\n", 
-                     meditationState.active, meditationState.streaming, currentLEDMode, 
-                     meditationState.currentChakra, ambientSound.name.c_str());
         
         // Validate: Only process if this completion matches what we're currently playing
         if (soundName != ambientSound.name) {
@@ -2709,15 +2764,17 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
             return;
         }
         
-        // If meditation mode, auto-advance to next chakra
-        if (meditationState.active && meditationState.streaming && currentLEDMode == LED_MEDITATION) {
+        // For meditation mode: auto-advance to next chakra
+        if (meditationState.active && currentLEDMode == LED_MEDITATION) {
             if (meditationState.currentChakra < MeditationState::CROWN) {
-                // Advance to next chakra
+                // Auto-advance to next chakra
                 meditationState.currentChakra = (MeditationState::Chakra)(meditationState.currentChakra + 1);
-                meditationState.phase = MeditationState::INHALE;
-                meditationState.phaseStartTime = millis();  // Restart breathing cycle
+                meditationState.phase = MeditationState::HOLD_BOTTOM;
+                meditationState.phaseStartTime = millis();
                 
-                // Request next chakra audio
+                Serial.printf("🧘 Auto-advancing to %s chakra\n", CHAKRA_NAMES[meditationState.currentChakra]);
+                
+                // Request next chakra sound
                 JsonDocument reqDoc;
                 reqDoc["action"] = "requestAmbient";
                 char nextSound[16];
@@ -2728,23 +2785,18 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
                 serializeJson(reqDoc, reqMsg);
                 webSocket.sendTXT(reqMsg);
                 
-                // Update ambient sound state
                 ambientSound.name = nextSound;
                 firstAudioChunk = true;
                 lastAudioChunkTime = millis();
-                
-                Serial.printf("🧘 Auto-advancing to %s chakra (color will smoothly transition)\n", CHAKRA_NAMES[meditationState.currentChakra]);
-                // DON'T show marquee - let LED color smoothly transition in breathing visualization
             } else {
-                // All chakras complete - return to IDLE
-                Serial.println("✨ Meditation sequence complete! Returning to IDLE");
+                // Completed all 7 chakras - return to IDLE
+                Serial.println("🧘 Meditation sequence complete - returning to IDLE");
                 meditationState.active = false;
-                meditationState.streaming = false;
                 isPlayingAmbient = false;
                 isPlayingResponse = false;
-                volumeMultiplier = meditationState.savedVolume;  // Restore volume
+                volumeMultiplier = meditationState.savedVolume;
                 Serial.printf("🔊 Volume restored to %.0f%%\n", volumeMultiplier * 100);
-                startMarquee("COMPLETE", CRGB(255, 255, 255), LED_IDLE);  // Return to IDLE with white marquee
+                startMarquee("COMPLETE", CRGB(255, 255, 255), LED_IDLE);
             }
         }
         return;
@@ -3825,9 +3877,9 @@ void updateLEDs() {
                         CRGB(255, 100, 0),    // SACRAL - Orange
                         CRGB(255, 200, 0),    // SOLAR - Yellow
                         CRGB(0, 255, 0),      // HEART - Green
-                        CRGB(0, 150, 255),    // THROAT - Blue
-                        CRGB(75, 0, 130),     // THIRD_EYE - Indigo
-                        CRGB(148, 0, 211)     // CROWN - Violet
+                        CRGB(0, 100, 255),    // THROAT - Blue (more blue, less cyan)
+                        CRGB(75, 0, 130),     // THIRD_EYE - Indigo (darker purple)
+                        CRGB(180, 0, 255)     // CROWN - Violet (brighter purple)
                     };
                     
                     CRGB currentColor = chakraColors[meditationState.currentChakra];

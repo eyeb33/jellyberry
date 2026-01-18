@@ -758,6 +758,20 @@ void loop() {
                 DEBUG_PRINTLN("🎵 Ambient VU meter mode enabled");
             } else if (modeToCheck == LED_AMBIENT_VU) {
                 ambientVUMode = false;
+                
+                // CRITICAL: Flush audio queue to prevent stale VU audio from playing
+                AudioChunk dummy;
+                while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {
+                    // Drain all queued audio packets
+                }
+                
+                // Clear I2S hardware buffer
+                i2s_zero_dma_buffer(I2S_NUM_1);
+                
+                // Set drain period to discard any stale packets still in flight
+                ambientSound.drainUntil = millis() + 500;  // 500ms drain window
+                Serial.println("🗑️  Flushed audio queue for clean VU->Rain transition");
+                
                 currentAmbientSoundType = SOUND_RAIN;  // Start with rain
                 ambientSound.name = "rain";
                 ambientSound.active = true;
@@ -1007,10 +1021,17 @@ void loop() {
             }
         }
         
+        // VU meter mode: Button 1 disabled (button 2 advances to next mode)
+        // Skip START button handling in VU mode
+        if (currentLEDMode == LED_AMBIENT_VU && startRisingEdge) {
+            DEBUG_PRINTLN("⚠️  Button 1 disabled in VU mode - use button 2 to advance");
+            // Do nothing - button 1 is disabled in VU mode
+        }
         // Ambient mode: Button 1 cycles between sounds (rain → ocean → rainforest)
-        static uint32_t lastAmbientCycle = 0;
-        if (currentLEDMode == LED_AMBIENT && startRisingEdge && 
-            (millis() - lastAmbientCycle) > 500) {  // 500ms debounce
+        else {
+            static uint32_t lastAmbientCycle = 0;
+            if (currentLEDMode == LED_AMBIENT && startRisingEdge && 
+                (millis() - lastAmbientCycle) > 500) {  // 500ms debounce
             
             lastAmbientCycle = millis();
             
@@ -1053,6 +1074,7 @@ void loop() {
             lastAudioChunkTime = millis();
             
             // Request new sound from server (will be sent after marquee completes)
+            }
         }
         
         // Pomodoro mode: Button 1 long press = pause/resume, short press = Gemini
@@ -1332,9 +1354,9 @@ void loop() {
                          (const char*[]){"WHITE", "RED", "GREEN", "BLUE"}[lampState.currentColor]);
         }
         // Start recording on rising edge (normal case - not interrupting)
-        // Block if: recording active, playing response, OR in ambient sound mode, OR conversation window is open, OR in Meditation/Ambient/Lamp mode
+        // Block if: recording active, playing response, OR in ambient sound mode, OR conversation window is open, OR in Meditation/Ambient/Lamp/VU mode
         // Special handling for Pomodoro: only trigger on button release after short press
-        else if (!meditationHandled && currentLEDMode != LED_MEDITATION && currentLEDMode != LED_AMBIENT && currentLEDMode != LED_LAMP && !recordingActive && !isPlayingResponse && !isPlayingAmbient && !conversationMode) {
+        else if (!meditationHandled && currentLEDMode != LED_MEDITATION && currentLEDMode != LED_AMBIENT && currentLEDMode != LED_AMBIENT_VU && currentLEDMode != LED_LAMP && !recordingActive && !isPlayingResponse && !isPlayingAmbient && !conversationMode) {
             // Pomodoro mode: only start recording on button release after SHORT press
             bool shouldStartRecording = false;
             if (currentLEDMode == LED_POMODORO) {
@@ -2960,18 +2982,20 @@ void updateLEDs() {
             // Gentle blue pulse - all strips in sync, bottom to top to bottom
             // Smooth bouncing wave with even fade at both ends
             {
-                // 5.3 second cycle (50% faster than 8s), bounces up and down
-                float t = (millis() % 5333) / 5333.0;
+                // 5.9 second cycle (10% slower than 5.3s), bounces up and down
+                // ORIGINAL (to revert): 5333ms for 5.3s cycle
+                float t = (millis() % 5866) / 5866.0;
                 
-                // Create bouncing wave: stays within LED range (0-11) with fade margins
-                // Range 0→14→0 where 14 gives smooth fade at top (doesn't hit full 16)
+                // Create bouncing wave: centered for symmetry at both ends
+                // Range -2.5→13.5→-2.5 (centered at row 5.5, perfectly symmetric)
+                // ORIGINAL (to revert): Range 0→14→0, use "wavePos = (t * 2.0) * 14.0" and "wavePos = ((1.0 - t) * 2.0) * 14.0"
                 float wavePos;
                 if (t < 0.5) {
-                    // First half: bottom to top (0→14)
-                    wavePos = (t * 2.0) * 14.0;
+                    // First half: bottom to top (-2.5→13.5)
+                    wavePos = (t * 2.0) * 16.0 - 2.5;
                 } else {
-                    // Second half: top to bottom (14→0)
-                    wavePos = ((1.0 - t) * 2.0) * 14.0;
+                    // Second half: top to bottom (13.5→-2.5)
+                    wavePos = ((1.0 - t) * 2.0) * 16.0 - 2.5;
                 }
                 
                 // Debug every 2 seconds
@@ -3033,12 +3057,12 @@ void updateLEDs() {
                             // Green at bottom, yellow in middle, red at top
                             float progress = (float)row / (float)LEDS_PER_COLUMN;
                             
-                            if (progress < 0.4) {
-                                leds[ledIndex] = CRGB(0, 255, 0);  // Green (bottom 40%)
-                            } else if (progress < 0.7) {
-                                leds[ledIndex] = CRGB(255, 255, 0);  // Yellow (40-70%)
+                            if (progress < 0.5) {
+                                leds[ledIndex] = CRGB(0, 255, 0);  // Green (bottom 50% - 6 LEDs)
+                            } else if (progress < 0.83) {
+                                leds[ledIndex] = CRGB(255, 255, 0);  // Yellow (50-83% - 4 LEDs)
                             } else {
-                                leds[ledIndex] = CRGB(255, 0, 0);  // Red (top 70-100%)
+                                leds[ledIndex] = CRGB(255, 0, 0);  // Red (top 83-100% - 2 LEDs)
                             }
                         }
                         // LEDs above numRows keep their faded value
@@ -3130,12 +3154,12 @@ void updateLEDs() {
                             
                             if (row < numRows) {
                                 // Gradient based on row height
-                                if (row < LEDS_PER_COLUMN * 0.6) {
-                                    leds[ledIndex] = CRGB(0, 255, 0);  // Green (bottom 60%)
-                                } else if (row < LEDS_PER_COLUMN * 0.85) {
-                                    leds[ledIndex] = CRGB(255, 255, 0);  // Yellow (60-85%)
+                                if (row < LEDS_PER_COLUMN * 0.5) {
+                                    leds[ledIndex] = CRGB(0, 255, 0);  // Green (bottom 50% - 6 LEDs)
+                                } else if (row < LEDS_PER_COLUMN * 0.83) {
+                                    leds[ledIndex] = CRGB(255, 255, 0);  // Yellow (50-83% - 4 LEDs)
                                 } else {
-                                    leds[ledIndex] = CRGB(255, 0, 0);  // Red (top 85-100%)
+                                    leds[ledIndex] = CRGB(255, 0, 0);  // Red (top 83-100% - 2 LEDs)
                                 }
                             }
                             // LEDs above numRows will keep their faded value from fadeToBlackBy
@@ -3174,12 +3198,12 @@ void updateLEDs() {
                             // More pronounced color differences for better visibility
                             float progress = (float)row / (float)LEDS_PER_COLUMN;
                             
-                            if (progress < 0.4) {
-                                leds[ledIndex] = CRGB(0, 150, 255);  // Sky blue (bottom 40%)
-                            } else if (progress < 0.7) {
-                                leds[ledIndex] = CRGB(0, 255, 200);  // Cyan/aqua (40-70%)
+                            if (progress < 0.5) {
+                                leds[ledIndex] = CRGB(0, 150, 255);  // Sky blue (bottom 50% - 6 LEDs)
+                            } else if (progress < 0.83) {
+                                leds[ledIndex] = CRGB(0, 255, 200);  // Cyan/aqua (50-83% - 4 LEDs)
                             } else {
-                                leds[ledIndex] = CRGB(150, 0, 255);  // Magenta/purple (top 70-100%)
+                                leds[ledIndex] = CRGB(150, 0, 255);  // Magenta/purple (top 83-100% - 2 LEDs)
                             }
                         }
                         // LEDs above numRows keep their faded value

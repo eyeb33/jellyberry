@@ -103,6 +103,9 @@ bool ambientVUMode = false;  // Toggle for ambient sound VU meter mode
 enum AmbientSoundType { SOUND_RAIN, SOUND_OCEAN, SOUND_RAINFOREST, SOUND_FIRE };
 AmbientSoundType currentAmbientSoundType = SOUND_RAIN;
 
+// Startup sound flag
+bool startupSoundPlayed = false;
+
 // Tide visualization state
 struct TideState {
     String state;  // "flooding" or "ebbing"
@@ -506,10 +509,6 @@ void setup() {
     xTaskCreatePinnedToCore(ledTask, "LEDs", 4096, NULL, 0, &ledTaskHandle, CORE_0);
     xTaskCreatePinnedToCore(audioTask, "Audio", 32768, NULL, 2, &audioTaskHandle, CORE_1);  // 32KB for audio buffers + processing
     Serial.println("✓ Tasks created on dual cores");
-
-    // Play startup sound
-    Serial.println("🔊 Playing startup sound...");
-    playStartupSound();
     
     Serial.printf("=== Initialization Complete ===  [LEDMode: IDLE]\n");
     Serial.println("Touch START pad to begin recording");
@@ -1944,38 +1943,18 @@ void audioTask(void * parameter) {
 
 // ============== AUDIO FEEDBACK ==============
 void playStartupSound() {
-    // Play a pleasant ascending melody on startup
-    const int sampleRate = 24000;
-    const int noteDuration = 120;  // 120ms per note
-    const int numSamples = (sampleRate * noteDuration) / 1000;
-    
-    // Musical notes: C5, E5, G5, C6 (major chord arpeggio)
-    const float frequencies[] = {523.25f, 659.25f, 783.99f, 1046.50f};
-    const int numNotes = 4;
-    
-    static int16_t toneBuffer[5760];  // 120ms at 24kHz stereo (2880 samples * 2 channels)
-    
-    for (int note = 0; note < numNotes; note++) {
-        for (int i = 0; i < numSamples; i++) {
-            // Generate sine wave with fade-in/fade-out envelope
-            float t = (float)i / sampleRate;
-            float envelope = 1.0f;
-            if (i < numSamples / 10) {
-                envelope = (float)i / (numSamples / 10);  // Fade in
-            } else if (i > numSamples * 9 / 10) {
-                envelope = (float)(numSamples - i) / (numSamples / 10);  // Fade out
-            }
-            
-            int16_t sample = (int16_t)(sin(2.0f * PI * frequencies[note] * t) * 6000 * envelope * volumeMultiplier);
-            
-            // Stereo output
-            toneBuffer[i * 2] = sample;
-            toneBuffer[i * 2 + 1] = sample;
-        }
-        
-        size_t bytes_written;
-        i2s_write(I2S_NUM_1, toneBuffer, numSamples * 4, &bytes_written, portMAX_DELAY);
+    // Request startup sound from server
+    if (!isWebSocketConnected) {
+        Serial.println("⚠️  Cannot play startup sound - WebSocket not connected");
+        return;
     }
+    
+    JsonDocument startupDoc;
+    startupDoc["action"] = "requestStartup";
+    String startupMsg;
+    serializeJson(startupDoc, startupMsg);
+    webSocket.sendTXT(startupMsg);
+    Serial.println("🔊 Requesting startup sound from server");
 }
 
 void playZenBell() {
@@ -2433,6 +2412,13 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
     // Handle server ready message
     if (doc["type"].is<const char*>() && doc["type"] == "ready") {
         Serial.printf("✓ Server: %s\n", doc["message"].as<const char*>());
+        
+        // Play startup sound once after WebSocket is ready
+        if (!startupSoundPlayed) {
+            startupSoundPlayed = true;
+            Serial.println("🔊 Playing startup sound...");
+            playStartupSound();
+        }
         return;
     }
     

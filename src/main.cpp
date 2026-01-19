@@ -3199,16 +3199,16 @@ void updateLEDs() {
                         }
                         
                         if (row < numRows) {
-                            // Blue → cyan → magenta gradient based on row height
-                            // More pronounced color differences for better visibility
+                            // Blue → cyan → magenta gradient with distinct color zones
+                            // More distinct colors for better visibility
                             float progress = (float)row / (float)LEDS_PER_COLUMN;
                             
                             if (progress < 0.5) {
-                                leds[ledIndex] = CRGB(0, 150, 255);  // Sky blue (bottom 50% - 6 LEDs)
+                                leds[ledIndex] = CRGB(0, 100, 200);  // Deeper blue (bottom 50% - 6 LEDs)
                             } else if (progress < 0.83) {
-                                leds[ledIndex] = CRGB(0, 255, 200);  // Cyan/aqua (50-83% - 4 LEDs)
+                                leds[ledIndex] = CRGB(0, 255, 150);  // Bright cyan (50-83% - 4 LEDs)
                             } else {
-                                leds[ledIndex] = CRGB(150, 0, 255);  // Magenta/purple (top 83-100% - 2 LEDs)
+                                leds[ledIndex] = CRGB(200, 0, 255);  // Bright magenta (top 83-100% - 2 LEDs)
                             }
                         }
                         // LEDs above numRows keep their faded value
@@ -4370,29 +4370,54 @@ void updateLEDs() {
 void websocketTask(void * parameter) {
     static uint32_t lastConnCheck = 0;
     static uint32_t lastHealthLog = 0;
+    static uint32_t startupHeap = 0;
+    static uint32_t lowestHeap = UINT32_MAX;
+    static uint32_t startTime = millis();
+    
     while(1) {
         webSocket.loop();
         
         // Health monitoring every 5s (more frequent for weak signal detection)
         if (millis() - lastHealthLog > 5000) {
             int32_t rssi = WiFi.RSSI();
-            uint32_t timeSinceLastSend = millis() - lastWebSocketSendTime;
             
             // Get memory statistics
             uint32_t freeHeap = ESP.getFreeHeap();
-            uint32_t minFreeHeap = ESP.getMinFreeHeap();
-            uint32_t heapSize = ESP.getHeapSize();
             uint32_t freePsram = ESP.getFreePsram();
             
-            // Warn if signal is degrading rapidly
-            if (lastRSSI != 0 && (lastRSSI - rssi) > 10) {
-                Serial.printf("⚠️  WiFi signal dropped %d dBm! (%d → %d)\n", lastRSSI - rssi, lastRSSI, rssi);
+            // Memory leak detection tracking (quiet mode - only show baseline and hourly reports)
+            if (startupHeap == 0) {
+                startupHeap = freeHeap;
+                lowestHeap = freeHeap;
+                Serial.printf("📊 Memory baseline: Heap=%u KB, PSRAM=%u KB\n", freeHeap/1024, freePsram/1024);
+            }
+            if (freeHeap < lowestHeap) {
+                lowestHeap = freeHeap;
+                Serial.printf("📉 New low heap: %u KB (lost %u KB since startup)\n", 
+                             freeHeap/1024, (startupHeap - freeHeap)/1024);
             }
             
-            Serial.printf("[WS Health] Connected=%d, WiFi=%d dBm, LastSend=%us ago, Failures=%u\n",
-                         isWebSocketConnected, rssi, timeSinceLastSend/1000, webSocketSendFailures);
-            Serial.printf("[Memory] Heap: %u/%u KB (min=%u KB), PSRAM: %u KB, Playing=%d\n",
-                         freeHeap/1024, heapSize/1024, minFreeHeap/1024, freePsram/1024, isPlayingResponse);
+            // Hourly summary for leak detection
+            uint32_t uptime = (millis() - startTime) / 1000;
+            if (uptime > 0 && uptime % 3600 == 0) {
+                Serial.printf("\n╔══════════════════════════════════════════╗\n");
+                Serial.printf("║  HOURLY MEMORY REPORT - %u hours runtime  ║\n", uptime/3600);
+                Serial.printf("╠══════════════════════════════════════════╣\n");
+                Serial.printf("║  Current Heap:  %6u KB                ║\n", freeHeap/1024);
+                Serial.printf("║  Startup Heap:  %6u KB                ║\n", startupHeap/1024);
+                Serial.printf("║  Lowest Heap:   %6u KB                ║\n", lowestHeap/1024);
+                Serial.printf("║  Heap Lost:     %6u KB                ║\n", (startupHeap - freeHeap)/1024);
+                Serial.printf("║  PSRAM Free:    %6u KB                ║\n", freePsram/1024);
+                Serial.printf("║  Mode: %-30s    ║\n", 
+                    currentLEDMode == LED_IDLE ? "IDLE" :
+                    currentLEDMode == LED_AMBIENT ? "AMBIENT" :
+                    currentLEDMode == LED_AMBIENT_VU ? "VU METER" :
+                    currentLEDMode == LED_SEA_GOOSEBERRY ? "SEA GOOSEBERRY" :
+                    currentLEDMode == LED_POMODORO ? "POMODORO" :
+                    currentLEDMode == LED_MEDITATION ? "MEDITATION" : "OTHER");
+                Serial.printf("╚══════════════════════════════════════════╝\n\n");
+            }
+            
             lastRSSI = rssi;
             lastHealthLog = millis();
             

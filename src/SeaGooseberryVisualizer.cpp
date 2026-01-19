@@ -92,8 +92,9 @@ void SeaGooseberryVisualizer::update(uint32_t nowMs) {
         breathingPhase -= 1.0f;
     }
     
-    // Periodically shuffle patterns to break repetition (every 3-5s)
-    if (nowMs - lastShuffleMs >= nextShuffleInterval) {
+    // Disable periodic shuffling to prevent frame skip appearance
+    // Initial randomization at startup provides variety without sudden changes
+    if (false && nowMs - lastShuffleMs >= nextShuffleInterval) {
         shufflePatterns();
         lastShuffleMs = nowMs;
         nextShuffleInterval = 3000 + random(0, 2000);  // Next shuffle in 3-5s
@@ -144,11 +145,8 @@ void SeaGooseberryVisualizer::render(CRGB* leds, int ledCount) {
                 int ledIdx = ledIndexForCoord(s, h);
                 if (ledIdx < 0 || ledIdx >= ledCount) continue;
                 
-                // Distance from band center
+                // Distance from band center (no wrapping - waves exit naturally at top)
                 float distance = abs(h - bandCenter);
-                if (distance > LEDS_PER_STRIP / 2) {
-                    distance = LEDS_PER_STRIP - distance;  // Wrap distance
-                }
                 
                 // Gaussian brightness curve (2-3 LED width)
                 float brightness = getGaussianBrightness(distance);

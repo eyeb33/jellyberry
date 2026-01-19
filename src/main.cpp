@@ -651,7 +651,7 @@ void loop() {
             Serial.println("🔘 Button 2 pressed (start)");
         }
         
-        // Button 2 long-press: Return to IDLE and start Gemini recording
+        // Button 2 long-press: Return to IDLE and start Gemini recording (from any mode)
         if (stopFallingEdge && !recordingActive && 
             (millis() - button2PressStart) >= BUTTON2_LONG_PRESS) {
             Serial.printf("🏠 Button 2 long-press (%lu ms): Returning to IDLE + starting recording\n",
@@ -759,6 +759,12 @@ void loop() {
             } else if (modeToCheck == LED_AMBIENT_VU) {
                 ambientVUMode = false;
                 
+                // Switch to Sea Gooseberry jellyfish mode (no audio needed)
+                DEBUG_PRINTLN("🔄 VU → Sea Gooseberry mode");
+                seaGooseberry.begin();  // Initialize visualizer
+                startMarquee("SEA JELLY", CRGB(100, 200, 255), LED_SEA_GOOSEBERRY);
+            } else if (modeToCheck == LED_SEA_GOOSEBERRY) {
+                // Switch to Rain ambient sound
                 // CRITICAL: Flush audio queue to prevent stale VU audio from playing
                 AudioChunk dummy;
                 while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {
@@ -770,7 +776,7 @@ void loop() {
                 
                 // Set drain period to discard any stale packets still in flight
                 ambientSound.drainUntil = millis() + 500;  // 500ms drain window
-                Serial.println("🗑️  Flushed audio queue for clean VU->Rain transition");
+                Serial.println("🗑️  Flushed audio queue for clean Jelly->Rain transition");
                 
                 currentAmbientSoundType = SOUND_RAIN;  // Start with rain
                 ambientSound.name = "rain";
@@ -783,15 +789,7 @@ void loop() {
                 DEBUG_PRINT("🌧️  Ambient mode: Rain (seq %d)\n", ambientSound.sequence);
                 // Show marquee first
                 startMarquee("RAIN", CRGB(0, 100, 255), LED_AMBIENT);  // Blue for rain
-                // Request rain sounds from server (sequence number handles overlap)
-                JsonDocument ambientDoc;
-                ambientDoc["action"] = "requestAmbient";
-                ambientDoc["sound"] = "rain";
-                ambientDoc["sequence"] = ambientSound.sequence;
-                String ambientMsg;
-                serializeJson(ambientDoc, ambientMsg);
-                DEBUG_PRINT("📤 Sending ambient request: %s\n", ambientMsg.c_str());
-                webSocket.sendTXT(ambientMsg);
+                // Audio request will be sent after marquee completes (see LED_MARQUEE case)
             } else if (modeToCheck == LED_AMBIENT) {
                 // Stop ambient sound and switch to Pomodoro mode
                 DEBUG_PRINTLN("🔄 Mode transition: AMBIENT → POMODORO (cleaning up...)");
@@ -1027,15 +1025,15 @@ void loop() {
             DEBUG_PRINTLN("⚠️  Button 1 disabled in VU mode - use button 2 to advance");
             // Do nothing - button 1 is disabled in VU mode
         }
-        // Ambient mode: Button 1 cycles between sounds (rain → ocean → rainforest)
+        // Ambient mode & Sea Gooseberry: Button 1 cycles to ambient sounds
         else {
             static uint32_t lastAmbientCycle = 0;
-            if (currentLEDMode == LED_AMBIENT && startRisingEdge && 
+            if ((currentLEDMode == LED_AMBIENT || currentLEDMode == LED_SEA_GOOSEBERRY) && startRisingEdge && 
                 (millis() - lastAmbientCycle) > 500) {  // 500ms debounce
             
             lastAmbientCycle = millis();
             
-            // Stop current audio
+            // Stop current audio (if any)
             JsonDocument stopDoc;
             stopDoc["action"] = "stopAmbient";
             String stopMsg;
@@ -1043,8 +1041,15 @@ void loop() {
             webSocket.sendTXT(stopMsg);
             i2s_zero_dma_buffer(I2S_NUM_1);
             
-            // Cycle to next sound
-            if (currentAmbientSoundType == SOUND_RAIN) {
+            // If coming from Sea Gooseberry, go to Rain
+            if (currentLEDMode == LED_SEA_GOOSEBERRY) {
+                currentAmbientSoundType = SOUND_RAIN;
+                ambientSound.name = "rain";
+                DEBUG_PRINT("🌧️  Sea Gooseberry → Rain (seq %d)\n", ambientSound.sequence + 1);
+                startMarquee("RAIN", CRGB(0, 100, 255), LED_AMBIENT);  // Blue
+            }
+            // Cycle to next sound in Ambient mode
+            else if (currentAmbientSoundType == SOUND_RAIN) {
                 currentAmbientSoundType = SOUND_OCEAN;
                 ambientSound.name = "ocean";
                 DEBUG_PRINT("🌊 Ambient: Switching to Ocean (seq %d)\n", ambientSound.sequence + 1);
@@ -1354,9 +1359,9 @@ void loop() {
                          (const char*[]){"WHITE", "RED", "GREEN", "BLUE"}[lampState.currentColor]);
         }
         // Start recording on rising edge (normal case - not interrupting)
-        // Block if: recording active, playing response, OR in ambient sound mode, OR conversation window is open, OR in Meditation/Ambient/Lamp/VU mode
+        // Block if: recording active, playing response, OR in ambient sound mode, OR conversation window is open, OR in Meditation/Ambient/Lamp/VU/SeaGooseberry mode
         // Special handling for Pomodoro: only trigger on button release after short press
-        else if (!meditationHandled && currentLEDMode != LED_MEDITATION && currentLEDMode != LED_AMBIENT && currentLEDMode != LED_AMBIENT_VU && currentLEDMode != LED_LAMP && !recordingActive && !isPlayingResponse && !isPlayingAmbient && !conversationMode) {
+        else if (!meditationHandled && currentLEDMode != LED_MEDITATION && currentLEDMode != LED_AMBIENT && currentLEDMode != LED_AMBIENT_VU && currentLEDMode != LED_SEA_GOOSEBERRY && currentLEDMode != LED_LAMP && !recordingActive && !isPlayingResponse && !isPlayingAmbient && !conversationMode) {
             // Pomodoro mode: only start recording on button release after SHORT press
             bool shouldStartRecording = false;
             if (currentLEDMode == LED_POMODORO) {

@@ -48,15 +48,15 @@ private:
     static constexpr int LEDS_PER_STRIP = 12;
     static constexpr int NUM_MAIN_RIBS = 8;  // Main bright ribs (strips 0,1,3,4,6,7,9,10)
     
-    // Metachronal wave timing (1-2 seconds traverse as observed)
-    static constexpr float BASE_WAVE_SPEED = 0.00057f;  // ~1.75s per strip traverse (85% of original)
+    // Metachronal wave timing (slower, more organic pace)
+    static constexpr float BASE_WAVE_SPEED = 0.000412f;  // 30% slower than original for gentle organic feel
     static constexpr float PHASE_SHIFT_PER_STRIP = 0.08f;  // Phase offset for circulation
     static constexpr int NUM_WAVES_PER_STRIP = 2;  // 2 bands per rib with good spacing
     static constexpr float SPEED_VARIATION = 0.20f;  // ±20% per-rib speed variation
     
-    // Pulse shape (2-3 LED vertical bands - wider for visibility)
+    // Pulse shape (wider bands for smooth, glitch-free LED-to-LED transitions)
     static constexpr float BAND_CENTER_WIDTH = 1.0f;  // Gaussian center
-    static constexpr float BAND_FALLOFF = 1.5f;  // Medium falloff for 2-3 LED bands
+    static constexpr float BAND_FALLOFF = 2.0f;  // Wider falloff for organic smooth motion
     
     // Color palette (cyan→green→turquoise with blue accents)
     // Pastel/constrained, not fully saturated

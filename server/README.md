@@ -2,6 +2,8 @@
 
 WebSocket proxy server for Jellyberry device to communicate with Gemini Live API.
 
+**Model:** `gemini-2.5-flash-native-audio-preview-12-2025` (fast, low-latency audio generation)
+
 ## Local Development
 
 1. Install Deno: https://deno.land/

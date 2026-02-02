@@ -522,7 +522,7 @@ void loop() {
     static uint32_t lastBrightnessCheck = 0;
     
     if (millis() - lastPrint > 5000) {
-        Serial.write("LOOP_TICK\r\n", 11);
+        // Serial.write("LOOP_TICK\r\n", 11);  // Disabled for clean overnight logging
         lastPrint = millis();
     }
     
@@ -786,7 +786,7 @@ void loop() {
                 isPlayingResponse = false;
                 firstAudioChunk = true;
                 lastAudioChunkTime = millis();  // Initialize timing
-                DEBUG_PRINT("🌧️  Ambient mode: Rain (seq %d)\n", ambientSound.sequence);
+                Serial.printf("🌧️  MODE: Rain (seq %d)\n", ambientSound.sequence);
                 // Show marquee first
                 startMarquee("RAIN", CRGB(0, 100, 255), LED_AMBIENT);  // Blue for rain
                 // Audio request will be sent after marquee completes (see LED_MARQUEE case)
@@ -1045,29 +1045,29 @@ void loop() {
             if (currentLEDMode == LED_SEA_GOOSEBERRY) {
                 currentAmbientSoundType = SOUND_RAIN;
                 ambientSound.name = "rain";
-                DEBUG_PRINT("🌧️  Sea Gooseberry → Rain (seq %d)\n", ambientSound.sequence + 1);
+                Serial.printf("🌧️  MODE: Rain (seq %d)\n", ambientSound.sequence + 1);
                 startMarquee("RAIN", CRGB(0, 100, 255), LED_AMBIENT);  // Blue
             }
             // Cycle to next sound in Ambient mode
             else if (currentAmbientSoundType == SOUND_RAIN) {
                 currentAmbientSoundType = SOUND_OCEAN;
                 ambientSound.name = "ocean";
-                DEBUG_PRINT("🌊 Ambient: Switching to Ocean (seq %d)\n", ambientSound.sequence + 1);
+                Serial.printf("🌊 MODE: Ocean (seq %d)\n", ambientSound.sequence + 1);
                 startMarquee("OCEAN", CRGB(0, 150, 200), LED_AMBIENT);  // Cyan
             } else if (currentAmbientSoundType == SOUND_OCEAN) {
                 currentAmbientSoundType = SOUND_RAINFOREST;
                 ambientSound.name = "rainforest";
-                DEBUG_PRINT("🌿 Ambient: Switching to Rainforest (seq %d)\n", ambientSound.sequence + 1);
+                Serial.printf("🌿 MODE: Rainforest (seq %d)\n", ambientSound.sequence + 1);
                 startMarquee("FOREST", CRGB(50, 255, 50), LED_AMBIENT);  // Green
             } else if (currentAmbientSoundType == SOUND_RAINFOREST) {
                 currentAmbientSoundType = SOUND_FIRE;
                 ambientSound.name = "fire";
-                DEBUG_PRINT("🔥 Ambient: Switching to Fire (seq %d)\n", ambientSound.sequence + 1);
+                Serial.printf("🔥 MODE: Fire (seq %d)\n", ambientSound.sequence + 1);
                 startMarquee("FIRE", CRGB(255, 100, 0), LED_AMBIENT);  // Orange
             } else {  // SOUND_FIRE
                 currentAmbientSoundType = SOUND_RAIN;
                 ambientSound.name = "rain";
-                DEBUG_PRINT("🌧️  Ambient: Switching to Rain (seq %d)\n", ambientSound.sequence + 1);
+                Serial.printf("🌧️  MODE: Rain (seq %d)\n", ambientSound.sequence + 1);
                 startMarquee("RAIN", CRGB(0, 100, 255), LED_AMBIENT);  // Blue
             }
             
@@ -4471,7 +4471,7 @@ void ledTask(void * parameter) {
             updateCount++;
             
             if (millis() - lastUpdateLog > 30000) {
-                Serial.printf("🔄 LED task: %u updates in 30s (expect ~990)\n", updateCount);
+                // Serial.printf("🔄 LED task: %u updates in 30s (expect ~990)\n", updateCount);  // Disabled for clean logging
                 updateCount = 0;
                 lastUpdateLog = millis();
             }

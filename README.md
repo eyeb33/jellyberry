@@ -1,6 +1,8 @@
 # JellyBerry - Conversational AI Device Firmware
 
-**A production-ready Gemini 2.5 Realtime conversational AI device for ESP32-S3 with real-time audio I/O, WebSocket communication, and FastLED visualization.**
+**A production-ready Gemini 2.5 Flash conversational AI device for ESP32-S3 with real-time audio I/O, WebSocket communication, and FastLED visualization.**
+
+*Powered by `gemini-2.5-flash-native-audio-preview-12-2025` for fast, low-latency audio generation.*
 
 ## Features
 
@@ -28,18 +30,29 @@ Microphone (INMP441):
   SCK (Clock)   → GPIO 8
   WS (Word Sel) → GPIO 9
   SD (Data)     → GPIO 10
+  GND           → ESP32 GND
+  VCC           → 3.3V
 
 Speaker (MAX98357A):
   LRC (Sync)    → GPIO 5
   BCLK (Clock)  → GPIO 6
   DIN (Data)    → GPIO 7
+  GND           → ESP32 GND
+  VIN           → 5V
 
 LED Strip (WS2812B):
-  DATA          → GPIO 1 (via level shifter)
+  DATA          → GPIO 1
+  GND           → ESP32 GND (CRITICAL: must share ground with ESP32)
+  VCC/5V        → 5V power supply
 
 Touch Pads (TTP223):
   PAD1 (Start)  → GPIO 3
   PAD2 (Stop)   → GPIO 4
+  GND           → ESP32 GND
+  VCC           → 3.3V
+
+⚠️  IMPORTANT: All devices must share a common ground (GND) with the ESP32.
+    Without shared ground, LED data signals will be corrupted.
 ```
 
 ## Setup Instructions
@@ -144,9 +157,11 @@ IP: 192.168.1.XXX
 
 ## Troubleshooting
 
-### LEDs not lighting
-- Verify GPIO 1 connected via level shifter (5V→3.3V)
-- Check 5V power supply (LEDs draw ~100mA at max brightness)
+### LEDs not lighting or showing wrong colors
+- **CRITICAL**: Verify GND connection between ESP32 and LED power supply
+- Check GPIO 1 data line connection to LED strip DIN
+- Confirm 5V power supply adequate (LEDs draw ~100mA at max brightness)
+- Optional: Use 3.3V→5V level shifter on data line for better signal integrity
 - Test with FastLED example first
 
 ### Microphone not recording

@@ -8,7 +8,6 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <time.h>
-#include <lwip/sockets.h>
 #include "Config.h"
 #include "display_mapping.h"
 #include "front_text_marquee.h"
@@ -44,9 +43,10 @@ SeaGooseberryVisualizer seaGooseberry;
 EyeAnimationVisualizer eyeAnimation;
 
 bool isWebSocketConnected = false;
-bool recordingActive = false;
-bool isPlayingResponse = false;
-bool isPlayingAmbient = false;  // Track ambient sound playback separately
+// volatile: written by one FreeRTOS task / ISR context, read by another on the dual-core ESP32-S3.
+volatile bool recordingActive = false;
+volatile bool isPlayingResponse = false;
+volatile bool isPlayingAmbient = false;  // Track ambient sound playback separately
 bool isPlayingAlarm = false;      // Track alarm sound playback
 bool turnComplete = false;  // Track when Gemini has finished its turn
 bool responseInterrupted = false;  // Flag to ignore audio after interrupt
@@ -59,13 +59,13 @@ uint32_t lastAudioChunkTime = 0;  // Track when we last received audio
 uint32_t processingStartTime = 0;  // Track when PROCESSING mode started
 uint32_t lastWebSocketSendTime = 0;  // Track last successful send
 uint32_t webSocketSendFailures = 0;  // Count send failures
-uint32_t lastWiFiCheck = 0;  // Track WiFi health monitoring
+// NOTE: lastWiFiCheck is declared as a static local inside loop() - no global needed.
 int32_t lastRSSI = 0;  // Track signal strength changes
 bool firstAudioChunk = true;
-float volumeMultiplier = 0.25f;  // Volume control (25% for testing)
-int32_t currentAudioLevel = 0;  // Current audio amplitude for VU meter
-float smoothedAudioLevel = 0.0f;  // Smoothed audio level for stable VU meter
-bool conversationMode = false;  // Track if we're in conversation window
+volatile float volumeMultiplier = 0.25f;  // Volume control - volatile: read by audioTask, written by main/WS task
+volatile int32_t currentAudioLevel = 0;  // Current audio amplitude - volatile: written by audioTask, read by ledTask
+volatile float smoothedAudioLevel = 0.0f;  // Smoothed audio level - volatile: written by ledTask
+volatile bool conversationMode = false;  // Track if we're in conversation window
 uint32_t conversationWindowStart = 0;  // Timestamp when conversation window opened
 bool conversationRecording = false;  // Track if current recording was triggered from conversation mode
 
@@ -358,7 +358,8 @@ void setup() {
     // Create LED mutex for thread-safe access
     ledMutex = xSemaphoreCreateMutex();
     if (ledMutex == NULL) {
-        Serial.println("ERROR: Failed to create LED mutex!");
+        Serial.println("FATAL: Failed to create LED mutex - halting!");
+        while (true) { delay(1000); }  // Hard halt - nothing is safe without the mutex
     }
     Serial.println("\n\n========================================");
     Serial.println("=== JELLYBERRY BOOT STARTING ===");
@@ -561,6 +562,7 @@ void loop() {
                             alarmState.wasRecording = recordingActive;
                             alarmState.wasPlayingResponse = isPlayingResponse;
                             
+                            alarms[i].triggered = true;  // Prevent re-triggering every scan cycle
                             alarmState.ringing = true;
                             alarmState.ringStartTime = millis();
                             alarmState.pulseStartTime = millis();
@@ -590,6 +592,7 @@ void loop() {
                         alarmState.wasRecording = recordingActive;
                         alarmState.wasPlayingResponse = isPlayingResponse;
                         
+                        alarms[i].triggered = true;  // Prevent re-triggering every 10-second scan cycle
                         alarmState.ringing = true;
                         alarmState.ringStartTime = millis();
                         alarmState.pulseStartTime = millis();
@@ -1103,26 +1106,15 @@ void loop() {
                     // Long press: Toggle pause/resume
                     if (pomodoroState.paused) {
                         // Resume from paused state
-                        // Calculate how much time has already elapsed before pause
-                        int sessionDuration;
-                        if (pomodoroState.currentSession == PomodoroState::FOCUS) {
-                            sessionDuration = pomodoroState.focusDuration * 60;
-                        } else if (pomodoroState.currentSession == PomodoroState::SHORT_BREAK) {
-                            sessionDuration = pomodoroState.shortBreakDuration * 60;
-                        } else {
-                            sessionDuration = pomodoroState.longBreakDuration * 60;
-                        }
-                        
-                        // Restore original session duration
-                        pomodoroState.totalSeconds = sessionDuration;
-                        
-                        // Adjust startTime so elapsed time accounts for time already consumed
-                        int timeAlreadyElapsed = sessionDuration - pomodoroState.pausedTime;
+                        // Use the totalSeconds already stored when the session started.
+                        // Do NOT re-derive from focusDuration etc. — those may have been changed
+                        // by voice command between when the session started and when it was paused.
+                        int timeAlreadyElapsed = pomodoroState.totalSeconds - pomodoroState.pausedTime;
                         pomodoroState.startTime = millis() - (timeAlreadyElapsed * 1000);
                         pomodoroState.pausedTime = 0;
                         pomodoroState.paused = false;
                         
-                        DEBUG_PRINT("▶️  Pomodoro resumed from %d seconds remaining (long press)\n", sessionDuration - timeAlreadyElapsed);
+                        DEBUG_PRINT("▶️  Pomodoro resumed from %d seconds remaining (long press)\n", pomodoroState.totalSeconds - timeAlreadyElapsed);
                         // No sound on resume - user will source alternative
                     } else {
                         // Pause and save current position
@@ -2090,24 +2082,28 @@ void sendAudioChunk(uint8_t* data, size_t length) {
     // Create Live API realtimeInput message with Base64 encoded audio
     JsonDocument doc;
     
-    // Simple Base64 encode
+    // Base64 encode into a pre-allocated static buffer to avoid repeated heap allocations
+    // (the old String += approach allocates/reallocates every character, causing heap fragmentation)
+    // Max mic frame = MIC_FRAME_SIZE * 2 = 640 bytes → Base64 = ceil(640/3)*4 = 856 chars + NUL
+    static char encodedBuf[1024];
     const char* base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    String encoded = "";
+    size_t outPos = 0;
     int val = 0, valb = -6;
-    for (size_t i = 0; i < length; i++) {
+    for (size_t i = 0; i < length && outPos < sizeof(encodedBuf) - 5; i++) {
         val = (val << 8) + data[i];
         valb += 8;
         while (valb >= 0) {
-            encoded += base64_chars[(val >> valb) & 0x3F];
+            encodedBuf[outPos++] = base64_chars[(val >> valb) & 0x3F];
             valb -= 6;
         }
     }
-    if (valb > -6) encoded += base64_chars[((val << 8) >> (valb + 8)) & 0x3F];
-    while (encoded.length() % 4) encoded += '=';
+    if (valb > -6) encodedBuf[outPos++] = base64_chars[((val << 8) >> (valb + 8)) & 0x3F];
+    while (outPos % 4) encodedBuf[outPos++] = '=';
+    encodedBuf[outPos] = '\0';
     
     // Live API format: realtimeInput.audio as Blob
     JsonObject audio = doc["realtimeInput"]["audio"].to<JsonObject>();
-    audio["data"] = encoded;
+    audio["data"] = encodedBuf;
     audio["mimeType"] = "audio/pcm;rate=16000";
     
     String output;
@@ -2626,13 +2622,12 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
             }
             delay(200);
         }
-        // Brief delay to allow first audio chunk to arrive, then switch to playback mode
-        delay(300);
-        currentLEDMode = LED_AUDIO_REACTIVE;
-        isPlayingResponse = true;
-        lastAudioChunkTime = millis();  // Reset audio timeout
-        processingStartTime = 0;  // Clear processing timeout
-        Serial.println("✓ Ready for audio notification from Gemini...");
+        // Do NOT pre-set isPlayingResponse here — the standard audio prebuffer path in
+        // onWebSocketEvent(WStype_BIN) will set it once enough packets have buffered.
+        // Forcing it here caused the LED to switch before audio arrived (visual glitch)
+        // and the 300ms delay was blocking the WebSocket task.
+        processingStartTime = 0;  // Clear processing timeout so it doesn't blank the timer
+        Serial.println("✓ Timer expired - waiting for Gemini audio notification...");
         return;
     }
     

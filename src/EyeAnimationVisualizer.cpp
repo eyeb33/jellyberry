@@ -205,22 +205,27 @@ void EyeAnimationVisualizer::drawOvalEye(CRGB* leds, int stripStart, float openn
 }
 
 void EyeAnimationVisualizer::drawHeartEye(CRGB* leds, int stripStart) {
-    // Draw heart shape
+    // Draw heart shape - guard every index against ledIndexForCoord returning -1
+    auto safeSet = [&](int strip, int height, CRGB color) {
+        int idx = ledIndexForCoord(strip, height);
+        if (idx >= 0) leds[idx] = color;
+    };
+
     // Top bumps
-    leds[ledIndexForCoord(stripStart, 3)] = CRGB::Red;
-    leds[ledIndexForCoord(stripStart, 4)] = CRGB::Red;
-    leds[ledIndexForCoord(stripStart + 1, 3)] = CRGB::Red;
-    leds[ledIndexForCoord(stripStart + 1, 4)] = CRGB::Red;
+    safeSet(stripStart,     3, CRGB::Red);
+    safeSet(stripStart,     4, CRGB::Red);
+    safeSet(stripStart + 1, 3, CRGB::Red);
+    safeSet(stripStart + 1, 4, CRGB::Red);
     
     // Middle
     for (int h = 5; h <= 7; h++) {
-        leds[ledIndexForCoord(stripStart, h)] = CRGB::Red;
-        leds[ledIndexForCoord(stripStart + 1, h)] = CRGB::Red;
+        safeSet(stripStart,     h, CRGB::Red);
+        safeSet(stripStart + 1, h, CRGB::Red);
     }
     
     // Bottom point
-    leds[ledIndexForCoord(stripStart, 8)] = CRGB::Red;
-    leds[ledIndexForCoord(stripStart + 1, 8)] = CRGB::Red;
+    safeSet(stripStart,     8, CRGB::Red);
+    safeSet(stripStart + 1, 8, CRGB::Red);
 }
 
 void EyeAnimationVisualizer::drawPupil(CRGB* leds, int stripStart, float pupilX, float pupilY, float eyeOpenness) {

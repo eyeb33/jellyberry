@@ -269,16 +269,21 @@ function setAlarm(deviceId: string, alarmTime: string) {
       };
     }
     
-    // If alarm time is in the past, assume user means the next occurrence (tomorrow)
+    // If alarm time is in the past, advance to the next occurrence.
+    // Use a 60-second grace window: if the time is only slightly in the past
+    // (e.g. parsing ambiguity or a few seconds of clock drift) we still advance,
+    // but we include the adjustment in the return value so Gemini can confirm it with the user.
     const now = Date.now();
     const timeDiff = alarmDate.getTime() - now;
     const minutesUntil = Math.round(timeDiff / 1000 / 60);
+    let advancedToNextDay = false;
     
     console.log(`[${deviceId}] Time until alarm: ${minutesUntil} minutes`);
     
     if (alarmDate.getTime() <= now) {
-      console.log(`[${deviceId}] Alarm time is in the past, moving to next occurrence (tomorrow)`);
+      advancedToNextDay = true;
       alarmDate = new Date(alarmDate.getTime() + 24 * 60 * 60 * 1000); // Add 24 hours
+      console.log(`[${deviceId}] Alarm time was in the past by ${Math.abs(minutesUntil)} minutes - advancing to tomorrow`);
     }
     
     // Generate unique alarm ID
@@ -311,7 +316,10 @@ function setAlarm(deviceId: string, alarmTime: string) {
       triggerTime: triggerTime,
       formattedTime: formattedTime,
       formattedDate: formattedDate,
-      secondsUntil: secondsUntil
+      secondsUntil: secondsUntil,
+      // Tell Gemini if the time was in the past and was moved to tomorrow,
+      // so it can confirm this with the user rather than silently changing the date.
+      advancedToNextDay: advancedToNextDay
     };
   } catch (error) {
     return {

@@ -92,13 +92,8 @@ void SeaGooseberryVisualizer::update(uint32_t nowMs) {
         breathingPhase -= 1.0f;
     }
     
-    // Disable periodic shuffling to prevent frame skip appearance
-    // Initial randomization at startup provides variety without sudden changes
-    if (false && nowMs - lastShuffleMs >= nextShuffleInterval) {
-        shufflePatterns();
-        lastShuffleMs = nowMs;
-        nextShuffleInterval = 3000 + random(0, 2000);  // Next shuffle in 3-5s
-    }
+    // Periodic pattern shuffling is disabled — initial randomisation at startup
+    // provides sufficient variety without the sudden visual jumps that shuffling caused.
     
     // Calculate current speed (constant, per-rib variation applied in render)
     float currentSpeed = BASE_WAVE_SPEED * speedMultiplier;

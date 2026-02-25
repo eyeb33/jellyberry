@@ -24,7 +24,7 @@
 #endif
 
 // Chakra names array (used across multiple functions)
-static const char* CHAKRA_NAMES[NUM_CHAKRAS] = {
+const char* CHAKRA_NAMES[NUM_CHAKRAS] = {
     "ROOT", "SACRAL", "SOLAR", "HEART", "THROAT", "THIRD_EYE", "CROWN"
 };
 
@@ -95,146 +95,51 @@ QueueHandle_t audioOutputQueue;   // Queue for playback audio
 // Tuning: Increase for more buffer (higher latency), decrease for lower latency (more underruns)
 #define AUDIO_QUEUE_SIZE 30
 
-struct AudioChunk {
-    uint8_t data[2048];
-    size_t length;
-};
+#include "types.h"
 
-enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU, LED_AMBIENT, LED_POMODORO, LED_MEDITATION, LED_CLOCK, LED_LAMP, LED_SEA_GOOSEBERRY, LED_EYES, LED_ALARM, LED_CONVERSATION_WINDOW, LED_MARQUEE };
 LEDMode currentLEDMode = LED_IDLE;  // Start directly in idle mode
 LEDMode targetLEDMode = LED_IDLE;  // Mode to switch to after marquee finishes
 bool ambientVUMode = false;  // Toggle for ambient sound VU meter mode
 
 // Ambient sound type (for cycling within AMBIENT mode)
-enum AmbientSoundType { SOUND_RAIN, SOUND_OCEAN, SOUND_RAINFOREST, SOUND_FIRE };
 AmbientSoundType currentAmbientSoundType = SOUND_RAIN;
 
 // Startup sound flag
 bool startupSoundPlayed = false;
 
 // Tide visualization state
-struct TideState {
-    String state;  // "flooding" or "ebbing"
-    float waterLevel;  // 0.0 to 1.0
-    int nextChangeMinutes;
-    uint32_t displayStartTime;
-    bool active;
-} tideState = {"", 0.0, 0, 0, false};
+TideState tideState = {"", 0.0, 0, 0, false};
 
 // Timer visualization state
-struct TimerState {
-    int totalSeconds;
-    uint32_t startTime;
-    bool active;
-} timerState = {0, 0, false};
+TimerState timerState = {0, 0, false};
 
 // Moon phase visualization state
-struct MoonState {
-    String phaseName;
-    int illumination;  // 0-100%
-    float moonAge;
-    uint32_t displayStartTime;
-    bool active;
-} moonState = {"", 0, 0.0, 0, false};
+MoonState moonState = {"", 0, 0.0, 0, false};
 
 // LED mutex for thread-safe access
 SemaphoreHandle_t ledMutex = NULL;
 
 // Ambient sound state
-struct AmbientSound {
-    String name;  // "rain", "ocean", "rainforest", "fire"
-    bool active;
-    uint16_t sequence;  // Increments each time we request a new sound
-    uint16_t discardedCount;  // Count discarded chunks to reduce log spam
-    uint32_t drainUntil;  // Timestamp until which we silently drain stale packets
-} ambientSound = {"", false, 0, 0, 0};
+AmbientSound ambientSound = {"", false, 0, 0, 0};
 
 // Pomodoro timer state
-struct PomodoroState {
-    enum Session { FOCUS, SHORT_BREAK, LONG_BREAK };
-    Session currentSession;
-    int sessionCount;        // Track completed focus sessions (0-3, resets at 4)
-    int totalSeconds;        // Duration of current session
-    uint32_t startTime;      // When current timer started (0 if not started)
-    uint32_t pausedTime;     // Time remaining when paused (0 if not paused)
-    bool active;             // Pomodoro mode active
-    bool paused;             // Timer paused
-    // Custom durations (in minutes)
-    int focusDuration;       // Focus session duration (default: 25)
-    int shortBreakDuration;  // Short break duration (default: 5)
-    int longBreakDuration;   // Long break duration (default: 15)
-    // Flash animation state (non-blocking)
-    bool flashing;           // Currently flashing completion indicator
-    uint8_t flashCount;      // Number of flashes completed (0-6: on/off/on/off/on/off)
-    uint32_t flashStartTime; // When current flash state started
-} pomodoroState = {PomodoroState::FOCUS, 0, 25 * 60, 0, 0, false, false, 25, 5, 15, false, 0, 0};
+PomodoroState pomodoroState = {PomodoroState::FOCUS, 0, 25 * 60, 0, 0, false, false, 25, 5, 15, false, 0, 0};
 
 // Meditation mode state
-struct MeditationState {
-    enum Chakra { ROOT, SACRAL, SOLAR, HEART, THROAT, THIRD_EYE, CROWN };
-    enum BreathPhase { INHALE, HOLD_TOP, EXHALE, HOLD_BOTTOM };
-    Chakra currentChakra;
-    BreathPhase phase;
-    uint32_t phaseStartTime;
-    bool active;             // Meditation mode active
-    bool streaming;          // Currently streaming meditation audio
-    float savedVolume;       // User's volume before meditation
-} meditationState = {MeditationState::ROOT, MeditationState::INHALE, 0, false, false, 1.0f};
+MeditationState meditationState = {MeditationState::ROOT, MeditationState::INHALE, 0, false, false, 1.0f};
 
 // Clock display state
-struct ClockState {
-    int lastHour;            // Last displayed hour
-    int lastMinute;          // Last displayed minute
-    int scrollPosition;      // Horizontal scroll position for rotating display
-    uint32_t lastScrollUpdate; // Last time scroll position updated
-    bool active;             // Clock mode active
-} clockState = {-1, -1, 0, 0, false};
+ClockState clockState = {-1, -1, 0, 0, false};
 
 // Lamp mode state
-struct LampState {
-    enum Color { WHITE, RED, GREEN, BLUE };
-    Color currentColor;      // Current target color
-    Color previousColor;     // Color being replaced
-    int currentRow;          // Current row being lit (0-11)
-    int currentCol;          // Current column within row (0-11)
-    uint32_t lastUpdate;     // Last LED update time
-    uint32_t ledStartTimes[NUM_LEDS]; // Start time for each LED fade
-    bool active;             // Lamp mode active
-    bool fullyLit;           // All LEDs fully lit
-    bool transitioning;      // Currently transitioning between colors
-} lampState = {LampState::WHITE, LampState::WHITE, 0, 0, 0, {0}, false, false, false};
+LampState lampState = {LampState::WHITE, LampState::WHITE, 0, 0, 0, {0}, false, false, false};
 
 // Alarm state
-#define MAX_ALARMS 10
-struct Alarm {
-    uint32_t alarmID;        // Unique ID from server
-    time_t triggerTime;      // Unix timestamp when alarm should trigger
-    bool enabled;            // Alarm is active
-    bool triggered;          // Alarm has been triggered (prevent re-trigger)
-    bool snoozed;            // Currently snoozed
-    time_t snoozeUntil;      // Wake up from snooze at this time
-} alarms[MAX_ALARMS];
+Alarm alarms[MAX_ALARMS];
 
-struct AlarmState {
-    bool ringing;            // Alarm currently ringing
-    uint32_t ringStartTime;  // When alarm started ringing
-    uint32_t pulseStartTime; // For LED animation timing
-    float pulseRadius;       // Current radius for center-outward pulse
-    bool active;             // Alarm system active
-    LEDMode previousMode;    // Mode before alarm triggered (to restore after dismissal)
-    bool wasRecording;       // If recording was active when alarm triggered
-    bool wasPlayingResponse; // If playing response when alarm triggered
-} alarmState = {false, 0, 0, 0.0f, false, LED_IDLE, false, false};
+AlarmState alarmState = {false, 0, 0, 0.0f, false, LED_IDLE, false, false};
 
 // Day/Night brightness control
-struct DayNightData {
-    bool valid;            // Have we received sunrise/sunset times?
-    uint32_t sunriseTime;  // Unix timestamp of today's sunrise
-    uint32_t sunsetTime;   // Unix timestamp of today's sunset
-    uint32_t lastUpdate;   // When we last received this data
-    bool isDaytime;        // Current day/night state
-    uint8_t currentBrightness; // Active brightness level
-};
 DayNightData dayNightData = {false, 0, 0, 0, true, LED_BRIGHTNESS_DAY};
 
 // ============== FORWARD DECLARATIONS ==============
@@ -245,7 +150,7 @@ void audioTask(void * parameter);
 void updateLEDs();
 bool initI2SMic();
 bool initI2SSpeaker();
-void handleWebSocketMessage(uint8_t* payload, size_t length);
+#include "ws_handler.h"
 bool detectVoiceActivity(int16_t* samples, size_t count);
 void sendAudioChunk(uint8_t* data, size_t length);
 void playStartupSound();
@@ -265,7 +170,7 @@ void startMarquee(String text, CRGB color, LEDMode nextMode) {
     frontMarquee.start();
     targetLEDMode = nextMode;
     currentLEDMode = LED_MARQUEE;
-    DEBUG_PRINT("📜 Starting marquee: '%s' -> mode %d\n", text.c_str(), nextMode);
+    DEBUG_PRINT("ðŸ“œ Starting marquee: '%s' -> mode %d\n", text.c_str(), nextMode);
 }
 
 // ============== HELPER FUNCTIONS ==============
@@ -311,7 +216,7 @@ void updateDayNightBrightness() {
         dayNightData.currentBrightness = shouldBeDaytime ? LED_BRIGHTNESS_DAY : LED_BRIGHTNESS_NIGHT;
         FastLED.setBrightness(dayNightData.currentBrightness);
         
-        Serial.printf("🌅 Brightness changed to %s mode (%d/255 = %.0f%%)\n",
+        Serial.printf("ðŸŒ… Brightness changed to %s mode (%d/255 = %.0f%%)\n",
                      shouldBeDaytime ? "DAY" : "NIGHT",
                      dayNightData.currentBrightness,
                      (dayNightData.currentBrightness / 255.0) * 100);
@@ -390,35 +295,35 @@ void setup() {
     Serial.flush();
     audioOutputQueue = xQueueCreate(AUDIO_QUEUE_SIZE, sizeof(AudioChunk));
     if (!audioOutputQueue) {
-        Serial.println("✗ Failed to create audio queue");
+        Serial.println("âœ— Failed to create audio queue");
         currentLEDMode = LED_ERROR;
         return;
     }
-    Serial.println("✓ Audio queue created");
+    Serial.println("âœ“ Audio queue created");
     Serial.flush();
     
     // Raw PCM streaming - no codec initialization needed
-    Serial.println("✓ Audio pipeline: Raw PCM (16-bit, 16kHz mic → 24kHz speaker)");
+    Serial.println("âœ“ Audio pipeline: Raw PCM (16-bit, 16kHz mic â†’ 24kHz speaker)");
 
     // Initialize I2S audio
     if (!initI2SMic()) {
-        Serial.println("✗ Microphone init failed");
+        Serial.println("âœ— Microphone init failed");
         currentLEDMode = LED_ERROR;
         return;
     }
-    Serial.println("✓ Microphone initialized");
+    Serial.println("âœ“ Microphone initialized");
 
     if (!initI2SSpeaker()) {
-        Serial.println("✗ Speaker init failed");
+        Serial.println("âœ— Speaker init failed");
         currentLEDMode = LED_ERROR;
         return;
     }
-    Serial.println("✓ Speaker initialized");
+    Serial.println("âœ“ Speaker initialized");
 
     // Initialize touch pads
     pinMode(TOUCH_PAD_START_PIN, INPUT_PULLDOWN);
     pinMode(TOUCH_PAD_STOP_PIN, INPUT_PULLDOWN);
-    Serial.printf("✓ Touch pads initialized (START=%d, STOP=%d)\n", 
+    Serial.printf("âœ“ Touch pads initialized (START=%d, STOP=%d)\n", 
                   digitalRead(TOUCH_PAD_START_PIN), 
                   digitalRead(TOUCH_PAD_STOP_PIN));
 
@@ -471,21 +376,21 @@ void setup() {
         
         if (WiFi.status() == WL_CONNECTED) {
             connected = true;
-            Serial.println("\n✓ WiFi connected");
+            Serial.println("\nâœ“ WiFi connected");
             Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
             Serial.printf("Signal: %d dBm\n", WiFi.RSSI());
             
             // Configure NTP time sync (GMT timezone)
             configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-            Serial.println("⏰ NTP time sync configured");
+            Serial.println("â° NTP time sync configured");
         } else {
             retryCount++;
-            Serial.printf("\n✗ Connection attempt failed (status: %d)\n", WiFi.status());
+            Serial.printf("\nâœ— Connection attempt failed (status: %d)\n", WiFi.status());
         }
     }
     
     if (!connected) {
-        Serial.println("✗ WiFi connection failed after all retries");
+        Serial.println("âœ— WiFi connection failed after all retries");
         currentLEDMode = LED_ERROR;
         return;
     }
@@ -496,26 +401,26 @@ void setup() {
     
     #if USE_SSL
     webSocket.beginSSL(EDGE_SERVER_HOST, EDGE_SERVER_PORT, wsPath.c_str(), "", "wss");
-    Serial.printf("✓ WebSocket initialized to wss://%s:%d%s\n", EDGE_SERVER_HOST, EDGE_SERVER_PORT, wsPath.c_str());
+    Serial.printf("âœ“ WebSocket initialized to wss://%s:%d%s\n", EDGE_SERVER_HOST, EDGE_SERVER_PORT, wsPath.c_str());
     #else
     webSocket.begin(EDGE_SERVER_HOST, EDGE_SERVER_PORT, wsPath.c_str());
-    Serial.printf("✓ WebSocket initialized to ws://%s:%d%s\n", EDGE_SERVER_HOST, EDGE_SERVER_PORT, wsPath.c_str());
+    Serial.printf("âœ“ WebSocket initialized to ws://%s:%d%s\n", EDGE_SERVER_HOST, EDGE_SERVER_PORT, wsPath.c_str());
     #endif
     
     webSocket.onEvent(onWebSocketEvent);
     webSocket.setReconnectInterval(WS_RECONNECT_INTERVAL);
     webSocket.enableHeartbeat(60000, 30000, 5);  // Ping every 60s, timeout 30s, 5 retries = ~210s tolerance
-    Serial.println("✓ WebSocket initialized with relaxed keepalive");
+    Serial.println("âœ“ WebSocket initialized with relaxed keepalive");
     
     // Note: TCP buffer sizes are controlled by lwIP configuration, not runtime changeable
-    Serial.println("✓ Using default TCP buffers (configured in sdkconfig)");
+    Serial.println("âœ“ Using default TCP buffers (configured in sdkconfig)");
 
     // Start FreeRTOS tasks
     // WebSocket needs high priority (3) and larger stack for heavy audio streaming
     xTaskCreatePinnedToCore(websocketTask, "WebSocket", 16384, NULL, 3, &websocketTaskHandle, CORE_1);  // Increased from 8KB to 16KB
     xTaskCreatePinnedToCore(ledTask, "LEDs", 4096, NULL, 0, &ledTaskHandle, CORE_0);
     xTaskCreatePinnedToCore(audioTask, "Audio", 32768, NULL, 2, &audioTaskHandle, CORE_1);  // 32KB for audio buffers + processing
-    Serial.println("✓ Tasks created on dual cores");
+    Serial.println("âœ“ Tasks created on dual cores");
     
     Serial.printf("=== Initialization Complete ===  [LEDMode: IDLE]\n");
     Serial.println("Touch START pad to begin recording");
@@ -574,7 +479,7 @@ void loop() {
                             alarmState.pulseStartTime = millis();
                             alarmState.pulseRadius = 0.0f;
                             currentLEDMode = LED_ALARM;
-                            DEBUG_PRINT("⏰ Alarm %u ringing after snooze! (interrupted mode: %d)\n", alarms[i].alarmID, alarmState.previousMode);
+                            DEBUG_PRINT("â° Alarm %u ringing after snooze! (interrupted mode: %d)\n", alarms[i].alarmID, alarmState.previousMode);
                             
                             // Play alarm sound
                             isPlayingAlarm = true;
@@ -585,7 +490,7 @@ void loop() {
                             alarmDoc["action"] = "requestAlarm";
                             String alarmMsg;
                             serializeJson(alarmDoc, alarmMsg);
-                            DEBUG_PRINTLN("🔔 Requesting alarm sound from server");
+                            DEBUG_PRINTLN("ðŸ”” Requesting alarm sound from server");
                             webSocket.sendTXT(alarmMsg);
                             
                             break;
@@ -604,7 +509,7 @@ void loop() {
                         alarmState.pulseStartTime = millis();
                         alarmState.pulseRadius = 0.0f;
                         currentLEDMode = LED_ALARM;
-                        DEBUG_PRINT("⏰ Alarm %u triggered at %s (interrupted mode: %d)\n", alarms[i].alarmID, asctime(&timeinfo), alarmState.previousMode);
+                        DEBUG_PRINT("â° Alarm %u triggered at %s (interrupted mode: %d)\n", alarms[i].alarmID, asctime(&timeinfo), alarmState.previousMode);
                         
                         // Play alarm sound
                         isPlayingAlarm = true;
@@ -615,7 +520,7 @@ void loop() {
                         alarmDoc["action"] = "requestAlarm";
                         String alarmMsg;
                         serializeJson(alarmDoc, alarmMsg);
-                        DEBUG_PRINTLN("🔔 Requesting alarm sound from server");
+                        DEBUG_PRINTLN("ðŸ”” Requesting alarm sound from server");
                         webSocket.sendTXT(alarmMsg);
                         
                         break;
@@ -657,13 +562,13 @@ void loop() {
         // Detect button 2 press start
         if (stopRisingEdge) {
             button2PressStart = millis();
-            Serial.println("🔘 Button 2 pressed (start)");
+            Serial.println("ðŸ”˜ Button 2 pressed (start)");
         }
         
         // Button 2 long-press: Return to IDLE and start Gemini recording (from any mode)
         if (stopFallingEdge && !recordingActive && 
             (millis() - button2PressStart) >= BUTTON2_LONG_PRESS) {
-            Serial.printf("🏠 Button 2 long-press (%lu ms): Returning to IDLE + starting recording\n",
+            Serial.printf("ðŸ  Button 2 long-press (%lu ms): Returning to IDLE + starting recording\n",
                          millis() - button2PressStart);
             
             // Stop any active mode
@@ -697,12 +602,12 @@ void loop() {
             
             // Clear Meditation
             if (meditationState.active) {
-                Serial.println("🛑 CLEARING meditation state (button 2 long press)");
+                Serial.println("ðŸ›‘ CLEARING meditation state (button 2 long press)");
                 meditationState.active = false;
                 meditationState.phaseStartTime = 0;
                 meditationState.streaming = false;
                 volumeMultiplier = meditationState.savedVolume;  // Restore volume
-                Serial.printf("🔊 Volume restored to %.0f%%\n", volumeMultiplier * 100);
+                Serial.printf("ðŸ”Š Volume restored to %.0f%%\n", volumeMultiplier * 100);
             }
             
             // Clear Clock
@@ -730,7 +635,7 @@ void loop() {
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
             currentLEDMode = LED_RECORDING;
-            DEBUG_PRINTLN("🎤 Recording started via long-press");
+            DEBUG_PRINTLN("ðŸŽ¤ Recording started via long-press");
             
             stopPressed = stopTouch;
             lastDebounceTime = millis();
@@ -738,7 +643,7 @@ void loop() {
         }
         
         // STOP button short press: Cycle through modes
-        // IDLE → AMBIENT_VU → AMBIENT → POMODORO → MEDITATION → IDLE
+        // IDLE â†’ AMBIENT_VU â†’ AMBIENT â†’ POMODORO â†’ MEDITATION â†’ IDLE
         // Allow during ambient modes, block only during Gemini responses (non-ambient)
         if (stopRisingEdge && !recordingActive && 
             !(isPlayingResponse && !isPlayingAmbient)) {
@@ -764,12 +669,12 @@ void loop() {
                 ambientVUMode = true;
                 ambientSound.sequence++;  // Increment for mode change
                 startMarquee("VU MODE", CRGB::Green, LED_AMBIENT_VU);
-                DEBUG_PRINTLN("🎵 Ambient VU meter mode enabled");
+                DEBUG_PRINTLN("ðŸŽµ Ambient VU meter mode enabled");
             } else if (modeToCheck == LED_AMBIENT_VU) {
                 ambientVUMode = false;
                 
                 // Switch to Sea Gooseberry jellyfish mode (no audio needed)
-                DEBUG_PRINTLN("🔄 VU → Sea Gooseberry mode");
+                DEBUG_PRINTLN("ðŸ”„ VU â†’ Sea Gooseberry mode");
                 seaGooseberry.begin();  // Initialize visualizer
                 startMarquee("SEA JELLY", CRGB(100, 200, 255), LED_SEA_GOOSEBERRY);
             } else if (modeToCheck == LED_SEA_GOOSEBERRY) {
@@ -785,7 +690,7 @@ void loop() {
                 
                 // Set drain period to discard any stale packets still in flight
                 ambientSound.drainUntil = millis() + 500;  // 500ms drain window
-                Serial.println("🗑️  Flushed audio queue for clean Jelly->Rain transition");
+                Serial.println("ðŸ—‘ï¸  Flushed audio queue for clean Jelly->Rain transition");
                 
                 currentAmbientSoundType = SOUND_RAIN;  // Start with rain
                 ambientSound.name = "rain";
@@ -795,13 +700,13 @@ void loop() {
                 isPlayingResponse = false;
                 firstAudioChunk = true;
                 lastAudioChunkTime = millis();  // Initialize timing
-                Serial.printf("🌧️  MODE: Rain (seq %d)\n", ambientSound.sequence);
+                Serial.printf("ðŸŒ§ï¸  MODE: Rain (seq %d)\n", ambientSound.sequence);
                 // Show marquee first
                 startMarquee("RAIN", CRGB(0, 100, 255), LED_AMBIENT);  // Blue for rain
                 // Audio request will be sent after marquee completes (see LED_MARQUEE case)
             } else if (modeToCheck == LED_AMBIENT) {
                 // Stop ambient sound and switch to Pomodoro mode
-                DEBUG_PRINTLN("🔄 Mode transition: AMBIENT → POMODORO (cleaning up...)");
+                DEBUG_PRINTLN("ðŸ”„ Mode transition: AMBIENT â†’ POMODORO (cleaning up...)");
                 
                 // Clear audio buffer to prevent bleed
                 i2s_zero_dma_buffer(I2S_NUM_1);
@@ -811,7 +716,7 @@ void loop() {
                 // Clear LED buffer to remove rain/ocean effects (with mutex)
                 if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
                     if (currentLEDMode == LED_MEDITATION) {
-                        DEBUG_PRINT("⚠️ INTERRUPTING meditation: mode transition clear\n");
+                        DEBUG_PRINT("âš ï¸ INTERRUPTING meditation: mode transition clear\n");
                     }
                     fill_solid(leds, NUM_LEDS, CRGB::Black);
                     FastLED.show();
@@ -850,11 +755,11 @@ void loop() {
                     pomodoroState.paused = true;  // Will auto-start after marquee
                 }
                 
-                DEBUG_PRINTLN("🍅 Pomodoro mode activated (will auto-start after marquee)");
+                DEBUG_PRINTLN("ðŸ… Pomodoro mode activated (will auto-start after marquee)");
                 startMarquee("POMODORO", CRGB(255, 100, 0), LED_POMODORO);  // Orange for pomodoro
             } else if (modeToCheck == LED_POMODORO) {
                 // Exit Pomodoro and go to Meditation
-                DEBUG_PRINTLN("⏹️  Pomodoro mode stopped");
+                DEBUG_PRINTLN("â¹ï¸  Pomodoro mode stopped");
                 
                 // Clear Pomodoro state
                 pomodoroState.active = false;
@@ -882,7 +787,7 @@ void loop() {
                 // Clear LED buffer to remove Pomodoro timer visualization (with mutex)
                 if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
                     if (currentLEDMode == LED_MEDITATION) {
-                        DEBUG_PRINT("⚠️ INTERRUPTING meditation: Pomodoro mode transition (2x clear)\n");
+                        DEBUG_PRINT("âš ï¸ INTERRUPTING meditation: Pomodoro mode transition (2x clear)\n");
                     }
                     fill_solid(leds, NUM_LEDS, CRGB::Black);
                     FastLED.show();
@@ -903,20 +808,20 @@ void loop() {
                 // Lower volume for meditation (prevents vibration/distortion)
                 meditationState.savedVolume = volumeMultiplier;
                 volumeMultiplier = 0.10f;  // 10% volume for meditation
-                DEBUG_PRINT("🔊 Volume: %.0f%% → 10%% for meditation\n", meditationState.savedVolume * 100);
+                DEBUG_PRINT("ðŸ”Š Volume: %.0f%% â†’ 10%% for meditation\n", meditationState.savedVolume * 100);
                 
-                Serial.println("🧘 Meditation mode - waiting for marquee to complete");
+                Serial.println("ðŸ§˜ Meditation mode - waiting for marquee to complete");
                 startMarquee("MEDITATION", CRGB(255, 0, 255), LED_MEDITATION);  // Magenta
             } else if (modeToCheck == LED_MEDITATION) {
                 // Exit Meditation and go to Clock
-                DEBUG_PRINTLN("⏹️  Meditation mode stopped");
+                DEBUG_PRINTLN("â¹ï¸  Meditation mode stopped");
                 
                 // Clear meditation state
                 meditationState.active = false;
                 meditationState.phaseStartTime = 0;
                 meditationState.streaming = false;
                 volumeMultiplier = meditationState.savedVolume;  // Restore volume
-                Serial.printf("🔊 Volume restored to %.0f%%\n", volumeMultiplier * 100);
+                Serial.printf("ðŸ”Š Volume restored to %.0f%%\n", volumeMultiplier * 100);
                 
                 // Stop any audio
                 JsonDocument stopDoc;
@@ -942,11 +847,11 @@ void loop() {
                 clockState.scrollPosition = 0;
                 clockState.lastScrollUpdate = millis();
                 
-                DEBUG_PRINTLN("🕐 Clock mode activated");
+                DEBUG_PRINTLN("ðŸ• Clock mode activated");
                 startMarquee("CLOCK", CRGB::White, LED_CLOCK);
             } else if (modeToCheck == LED_CLOCK) {
                 // Exit Clock and go to Lamp
-                DEBUG_PRINTLN("⏹️  Clock mode stopped");
+                DEBUG_PRINTLN("â¹ï¸  Clock mode stopped");
                 
                 // Clear clock state
                 clockState.active = false;
@@ -967,11 +872,11 @@ void loop() {
                     lampState.ledStartTimes[i] = 0;
                 }
                 
-                DEBUG_PRINTLN("💡 Lamp mode activated");
+                DEBUG_PRINTLN("ðŸ’¡ Lamp mode activated");
                 startMarquee("LAMP", CRGB::White, LED_LAMP);
             } else if (modeToCheck == LED_LAMP) {
                 // Exit Lamp and go to Sea Gooseberry mode
-                DEBUG_PRINTLN("⏹️  Lamp mode stopped");
+                DEBUG_PRINTLN("â¹ï¸  Lamp mode stopped");
                 
                 // Clear lamp state
                 lampState.active = false;
@@ -980,22 +885,22 @@ void loop() {
                 // Initialize Sea Gooseberry visualizer
                 seaGooseberry.begin();
                 
-                DEBUG_PRINTLN("🌊 Sea Gooseberry mode activated");
+                DEBUG_PRINTLN("ðŸŒŠ Sea Gooseberry mode activated");
                 startMarquee("SEA JELLY", CRGB(100, 200, 255), LED_SEA_GOOSEBERRY);
             } else if (modeToCheck == LED_SEA_GOOSEBERRY) {
                 // Exit Sea Gooseberry and go to Eye Animation mode
-                DEBUG_PRINTLN("⏹️  Sea Gooseberry mode stopped");
+                DEBUG_PRINTLN("â¹ï¸  Sea Gooseberry mode stopped");
                 
                 // Initialize Eye Animation visualizer
                 eyeAnimation.begin();
                 
-                DEBUG_PRINTLN("👁️  Eye Animation mode activated");
+                DEBUG_PRINTLN("ðŸ‘ï¸  Eye Animation mode activated");
                 startMarquee("EYES", CRGB::White, LED_EYES);
             } else if (modeToCheck == LED_EYES) {
                 // Exit Eye Animation and return to IDLE
-                DEBUG_PRINTLN("⏹️  Eye Animation mode stopped");
+                DEBUG_PRINTLN("â¹ï¸  Eye Animation mode stopped");
                 
-                DEBUG_PRINTLN("💤 Returning to IDLE mode");
+                DEBUG_PRINTLN("ðŸ’¤ Returning to IDLE mode");
                 currentLEDMode = LED_IDLE;
                 targetLEDMode = LED_IDLE;
                 meditationState.phaseStartTime = 0;
@@ -1003,11 +908,11 @@ void loop() {
                 
                 // Restore original volume
                 volumeMultiplier = meditationState.savedVolume;
-                DEBUG_PRINT("🔊 Volume restored to %.0f%%\n", volumeMultiplier * 100);
+                DEBUG_PRINT("ðŸ”Š Volume restored to %.0f%%\n", volumeMultiplier * 100);
                 
                 // Clear LED buffer to remove meditation breathing visualization (with mutex)
                 if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-                    DEBUG_PRINT("🧘 Exiting meditation: clearing LEDs\n");
+                    DEBUG_PRINT("ðŸ§˜ Exiting meditation: clearing LEDs\n");
                     fill_solid(leds, NUM_LEDS, CRGB::Black);
                     FastLED.show();
                     xSemaphoreGive(ledMutex);
@@ -1031,7 +936,7 @@ void loop() {
         // VU meter mode: Button 1 disabled (button 2 advances to next mode)
         // Skip START button handling in VU mode
         if (currentLEDMode == LED_AMBIENT_VU && startRisingEdge) {
-            DEBUG_PRINTLN("⚠️  Button 1 disabled in VU mode - use button 2 to advance");
+            DEBUG_PRINTLN("âš ï¸  Button 1 disabled in VU mode - use button 2 to advance");
             // Do nothing - button 1 is disabled in VU mode
         }
         // Ambient mode & Sea Gooseberry: Button 1 cycles to ambient sounds
@@ -1054,29 +959,29 @@ void loop() {
             if (currentLEDMode == LED_SEA_GOOSEBERRY) {
                 currentAmbientSoundType = SOUND_RAIN;
                 ambientSound.name = "rain";
-                Serial.printf("🌧️  MODE: Rain (seq %d)\n", ambientSound.sequence + 1);
+                Serial.printf("ðŸŒ§ï¸  MODE: Rain (seq %d)\n", ambientSound.sequence + 1);
                 startMarquee("RAIN", CRGB(0, 100, 255), LED_AMBIENT);  // Blue
             }
             // Cycle to next sound in Ambient mode
             else if (currentAmbientSoundType == SOUND_RAIN) {
                 currentAmbientSoundType = SOUND_OCEAN;
                 ambientSound.name = "ocean";
-                Serial.printf("🌊 MODE: Ocean (seq %d)\n", ambientSound.sequence + 1);
+                Serial.printf("ðŸŒŠ MODE: Ocean (seq %d)\n", ambientSound.sequence + 1);
                 startMarquee("OCEAN", CRGB(0, 150, 200), LED_AMBIENT);  // Cyan
             } else if (currentAmbientSoundType == SOUND_OCEAN) {
                 currentAmbientSoundType = SOUND_RAINFOREST;
                 ambientSound.name = "rainforest";
-                Serial.printf("🌿 MODE: Rainforest (seq %d)\n", ambientSound.sequence + 1);
+                Serial.printf("ðŸŒ¿ MODE: Rainforest (seq %d)\n", ambientSound.sequence + 1);
                 startMarquee("FOREST", CRGB(50, 255, 50), LED_AMBIENT);  // Green
             } else if (currentAmbientSoundType == SOUND_RAINFOREST) {
                 currentAmbientSoundType = SOUND_FIRE;
                 ambientSound.name = "fire";
-                Serial.printf("🔥 MODE: Fire (seq %d)\n", ambientSound.sequence + 1);
+                Serial.printf("ðŸ”¥ MODE: Fire (seq %d)\n", ambientSound.sequence + 1);
                 startMarquee("FIRE", CRGB(255, 100, 0), LED_AMBIENT);  // Orange
             } else {  // SOUND_FIRE
                 currentAmbientSoundType = SOUND_RAIN;
                 ambientSound.name = "rain";
-                Serial.printf("🌧️  MODE: Rain (seq %d)\n", ambientSound.sequence + 1);
+                Serial.printf("ðŸŒ§ï¸  MODE: Rain (seq %d)\n", ambientSound.sequence + 1);
                 startMarquee("RAIN", CRGB(0, 100, 255), LED_AMBIENT);  // Blue
             }
             
@@ -1113,14 +1018,14 @@ void loop() {
                     if (pomodoroState.paused) {
                         // Resume from paused state
                         // Use the totalSeconds already stored when the session started.
-                        // Do NOT re-derive from focusDuration etc. — those may have been changed
+                        // Do NOT re-derive from focusDuration etc. â€” those may have been changed
                         // by voice command between when the session started and when it was paused.
                         int timeAlreadyElapsed = pomodoroState.totalSeconds - pomodoroState.pausedTime;
                         pomodoroState.startTime = millis() - (timeAlreadyElapsed * 1000);
                         pomodoroState.pausedTime = 0;
                         pomodoroState.paused = false;
                         
-                        DEBUG_PRINT("▶️  Pomodoro resumed from %d seconds remaining (long press)\n", pomodoroState.totalSeconds - timeAlreadyElapsed);
+                        DEBUG_PRINT("â–¶ï¸  Pomodoro resumed from %d seconds remaining (long press)\n", pomodoroState.totalSeconds - timeAlreadyElapsed);
                         // No sound on resume - user will source alternative
                     } else {
                         // Pause and save current position
@@ -1128,7 +1033,7 @@ void loop() {
                         pomodoroState.pausedTime = max(0, pomodoroState.totalSeconds - (int)elapsed);
                         pomodoroState.startTime = 0;
                         pomodoroState.paused = true;
-                        DEBUG_PRINT("⏸️  Pomodoro paused at %d seconds remaining (long press)\n", pomodoroState.pausedTime);
+                        DEBUG_PRINT("â¸ï¸  Pomodoro paused at %d seconds remaining (long press)\n", pomodoroState.pausedTime);
                         // No sound on pause - user will source alternative
                     }
                     lastPomodoroAction = millis();
@@ -1143,7 +1048,7 @@ void loop() {
         if (currentLEDMode == LED_MEDITATION && meditationState.active && startRisingEdge) {
             meditationHandled = true;  // Mark as handled to skip other button handlers
             
-            Serial.printf("🧘 Button 1: Advancing from chakra %d (%s) | edge detected\n", 
+            Serial.printf("ðŸ§˜ Button 1: Advancing from chakra %d (%s) | edge detected\n", 
                          meditationState.currentChakra, CHAKRA_NAMES[meditationState.currentChakra]);
             
             // CRITICAL: Stop audio playback completely to prevent glitches
@@ -1165,7 +1070,7 @@ void loop() {
             while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {
                 // Drain all queued audio packets
             }
-            Serial.printf("🗑️  Flushed audio queue for clean transition\n");
+            Serial.printf("ðŸ—‘ï¸  Flushed audio queue for clean transition\n");
             
             // Set drain period to discard any stale packets still in flight
             ambientSound.drainUntil = millis() + 500;  // 500ms drain window
@@ -1175,7 +1080,7 @@ void loop() {
                 // Advance to next chakra (breathing continues smoothly)
                 meditationState.currentChakra = (MeditationState::Chakra)(meditationState.currentChakra + 1);
                 
-                Serial.printf("🧘 Advanced to chakra %d (%s) - breathing continues\n", 
+                Serial.printf("ðŸ§˜ Advanced to chakra %d (%s) - breathing continues\n", 
                              meditationState.currentChakra, CHAKRA_NAMES[meditationState.currentChakra]);
                 
                 // Request new chakra sound (om001, om002, ..., om007)
@@ -1197,10 +1102,10 @@ void loop() {
                 firstAudioChunk = true;
                 lastAudioChunkTime = millis();
                 
-                Serial.printf("✅ Chakra advance complete: %s ready to stream\n", soundName);
+                Serial.printf("âœ… Chakra advance complete: %s ready to stream\n", soundName);
             } else {
                 // At final chakra - complete meditation
-                Serial.println("🧘 At CROWN chakra - meditation complete");
+                Serial.println("ðŸ§˜ At CROWN chakra - meditation complete");
                 
                 // Stop audio playback completely
                 isPlayingAmbient = false;
@@ -1224,7 +1129,7 @@ void loop() {
                 
                 // Restore volume
                 volumeMultiplier = meditationState.savedVolume;
-                Serial.printf("🔊 Volume restored to %.0f%%\n", volumeMultiplier * 100);
+                Serial.printf("ðŸ”Š Volume restored to %.0f%%\n", volumeMultiplier * 100);
                 
                 // Clear ambient audio state
                 ambientSound.active = false;
@@ -1239,7 +1144,7 @@ void loop() {
                     xSemaphoreGive(ledMutex);
                 }
                 
-                Serial.println("✅ Meditation state fully cleared - returning to idle");
+                Serial.println("âœ… Meditation state fully cleared - returning to idle");
                 
                 // Return to idle with marquee (no sound)
                 startMarquee("COMPLETE", CRGB(255, 255, 255), LED_IDLE);
@@ -1250,7 +1155,7 @@ void loop() {
         // Note: Pomodoro now allowed - button 1 can interrupt responses during Pomodoro
         else if (!meditationHandled && currentLEDMode != LED_MEDITATION && startRisingEdge && isPlayingResponse && !turnComplete && 
             (millis() - lastAudioChunkTime) < 500) {
-            DEBUG_PRINTLN("⏸️  Interrupted response - starting new recording");
+            DEBUG_PRINTLN("â¸ï¸  Interrupted response - starting new recording");
             responseInterrupted = true;  // Flag to ignore remaining audio chunks
             isPlayingResponse = false;
             i2s_zero_dma_buffer(I2S_NUM_1);  // Stop audio immediately
@@ -1259,16 +1164,16 @@ void loop() {
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
             currentLEDMode = LED_RECORDING;
-            DEBUG_PRINT("🎤 Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
+            DEBUG_PRINT("ðŸŽ¤ Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
         }
         // ALARM MODE: Button 1 or 2 dismisses alarm
         else if (currentLEDMode == LED_ALARM && alarmState.ringing && (startRisingEdge || stopRisingEdge)) {
-            DEBUG_PRINTLN("⏰ Alarm dismissed");
+            DEBUG_PRINTLN("â° Alarm dismissed");
             
             // Clear alarm from memory
             for (int i = 0; i < MAX_ALARMS; i++) {
                 if (alarms[i].enabled && !alarms[i].triggered) {
-                    DEBUG_PRINT("✓ Alarm %u dismissed and cleared from slot %d\n", alarms[i].alarmID, i);
+                    DEBUG_PRINT("âœ“ Alarm %u dismissed and cleared from slot %d\n", alarms[i].alarmID, i);
                     
                     // Zero out the alarm slot
                     alarms[i].alarmID = 0;
@@ -1293,7 +1198,7 @@ void loop() {
             String stopMsg;
             serializeJson(stopDoc, stopMsg);
             webSocket.sendTXT(stopMsg);
-            DEBUG_PRINTLN("🔕 Sent stop alarm request to server");
+            DEBUG_PRINTLN("ðŸ”• Sent stop alarm request to server");
             
             // Stop I2S output - let buffered audio drain naturally
             i2s_zero_dma_buffer(I2S_NUM_1);
@@ -1302,7 +1207,7 @@ void loop() {
             // (clearing queue while audio task is active causes crashes)
             
             // Restore previous mode
-            DEBUG_PRINT("↩️  Restoring previous mode: %d (recording=%d, playing=%d)\n", 
+            DEBUG_PRINT("â†©ï¸  Restoring previous mode: %d (recording=%d, playing=%d)\n", 
                          alarmState.previousMode, alarmState.wasRecording, alarmState.wasPlayingResponse);
             
             currentLEDMode = alarmState.previousMode;
@@ -1310,14 +1215,14 @@ void loop() {
             // Restore recording state if it was active
             if (alarmState.wasRecording) {
                 recordingActive = true;
-                DEBUG_PRINTLN("↩️  Resuming recording");
+                DEBUG_PRINTLN("â†©ï¸  Resuming recording");
             }
             
             // Restore playback state if it was active
             if (alarmState.wasPlayingResponse) {
                 isPlayingResponse = true;
                 lastAudioChunkTime = millis();  // Reset timeout
-                DEBUG_PRINTLN("↩️  Resuming audio playback");
+                DEBUG_PRINTLN("â†©ï¸  Resuming audio playback");
             }
             
             // Check if any more alarms are active
@@ -1334,7 +1239,7 @@ void loop() {
             
             playVolumeChime();  // Confirmation beep
         }
-        // LAMP MODE: Button 1 cycles colors (WHITE → RED → GREEN → BLUE)
+        // LAMP MODE: Button 1 cycles colors (WHITE â†’ RED â†’ GREEN â†’ BLUE)
         else if (!meditationHandled && currentLEDMode == LED_LAMP && lampState.active && startRisingEdge) {
             // Cycle to next color
             lampState.previousColor = lampState.currentColor;
@@ -1352,7 +1257,7 @@ void loop() {
                 lampState.ledStartTimes[i] = 0;
             }
             
-            DEBUG_PRINT("🎨 Lamp color: %s → %s\n", 
+            DEBUG_PRINT("ðŸŽ¨ Lamp color: %s â†’ %s\n", 
                          (const char*[]){"WHITE", "RED", "GREEN", "BLUE"}[lampState.previousColor], 
                          (const char*[]){"WHITE", "RED", "GREEN", "BLUE"}[lampState.currentColor]);
         }
@@ -1369,7 +1274,7 @@ void loop() {
                     // Only start recording if SHORT press (long press handled above for pause/resume)
                     if (pressDuration < LONG_PRESS_DURATION) {
                         shouldStartRecording = true;
-                        DEBUG_PRINTLN("🎤 Short press detected in Pomodoro - starting Gemini");
+                        DEBUG_PRINTLN("ðŸŽ¤ Short press detected in Pomodoro - starting Gemini");
                     }
                 }
             } else {
@@ -1380,7 +1285,7 @@ void loop() {
             if (shouldStartRecording) {
             // Additional safety: don't start recording if alarm is ringing
             if (alarmState.ringing) {
-                DEBUG_PRINTLN("⚠️  Cannot start recording - alarm is ringing");
+                DEBUG_PRINTLN("âš ï¸  Cannot start recording - alarm is ringing");
                 return;  // Button state already updated above
             }
             
@@ -1395,21 +1300,21 @@ void loop() {
             
             // CRITICAL: Cancel drain timer so Gemini responses can play
             if (ambientSound.drainUntil > 0) {
-                DEBUG_PRINTLN("✓ Cancelled drain timer - ready for new audio");
+                DEBUG_PRINTLN("âœ“ Cancelled drain timer - ready for new audio");
                 ambientSound.drainUntil = 0;
             }
             
             // Exit ambient VU mode
             if (ambientVUMode) {
                 ambientVUMode = false;
-                DEBUG_PRINTLN("🎵 Ambient VU meter mode disabled");
+                DEBUG_PRINTLN("ðŸŽµ Ambient VU meter mode disabled");
             }
             
             recordingActive = true;
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
             currentLEDMode = LED_RECORDING;
-            DEBUG_PRINT("🎤 Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
+            DEBUG_PRINT("ðŸŽ¤ Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
             }  // End of shouldStartRecording block
         }
         
@@ -1421,7 +1326,7 @@ void loop() {
                 currentLEDMode = LED_PROCESSING;
                 processingStartTime = millis();
             }
-            DEBUG_PRINT("⏹️  Recording stopped - Duration: %dms (max duration reached)\n", millis() - recordingStartTime);
+            DEBUG_PRINT("â¹ï¸  Recording stopped - Duration: %dms (max duration reached)\n", millis() - recordingStartTime);
         }
         
         lastDebounceTime = millis();
@@ -1438,7 +1343,7 @@ void loop() {
             processingStartTime = millis();
             // Stay in recording mode for now
         }
-        DEBUG_PRINTLN("⏹️  Recording stopped - Silence detected");
+        DEBUG_PRINTLN("â¹ï¸  Recording stopped - Silence detected");
     }
     
     // Show thinking animation if response is taking too long (after delay)
@@ -1446,33 +1351,33 @@ void loop() {
         (millis() - processingStartTime) > THINKING_ANIMATION_DELAY_MS && 
         (millis() - processingStartTime) < 10000) {
         currentLEDMode = LED_PROCESSING;
-        DEBUG_PRINTLN("⏳ Response delayed - showing thinking animation");
+        DEBUG_PRINTLN("â³ Response delayed - showing thinking animation");
     }
     
     // Timeout PROCESSING mode if no response after 10 seconds
     if ((currentLEDMode == LED_PROCESSING || currentLEDMode == LED_RECORDING) && 
         processingStartTime > 0 && (millis() - processingStartTime) > 10000) {
-        DEBUG_PRINT("⚠️  Processing timeout after 10s - no response received (mode was %d)\n", currentLEDMode);
+        DEBUG_PRINT("âš ï¸  Processing timeout after 10s - no response received (mode was %d)\n", currentLEDMode);
         processingStartTime = 0;
         
         // Return to visualizations if active, otherwise IDLE
         if (pomodoroState.active) {
             currentLEDMode = LED_POMODORO;
-            DEBUG_PRINTLN("↩️  Timeout - returning to POMODORO display");
+            DEBUG_PRINTLN("â†©ï¸  Timeout - returning to POMODORO display");
         } else if (timerState.active) {
             currentLEDMode = LED_TIMER;
-            DEBUG_PRINTLN("↩️  Timeout - returning to TIMER display");
+            DEBUG_PRINTLN("â†©ï¸  Timeout - returning to TIMER display");
         } else if (moonState.active) {
             currentLEDMode = LED_MOON;
             moonState.displayStartTime = millis();
-            DEBUG_PRINTLN("↩️  Timeout - returning to MOON display");
+            DEBUG_PRINTLN("â†©ï¸  Timeout - returning to MOON display");
         } else if (tideState.active) {
             currentLEDMode = LED_TIDE;
             tideState.displayStartTime = millis();
-            DEBUG_PRINTLN("↩️  Timeout - returning to TIDE display");
+            DEBUG_PRINTLN("â†©ï¸  Timeout - returning to TIDE display");
         } else {
             currentLEDMode = LED_IDLE;
-            DEBUG_PRINTLN("↩️  Timeout - returning to IDLE");
+            DEBUG_PRINTLN("â†©ï¸  Timeout - returning to IDLE");
         }
     }
     
@@ -1486,7 +1391,7 @@ void loop() {
         
         if (noNewPackets && queueDrained) {
             isPlayingResponse = false;
-            DEBUG_PRINT("⏹️  Audio playback complete (timeout + queue drained to %u), turnComplete=%d\n", queueDepth, turnComplete);
+            DEBUG_PRINT("â¹ï¸  Audio playback complete (timeout + queue drained to %u), turnComplete=%d\n", queueDepth, turnComplete);
         
         // Check if turn is complete - if so, decide what to show
         // Skip conversation mode for startup greeting
@@ -1496,31 +1401,31 @@ void loop() {
             conversationMode = true;
             conversationWindowStart = millis();
             currentLEDMode = LED_CONVERSATION_WINDOW;
-            Serial.println("💬 Conversation window opened - speak anytime in next 10 seconds");
+            Serial.println("ðŸ’¬ Conversation window opened - speak anytime in next 10 seconds");
         } else {
             // Turn not complete - show visualizations or return to idle/ambient
             // Priority: Pomodoro > Timer > Moon > Tide > Ambient VU > Idle
             if (pomodoroState.active) {
                 currentLEDMode = LED_POMODORO;
-                DEBUG_PRINTLN("✓ Audio playback complete - switching to POMODORO display");
+                DEBUG_PRINTLN("âœ“ Audio playback complete - switching to POMODORO display");
             } else if (timerState.active) {
                 currentLEDMode = LED_TIMER;
-                DEBUG_PRINTLN("✓ Audio playback complete - switching to TIMER display");
+                DEBUG_PRINTLN("âœ“ Audio playback complete - switching to TIMER display");
             } else if (moonState.active) {
                 currentLEDMode = LED_MOON;
                 moonState.displayStartTime = millis();
-                DEBUG_PRINTLN("✓ Audio playback complete - switching to MOON display");
+                DEBUG_PRINTLN("âœ“ Audio playback complete - switching to MOON display");
             } else if (tideState.active) {
                 currentLEDMode = LED_TIDE;
                 tideState.displayStartTime = millis();
-                DEBUG_PRINT("✓ Audio playback complete - switching to TIDE display (state=%s, level=%.2f)\n", 
+                DEBUG_PRINT("âœ“ Audio playback complete - switching to TIDE display (state=%s, level=%.2f)\n", 
                              tideState.state.c_str(), tideState.waterLevel);
             } else if (ambientVUMode) {
                 currentLEDMode = LED_AMBIENT_VU;
-                DEBUG_PRINTLN("✓ Audio playback complete - returning to AMBIENT VU mode");
+                DEBUG_PRINTLN("âœ“ Audio playback complete - returning to AMBIENT VU mode");
             } else {
                 currentLEDMode = LED_IDLE;
-                DEBUG_PRINTLN("✓ Audio playback complete - switching to IDLE");
+                DEBUG_PRINTLN("âœ“ Audio playback complete - switching to IDLE");
             }
         }
         }
@@ -1564,7 +1469,7 @@ void loop() {
         int secondsRemaining = pomodoroState.totalSeconds - (int)elapsed;
         
         if (secondsRemaining <= 0) {
-            DEBUG_PRINTLN("⏰ Pomodoro session complete!");
+            DEBUG_PRINTLN("â° Pomodoro session complete!");
             
             // Start non-blocking flash animation
             pomodoroState.flashing = true;
@@ -1580,7 +1485,7 @@ void loop() {
                 
                 if (pomodoroState.sessionCount >= 4) {
                     // After 4 focus sessions, take a long break
-                    DEBUG_PRINT("🍅 → 🟦 Focus complete! Starting long break (%d min)\n", pomodoroState.longBreakDuration);
+                    DEBUG_PRINT("ðŸ… â†’ ðŸŸ¦ Focus complete! Starting long break (%d min)\n", pomodoroState.longBreakDuration);
                     pomodoroState.currentSession = PomodoroState::LONG_BREAK;
                     pomodoroState.totalSeconds = pomodoroState.longBreakDuration * 60;
                     startMarquee("LONG BREAK", CRGB(0, 100, 255), LED_POMODORO);
@@ -1591,7 +1496,7 @@ void loop() {
                     pomodoroState.paused = false;
                 } else {
                     // Normal short break after focus
-                    DEBUG_PRINT("🍅 → 🟩 Focus complete! Starting short break (%d min) [%d/4]\n", pomodoroState.shortBreakDuration, pomodoroState.sessionCount);
+                    DEBUG_PRINT("ðŸ… â†’ ðŸŸ© Focus complete! Starting short break (%d min) [%d/4]\n", pomodoroState.shortBreakDuration, pomodoroState.sessionCount);
                     pomodoroState.currentSession = PomodoroState::SHORT_BREAK;
                     pomodoroState.totalSeconds = pomodoroState.shortBreakDuration * 60;
                     startMarquee("SHORT BREAK", CRGB(0, 255, 0), LED_POMODORO);
@@ -1603,7 +1508,7 @@ void loop() {
                 }
             } else if (pomodoroState.currentSession == PomodoroState::LONG_BREAK) {
                 // Long break complete - END OF CYCLE, return to IDLE
-                DEBUG_PRINTLN("🟦 → 🛑 Long break complete! Pomodoro cycle finished - returning to IDLE");
+                DEBUG_PRINTLN("ðŸŸ¦ â†’ ðŸ›‘ Long break complete! Pomodoro cycle finished - returning to IDLE");
                 pomodoroState.active = false;
                 pomodoroState.currentSession = PomodoroState::FOCUS;
                 pomodoroState.totalSeconds = pomodoroState.focusDuration * 60;
@@ -1614,7 +1519,7 @@ void loop() {
                 startMarquee("COMPLETE", CRGB(255, 255, 0), LED_IDLE);  // Return to IDLE with yellow completion
             } else {
                 // Short break complete, return to focus
-                DEBUG_PRINT("🟩 → 🍅 Break complete! Starting focus session (%d min)\n", pomodoroState.focusDuration);
+                DEBUG_PRINT("ðŸŸ© â†’ ðŸ… Break complete! Starting focus session (%d min)\n", pomodoroState.focusDuration);
                 pomodoroState.currentSession = PomodoroState::FOCUS;
                 pomodoroState.totalSeconds = pomodoroState.focusDuration * 60;
                 startMarquee("FOCUS TIME", CRGB(255, 0, 0), LED_POMODORO);
@@ -1632,7 +1537,7 @@ void loop() {
     // Skip this check for meditation mode (has its own completion handler)
     if (isPlayingAmbient && ambientSound.active && !firstAudioChunk && 
         (millis() - lastAudioChunkTime) > 7000 && currentLEDMode != LED_MEDITATION) {
-        Serial.printf("✓ Ambient sound completed: %s - returning to IDLE\n", ambientSound.name.c_str());
+        Serial.printf("âœ“ Ambient sound completed: %s - returning to IDLE\n", ambientSound.name.c_str());
         
         // Return to IDLE mode
         currentLEDMode = LED_IDLE;
@@ -1649,13 +1554,13 @@ void loop() {
         
         if (currentLEDMode == LED_TIDE && tideState.active) {
             if (millis() - tideState.displayStartTime > 10000) {
-                Serial.println("🌊 Tide display complete - opening conversation window");
+                Serial.println("ðŸŒŠ Tide display complete - opening conversation window");
                 tideState.active = false;
                 shouldOpenConversation = true;
             }
         } else if (currentLEDMode == LED_MOON && moonState.active) {
             if (millis() - moonState.displayStartTime > 10000) {
-                Serial.println("🌙 Moon display complete - opening conversation window");
+                Serial.println("ðŸŒ™ Moon display complete - opening conversation window");
                 moonState.active = false;
                 shouldOpenConversation = true;
             }
@@ -1663,12 +1568,12 @@ void loop() {
         // Note: Timer has its own expiry logic and shouldn't auto-transition
         
         if (shouldOpenConversation) {
-            Serial.printf("🔄 Transition to conversation: LED=%d, recording=%d, playing=%d, alarm=%d\n",
+            Serial.printf("ðŸ”„ Transition to conversation: LED=%d, recording=%d, playing=%d, alarm=%d\n",
                          currentLEDMode, recordingActive, isPlayingResponse, alarmState.ringing);
             conversationMode = true;
             conversationWindowStart = millis();
             currentLEDMode = LED_CONVERSATION_WINDOW;
-            Serial.println("💬 Conversation window opened - speak anytime in next 10 seconds");
+            Serial.println("ðŸ’¬ Conversation window opened - speak anytime in next 10 seconds");
         }
     }
     
@@ -1679,7 +1584,7 @@ void loop() {
         // Debug every 2 seconds - show current state
         static uint32_t lastDebugPrint = 0;
         if (millis() - lastDebugPrint > 2000) {
-            Serial.printf("💬 [CONV] active, window=%ums/%u, LED=%d, turnComplete=%d\n", 
+            Serial.printf("ðŸ’¬ [CONV] active, window=%ums/%u, LED=%d, turnComplete=%d\n", 
                          elapsed, CONVERSATION_WINDOW_MS, currentLEDMode, turnComplete);
             lastDebugPrint = millis();
         }
@@ -1698,7 +1603,7 @@ void loop() {
                 conversationVADDetected = false;  // Consume the flag
                 
                 // Voice detected - log and start recording
-                Serial.printf("🎤 Voice detected in conversation window - avgAmp=%d, starting recording\n", (int)currentAudioLevel);
+                Serial.printf("ðŸŽ¤ Voice detected in conversation window - avgAmp=%d, starting recording\n", (int)currentAudioLevel);
                 
                 // Exit conversation mode and start recording
                 conversationMode = false;
@@ -1710,31 +1615,31 @@ void loop() {
                 currentLEDMode = LED_RECORDING;
                 lastDebounceTime = millis();
                 
-                Serial.printf("✅ Recording mode activated: LED=%d, audioLevel=%d\n", currentLEDMode, (int)currentAudioLevel);
+                Serial.printf("âœ… Recording mode activated: LED=%d, audioLevel=%d\n", currentLEDMode, (int)currentAudioLevel);
             }
         } else {
             // Window expired with no voice - return to visualizations or idle
-            Serial.println("💬 Conversation window expired");
+            Serial.println("ðŸ’¬ Conversation window expired");
             conversationMode = false;
             
             // Priority: Pomodoro > Timer > Moon > Tide > Idle
             if (pomodoroState.active) {
                 currentLEDMode = LED_POMODORO;
-                Serial.println("↩️  Returning to POMODORO display");
+                Serial.println("â†©ï¸  Returning to POMODORO display");
             } else if (timerState.active) {
                 currentLEDMode = LED_TIMER;
-                Serial.println("↩️  Returning to TIMER display");
+                Serial.println("â†©ï¸  Returning to TIMER display");
             } else if (moonState.active) {
                 currentLEDMode = LED_MOON;
                 moonState.displayStartTime = millis();
-                Serial.println("↩️  Returning to MOON display");
+                Serial.println("â†©ï¸  Returning to MOON display");
             } else if (tideState.active) {
                 currentLEDMode = LED_TIDE;
                 tideState.displayStartTime = millis();
-                Serial.println("↩️  Returning to TIDE display");
+                Serial.println("â†©ï¸  Returning to TIDE display");
             } else {
                 currentLEDMode = LED_IDLE;
-                Serial.println("↩️  Returning to IDLE");
+                Serial.println("â†©ï¸  Returning to IDLE");
             }
         }
     }
@@ -1843,7 +1748,7 @@ void audioTask(void * parameter) {
                 audioBufferIndex = (audioBufferIndex + 1) % AUDIO_DELAY_BUFFER_SIZE;
                 currentAudioLevel = audioLevelBuffer[audioBufferIndex];
                 
-                // Convert mono → stereo with volume
+                // Convert mono â†’ stereo with volume
                 for (int i = 0; i < numSamples; i++) {
                     int32_t sample = (int32_t)(pcmSamples[i] * volumeMultiplier);
                     if (sample > 32767) sample = 32767;
@@ -1857,7 +1762,7 @@ void audioTask(void * parameter) {
                 esp_err_t result = i2s_write(I2S_NUM_1, stereoBuffer, numSamples * 4, &bytes_written, pdMS_TO_TICKS(500));
                 
                 if (result != ESP_OK || bytes_written < numSamples * 4) {
-                    Serial.printf("⚠️  I2S write failed: result=%d, wrote=%u/%u\n", result, bytes_written, numSamples*4);
+                    Serial.printf("âš ï¸  I2S write failed: result=%d, wrote=%u/%u\n", result, bytes_written, numSamples*4);
                     // Continue anyway - don't get stuck
                 }
                 
@@ -1867,12 +1772,12 @@ void audioTask(void * parameter) {
                 // Debug periodically
                 static uint32_t lastPlaybackDebug = 0;
                 if (millis() - lastPlaybackDebug > 1000) {
-                    Serial.printf("[PLAYBACK] Raw PCM: %d bytes → %d samples, level=%d, queue=%d\n", 
+                    Serial.printf("[PLAYBACK] Raw PCM: %d bytes â†’ %d samples, level=%d, queue=%d\n", 
                                  playbackChunk.length, numSamples, currentAudioLevel, uxQueueMessagesWaiting(audioOutputQueue));
                     lastPlaybackDebug = millis();
                 }
             } else {
-                Serial.printf("❌ Invalid PCM chunk: %d bytes (%d samples)\n", playbackChunk.length, numSamples);
+                Serial.printf("âŒ Invalid PCM chunk: %d bytes (%d samples)\n", playbackChunk.length, numSamples);
             }
         }
         
@@ -1993,7 +1898,7 @@ void audioTask(void * parameter) {
 void playStartupSound() {
     // Request startup sound from server
     if (!isWebSocketConnected) {
-        Serial.println("⚠️  Cannot play startup sound - WebSocket not connected");
+        Serial.println("âš ï¸  Cannot play startup sound - WebSocket not connected");
         return;
     }
     
@@ -2002,13 +1907,13 @@ void playStartupSound() {
     String startupMsg;
     serializeJson(startupDoc, startupMsg);
     webSocket.sendTXT(startupMsg);
-    Serial.println("🔊 Requesting startup sound from server");
+    Serial.println("ðŸ”Š Requesting startup sound from server");
 }
 
 void playZenBell() {
     // Request zen bell sound from server
     if (!isWebSocketConnected) {
-        Serial.println("⚠️  Cannot play zen bell - WebSocket not connected");
+        Serial.println("âš ï¸  Cannot play zen bell - WebSocket not connected");
         return;
     }
     
@@ -2017,7 +1922,7 @@ void playZenBell() {
     String bellMsg;
     serializeJson(bellDoc, bellMsg);
     webSocket.sendTXT(bellMsg);
-    Serial.println("🔔 Requesting zen bell from server");
+    Serial.println("ðŸ”” Requesting zen bell from server");
 }
 
 void playShutdownSound() {
@@ -2113,7 +2018,7 @@ void sendAudioChunk(uint8_t* data, size_t length) {
     
     // Base64 encode into a pre-allocated static buffer to avoid repeated heap allocations
     // (the old String += approach allocates/reallocates every character, causing heap fragmentation)
-    // Max mic frame = MIC_FRAME_SIZE * 2 = 640 bytes → Base64 = ceil(640/3)*4 = 856 chars + NUL
+    // Max mic frame = MIC_FRAME_SIZE * 2 = 640 bytes â†’ Base64 = ceil(640/3)*4 = 856 chars + NUL
     static char encodedBuf[1024];
     const char* base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     size_t outPos = 0;
@@ -2155,13 +2060,13 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     switch(type) {
         case WStype_CONNECTED:
             {
-                Serial.printf("✓ WebSocket Connected to Edge Server! (disconnect count: %d)\n", disconnectCount);
+                Serial.printf("âœ“ WebSocket Connected to Edge Server! (disconnect count: %d)\n", disconnectCount);
                 isWebSocketConnected = true;
                 shutdownSoundPlayed = false;  // Reset flag on successful connection
                 currentLEDMode = LED_CONNECTED;
                 
                 // Edge server handles Gemini setup automatically
-                Serial.println("✓ Waiting for 'ready' message from server");
+                Serial.println("âœ“ Waiting for 'ready' message from server");
                 
                 // Show connection on LEDs (with mutex)
                 if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
@@ -2173,7 +2078,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 
                 // Resume ambient mode if it was active before disconnect
                 if (ambientSound.active && !ambientSound.name.isEmpty()) {
-                    Serial.printf("▶️  Resuming ambient sound: %s (seq %d)\n", 
+                    Serial.printf("â–¶ï¸  Resuming ambient sound: %s (seq %d)\n", 
                                  ambientSound.name.c_str(), ambientSound.sequence);
                     
                     // Restore LED mode based on ambient sound
@@ -2205,7 +2110,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 } else if (ambientVUMode) {
                     // Resume VU meter mode
                     currentLEDMode = LED_AMBIENT_VU;
-                    Serial.println("▶️  Resuming VU meter mode");
+                    Serial.println("â–¶ï¸  Resuming VU meter mode");
                 } else {
                     currentLEDMode = LED_IDLE;
                 }
@@ -2213,13 +2118,13 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             break;
             
         case WStype_TEXT:
-            Serial.printf("📥 Received TEXT: %d bytes: %.*s\n", length, (int)min(length, (size_t)200), (char*)payload);
+            Serial.printf("ðŸ“¥ Received TEXT: %d bytes: %.*s\n", length, (int)min(length, (size_t)200), (char*)payload);
             handleWebSocketMessage(payload, length);
             break;
             
         case WStype_BIN:
             {
-                // 🔍 DIAGNOSTIC: Track packet timing to detect bursting
+                // ðŸ” DIAGNOSTIC: Track packet timing to detect bursting
                 static uint32_t packetCount = 0;
                 static uint32_t lastPacketTime = 0;
                 static uint32_t fastPackets = 0;  // Packets received < 20ms apart
@@ -2242,7 +2147,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     uint32_t bytesPerSec = binaryBytesReceived / 5;
                     float avgInterval = packetCount > 1 ? 5000.0f / packetCount : 0;
                     uint32_t queueDepth = uxQueueMessagesWaiting(audioOutputQueue);
-                    Serial.printf("📊 [STREAM] %u packets, %.1fms avg interval, %u fast (<20ms), %u KB/s, queue=%u\n", 
+                    Serial.printf("ðŸ“Š [STREAM] %u packets, %.1fms avg interval, %u fast (<20ms), %u KB/s, queue=%u\n", 
                                  packetCount, avgInterval, fastPackets, bytesPerSec/1024, queueDepth);
                     packetCount = 0;
                     fastPackets = 0;
@@ -2277,7 +2182,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                         
                         if (millis() - lastDiscardLog > 10000) {
                             if (discardsSinceLog > 0) {
-                                Serial.printf("🚫 Discarded %u stale ambient chunks in last 10s (seq %d, active=%d, expected=%d)\n", 
+                                Serial.printf("ðŸš« Discarded %u stale ambient chunks in last 10s (seq %d, active=%d, expected=%d)\n", 
                                              discardsSinceLog, chunkSequence, ambientSound.active, ambientSound.sequence);
                             }
                             discardsSinceLog = 0;
@@ -2292,7 +2197,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     
                     // Clear drain timer when we receive first packet of new sequence
                     if (ambientSound.drainUntil > 0) {
-                        Serial.printf("✓ New sequence %d arrived - drain complete\n", chunkSequence);
+                        Serial.printf("âœ“ New sequence %d arrived - drain complete\n", chunkSequence);
                         ambientSound.drainUntil = 0;
                     }
                 }
@@ -2300,7 +2205,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 
                 // Ignore audio if response was interrupted (but not for ambient/alarm sounds)
                 if (responseInterrupted && !isPlayingAmbient && !isPlayingAlarm) {
-                    Serial.println("🚫 Discarding audio chunk (response was interrupted)");
+                    Serial.println("ðŸš« Discarding audio chunk (response was interrupted)");
                     break;
                 }
                 
@@ -2310,13 +2215,13 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     // CRITICAL: Stop recording immediately when response arrives (even during prebuffer)
                     // This prevents connection overload from bidirectional audio traffic
                     if (recordingActive) {
-                        Serial.println("⏹️  Stopping recording - response arriving");
+                        Serial.println("â¹ï¸  Stopping recording - response arriving");
                         recordingActive = false;
                     }
                     
                     // Wait for prebuffer before starting playback to eliminate initial stutter
                     uint32_t queueDepth = uxQueueMessagesWaiting(audioOutputQueue);
-                    const uint32_t MIN_PREBUFFER = 8;  // ~320ms buffer (8 packets × 40ms)
+                    const uint32_t MIN_PREBUFFER = 8;  // ~320ms buffer (8 packets Ã— 40ms)
                     
                     if (queueDepth >= MIN_PREBUFFER) {
                         isPlayingResponse = true;
@@ -2349,18 +2254,18 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                         audioBufferIndex = 0;
                         
                         if (isPlayingAmbient) {
-                            Serial.printf("🔊 Starting ambient audio stream: %s (prebuffered %u packets)\n", 
+                            Serial.printf("ðŸ”Š Starting ambient audio stream: %s (prebuffered %u packets)\n", 
                                          ambientSound.name.c_str(), queueDepth);
                         } else if (isPlayingAlarm) {
-                            Serial.printf("🔔 Starting alarm audio playback (prebuffered %u packets)\n", queueDepth);
+                            Serial.printf("ðŸ”” Starting alarm audio playback (prebuffered %u packets)\n", queueDepth);
                         } else {
-                            Serial.printf("🔊 Starting audio playback with %u packets prebuffered\n", queueDepth);
+                            Serial.printf("ðŸ”Š Starting audio playback with %u packets prebuffered\n", queueDepth);
                         }
                     } else {
                         // Silent prebuffering phase - log once per stream
                         static uint32_t lastPrebufferLog = 0;
                         if (millis() - lastPrebufferLog > 1000) {
-                            Serial.printf("⏳ Prebuffering... (%u/%u packets)\n", queueDepth, MIN_PREBUFFER);
+                            Serial.printf("â³ Prebuffering... (%u/%u packets)\n", queueDepth, MIN_PREBUFFER);
                             lastPrebufferLog = millis();
                         }
                     }
@@ -2386,7 +2291,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     memcpy(chunk.data, payload, length);
                     chunk.length = length;
                     
-                    // 🔍 DIAGNOSTIC: Track queue depth before send
+                    // ðŸ” DIAGNOSTIC: Track queue depth before send
                     uint32_t queueBefore = uxQueueMessagesWaiting(audioOutputQueue);
                     
                     // Block up to 100ms if queue is full (applies backpressure to TCP)
@@ -2398,7 +2303,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                         dropsince++;
                         if (millis() - lastDropWarning > 2000) {
                             if (dropsince > 0) {
-                                Serial.printf("⚠️  Blocked on queue for 100ms+ (%u times, queue=%u/%u) - audio system may be frozen\n", 
+                                Serial.printf("âš ï¸  Blocked on queue for 100ms+ (%u times, queue=%u/%u) - audio system may be frozen\n", 
                                              dropsince, queueBefore, AUDIO_QUEUE_SIZE);
                                 dropsince = 0;
                             }
@@ -2407,11 +2312,11 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     } else {
                         // Queue growth logging disabled (too noisy during meditation)
                         // if (queueBefore == 0 || queueBefore >= AUDIO_QUEUE_SIZE - 5) {
-                        //     Serial.printf("📈 Queue: %u → %u/%u\n", queueBefore, queueBefore + 1, AUDIO_QUEUE_SIZE);
+                        //     Serial.printf("ðŸ“ˆ Queue: %u â†’ %u/%u\n", queueBefore, queueBefore + 1, AUDIO_QUEUE_SIZE);
                         // }
                     }
                 } else {
-                    Serial.printf("❌ PCM chunk too large: %d bytes\n", length);
+                    Serial.printf("âŒ PCM chunk too large: %d bytes\n", length);
                 }
             }
             break;
@@ -2419,13 +2324,13 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
         case WStype_DISCONNECTED:
             disconnectCount++;
             lastDisconnectTime = millis();
-            Serial.printf("✗ WebSocket Disconnected (#%d) - isPlaying=%d, recording=%d, uptime=%lus\n",
+            Serial.printf("âœ— WebSocket Disconnected (#%d) - isPlaying=%d, recording=%d, uptime=%lus\n",
                          disconnectCount, isPlayingResponse, recordingActive, millis()/1000);
             isWebSocketConnected = false;
             
             // Pause ambient playback but keep mode state for resume on reconnect
             if (isPlayingAmbient || ambientSound.active) {
-                Serial.printf("⏸️  Pausing ambient sound due to disconnect: %s (will resume)\n", ambientSound.name.c_str());
+                Serial.printf("â¸ï¸  Pausing ambient sound due to disconnect: %s (will resume)\n", ambientSound.name.c_str());
                 isPlayingAmbient = false;
                 isPlayingResponse = false;
                 // Keep ambientSound.active and name to resume on reconnect
@@ -2443,525 +2348,12 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             break;
             
         case WStype_ERROR:
-            Serial.println("✗ WebSocket Error");
+            Serial.println("âœ— WebSocket Error");
             currentLEDMode = LED_ERROR;
             break;
             
         default:
             break;
-    }
-}
-
-void handleWebSocketMessage(uint8_t* payload, size_t length) {
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, payload, length);
-    
-    if (error) {
-        Serial.printf("JSON parse error: %s\n", error.c_str());
-        return;
-    }
-    
-    // Handle server ready message
-    if (doc["type"].is<const char*>() && doc["type"] == "ready") {
-        Serial.printf("✓ Server: %s\n", doc["message"].as<const char*>());
-        
-        // Play startup sound once after WebSocket is ready
-        if (!startupSoundPlayed) {
-            startupSoundPlayed = true;
-            Serial.println("🔊 Playing startup sound...");
-            playStartupSound();
-        }
-        return;
-    }
-    
-    // Handle setup complete message
-    if (doc["type"].is<const char*>() && doc["type"] == "setupComplete") {
-        Serial.println("📦 Setup complete - ready for interaction");
-        // Greeting feature removed for simplicity - ready immediately
-        return;
-    }
-    
-    // Handle turn complete
-    if (doc["type"].is<const char*>() && doc["type"] == "turnComplete") {
-        Serial.println("✓ Turn complete");
-        turnComplete = true;  // Mark turn as finished
-        // Don't change LED mode here - let the audio finish playing naturally
-        // isPlayingResponse will be set to false when audio actually stops
-        // Conversation window will open after audio completes
-        
-        // Clear greeting flag ONLY if this was the startup greeting
-        if (waitingForGreeting) {
-            waitingForGreeting = false;
-            Serial.println("👋 Startup greeting complete!");
-        }
-        
-        // Clear interrupt flag - old turn is done, ready for new response
-        if (responseInterrupted) {
-            Serial.println("✅ Old turn complete, cleared interrupt flag");
-            responseInterrupted = false;
-        }
-        return;
-    }
-    
-    // Handle function calls
-    if (doc["type"].is<const char*>() && doc["type"] == "functionCall") {
-        String funcName = doc["name"].as<String>();
-        Serial.printf("🔧 Function call: %s\n", funcName.c_str());
-        
-        if (funcName == "set_volume") {
-            String direction = doc["args"]["direction"].as<String>();
-            if (direction == "up") {
-                volumeMultiplier = min(2.0f, volumeMultiplier + 0.2f);
-                Serial.printf("🔊 Volume up: %.0f%%\n", volumeMultiplier * 100);
-            } else if (direction == "down") {
-                volumeMultiplier = max(0.1f, volumeMultiplier - 0.2f);
-                Serial.printf("🔉 Volume down: %.0f%%\n", volumeMultiplier * 100);
-            }
-            // Play a brief chime at the new volume
-            playVolumeChime();
-            
-        } else if (funcName == "set_volume_percent") {
-            int percent = doc["args"]["percent"].as<int>();
-            volumeMultiplier = constrain(percent / 100.0f, 0.1f, 2.0f);
-            Serial.printf("🔊 Volume set: %d%%\n", percent);
-            
-            // Play a brief chime at the new volume
-            playVolumeChime();
-        }
-        
-        return;
-    }
-    
-    // Handle tide data from server
-    if (doc["type"].is<const char*>() && doc["type"] == "tideData") {
-        Serial.println("🌊 Received tide data - storing for display after speech");
-        tideState.state = doc["state"].as<String>();
-        tideState.waterLevel = doc["waterLevel"].as<float>();
-        tideState.nextChangeMinutes = doc["nextChangeMinutes"].as<int>();
-        tideState.active = true;
-        // Don't switch LED mode yet - let it display after audio finishes
-        
-        Serial.printf("🌊 Tide: %s, water level: %.1f%%, next change in %d minutes\n",
-                      tideState.state.c_str(), 
-                      tideState.waterLevel * 100,
-                      tideState.nextChangeMinutes);
-        return;
-    }
-    
-    // Handle sunrise/sunset data from server
-    if (doc["type"].is<const char*>() && doc["type"] == "sunData") {
-        dayNightData.sunriseTime = doc["sunrise"].as<long long>() / 1000;  // Convert ms to seconds
-        dayNightData.sunsetTime = doc["sunset"].as<long long>() / 1000;
-        dayNightData.valid = true;
-        dayNightData.lastUpdate = millis();
-        
-        // Immediately update brightness
-        updateDayNightBrightness();
-        
-        // Log the times
-        struct tm sunriseInfo, sunsetInfo;
-        localtime_r((time_t*)&dayNightData.sunriseTime, &sunriseInfo);
-        localtime_r((time_t*)&dayNightData.sunsetTime, &sunsetInfo);
-        char sunriseStr[10], sunsetStr[10];
-        strftime(sunriseStr, sizeof(sunriseStr), "%H:%M", &sunriseInfo);
-        strftime(sunsetStr, sizeof(sunsetStr), "%H:%M", &sunsetInfo);
-        
-        Serial.printf("🌅 Sunrise/sunset received: %s / %s (brightness: %s mode)\n",
-                     sunriseStr, sunsetStr,
-                     dayNightData.isDaytime ? "DAY" : "NIGHT");
-        return;
-    }
-    
-    // Handle timer set from server
-    if (doc["type"].is<const char*>() && doc["type"] == "timerSet") {
-        Serial.println("⏱️  Timer set - storing for display after speech");
-        timerState.totalSeconds = doc["durationSeconds"].as<int>();
-        timerState.startTime = millis();
-        timerState.active = true;
-        // Don't switch LED mode yet - let it display after audio finishes
-        
-        Serial.printf("⏱️  Timer: %d seconds (%d minutes)\n",
-                      timerState.totalSeconds,
-                      timerState.totalSeconds / 60);
-        return;
-    }
-    
-    // Handle alarm set from server
-    if (doc["type"].is<const char*>() && doc["type"] == "setAlarm") {
-        uint32_t alarmID = doc["alarmID"].as<uint32_t>();
-        time_t triggerTime = doc["triggerTime"].as<long long>() / 1000;  // Convert ms to seconds
-        
-        // Find empty slot
-        int slot = -1;
-        for (int i = 0; i < MAX_ALARMS; i++) {
-            if (!alarms[i].enabled) {
-                slot = i;
-                break;
-            }
-        }
-        
-        if (slot >= 0) {
-            alarms[slot].alarmID = alarmID;
-            alarms[slot].triggerTime = triggerTime;
-            alarms[slot].enabled = true;
-            alarms[slot].triggered = false;
-            alarms[slot].snoozed = false;
-            alarms[slot].snoozeUntil = 0;
-            
-            // Format time for logging
-            struct tm timeinfo;
-            localtime_r(&triggerTime, &timeinfo);
-            char timeStr[20];
-            strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
-            
-            Serial.printf("⏰ Alarm set: ID=%u, time=%s (slot %d)\n", alarmID, timeStr, slot);
-            alarmState.active = true;
-        } else {
-            Serial.println("⚠️  No alarm slots available!");
-        }
-        return;
-    }
-    
-    // Handle timer cancelled
-    if (doc["type"].is<const char*>() && doc["type"] == "timerCancelled") {
-        Serial.println("⏱️  Timer cancelled");
-        timerState.active = false;
-        if (currentLEDMode == LED_TIMER) {
-            currentLEDMode = LED_IDLE;
-        }
-        return;
-    }
-    
-    // Handle timer expired
-    if (doc["type"].is<const char*>() && doc["type"] == "timerExpired") {
-        Serial.println("⏰ Timer expired!");
-        timerState.active = false;
-        // Flash LEDs for completion (with mutex)
-        for (int i = 0; i < 3; i++) {
-            if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-                fill_solid(leds, NUM_LEDS, CRGB::Green);
-                FastLED.show();
-                xSemaphoreGive(ledMutex);
-            }
-            delay(200);
-            if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-                fill_solid(leds, NUM_LEDS, CRGB::Black);
-                FastLED.show();
-                xSemaphoreGive(ledMutex);
-            }
-            delay(200);
-        }
-        // Do NOT pre-set isPlayingResponse here — the standard audio prebuffer path in
-        // onWebSocketEvent(WStype_BIN) will set it once enough packets have buffered.
-        // Forcing it here caused the LED to switch before audio arrived (visual glitch)
-        // and the 300ms delay was blocking the WebSocket task.
-        processingStartTime = 0;  // Clear processing timeout so it doesn't blank the timer
-        Serial.println("✓ Timer expired - waiting for Gemini audio notification...");
-        return;
-    }
-    
-    // Handle cancel alarm from server
-    if (doc["type"].is<const char*>() && doc["type"] == "cancelAlarm") {
-        String which = doc["which"].as<String>();
-        Serial.printf("🚫 Cancel alarm request: %s\n", which.c_str());
-        
-        if (which == "all") {
-            // Cancel all alarms
-            int cancelledCount = 0;
-            for (int i = 0; i < MAX_ALARMS; i++) {
-                if (alarms[i].enabled) {
-                    alarms[i].alarmID = 0;
-                    alarms[i].triggerTime = 0;
-                    alarms[i].enabled = false;
-                    alarms[i].triggered = false;
-                    alarms[i].snoozed = false;
-                    alarms[i].snoozeUntil = 0;
-                    cancelledCount++;
-                }
-            }
-            Serial.printf("✓ Cancelled %d alarm(s)\n", cancelledCount);
-            alarmState.active = false;
-        } else {
-            // Cancel next alarm (earliest one)
-            time_t earliestTime = 0;
-            int earliestSlot = -1;
-            
-            struct tm timeinfo;
-            if (getLocalTime(&timeinfo)) {
-                time_t now = mktime(&timeinfo);
-                
-                for (int i = 0; i < MAX_ALARMS; i++) {
-                    if (alarms[i].enabled && alarms[i].triggerTime > now) {
-                        if (earliestSlot == -1 || alarms[i].triggerTime < earliestTime) {
-                            earliestTime = alarms[i].triggerTime;
-                            earliestSlot = i;
-                        }
-                    }
-                }
-                
-                if (earliestSlot >= 0) {
-                    uint32_t cancelledID = alarms[earliestSlot].alarmID;
-                    
-                    // Clear the slot
-                    alarms[earliestSlot].alarmID = 0;
-                    alarms[earliestSlot].triggerTime = 0;
-                    alarms[earliestSlot].enabled = false;
-                    alarms[earliestSlot].triggered = false;
-                    alarms[earliestSlot].snoozed = false;
-                    alarms[earliestSlot].snoozeUntil = 0;
-                    
-                    Serial.printf("✓ Cancelled next alarm ID=%u from slot %d\n", cancelledID, earliestSlot);
-                    
-                    // Check if any more alarms are active
-                    bool hasActiveAlarms = false;
-                    for (int i = 0; i < MAX_ALARMS; i++) {
-                        if (alarms[i].enabled) {
-                            hasActiveAlarms = true;
-                            break;
-                        }
-                    }
-                    if (!hasActiveAlarms) {
-                        alarmState.active = false;
-                    }
-                } else {
-                    Serial.println("⚠️  No active alarms to cancel");
-                }
-            }
-        }
-        return;
-    }
-    
-    // Handle list alarms request
-    if (doc["type"].is<const char*>() && doc["type"] == "listAlarms") {
-        Serial.println("📋 List alarms request");
-        
-        struct tm timeinfo;
-        if (getLocalTime(&timeinfo)) {
-            time_t now = mktime(&timeinfo);
-            
-            // Build alarm list
-            JsonDocument responseDoc;
-            responseDoc["type"] = "alarmList";
-            JsonArray alarmArray = responseDoc["alarms"].to<JsonArray>();
-            
-            for (int i = 0; i < MAX_ALARMS; i++) {
-                // List all enabled alarms (don't filter by time - let Gemini handle past alarms)
-                if (alarms[i].enabled) {
-                    JsonObject alarmObj = alarmArray.add<JsonObject>();
-                    alarmObj["alarmID"] = alarms[i].alarmID;
-                    alarmObj["triggerTime"] = (long long)alarms[i].triggerTime * 1000; // Convert to ms
-                    
-                    // Format time string for logging
-                    struct tm alarmTimeinfo;
-                    localtime_r(&alarms[i].triggerTime, &alarmTimeinfo);
-                    char timeStr[32];
-                    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M", &alarmTimeinfo);
-                    alarmObj["formattedTime"] = timeStr;
-                    
-                    // Add flag for whether alarm is in the past
-                    alarmObj["isPast"] = (alarms[i].triggerTime <= now);
-                    
-                    Serial.printf("  Alarm %u: %s (isPast=%d)\n", alarms[i].alarmID, timeStr, (alarms[i].triggerTime <= now));
-                }
-            }
-            
-            String responseMsg;
-            serializeJson(responseDoc, responseMsg);
-            webSocket.sendTXT(responseMsg);
-            Serial.printf("📤 Sent alarm list: %d alarm(s)\n", alarmArray.size());
-        }
-        return;
-    }
-    
-    // Handle moon data
-    if (doc["type"].is<const char*>() && doc["type"] == "moonData") {
-        Serial.println("🌙 Received moon data - storing for display after speech");
-        moonState.phaseName = doc["phaseName"].as<String>();
-        moonState.illumination = doc["illumination"].as<int>();
-        moonState.moonAge = doc["moonAge"].as<float>();
-        moonState.active = true;
-        // Don't switch LED mode yet - let it display after audio finishes
-        
-        Serial.printf("🌙 Moon: %s (%d%% illuminated, %.1f days old)\n", 
-                      moonState.phaseName.c_str(), moonState.illumination, moonState.moonAge);
-        return;
-    }
-    
-    // Handle ambient stream completion
-    // Handle ambient stream completion
-    if (doc["type"].is<const char*>() && doc["type"] == "ambientComplete") {
-        String soundName = doc["sound"].as<String>();
-        uint16_t sequence = doc["sequence"].as<uint16_t>();
-        Serial.printf("🎵 Ambient track complete: %s (seq %d)\n", soundName.c_str(), sequence);
-        
-        // Validate: Only process if this completion matches what we're currently playing
-        if (soundName != ambientSound.name) {
-            Serial.printf("⚠️  Ignoring stale completion: expected '%s', got '%s'\n", 
-                         ambientSound.name.c_str(), soundName.c_str());
-            return;
-        }
-        
-        // For meditation mode: auto-advance to next chakra
-        if (meditationState.active && currentLEDMode == LED_MEDITATION) {
-            if (meditationState.currentChakra < MeditationState::CROWN) {
-                // Auto-advance to next chakra
-                meditationState.currentChakra = (MeditationState::Chakra)(meditationState.currentChakra + 1);
-                meditationState.phase = MeditationState::HOLD_BOTTOM;
-                meditationState.phaseStartTime = millis();
-                
-                Serial.printf("🧘 Auto-advancing to %s chakra\n", CHAKRA_NAMES[meditationState.currentChakra]);
-                
-                // Request next chakra sound
-                JsonDocument reqDoc;
-                reqDoc["action"] = "requestAmbient";
-                char nextSound[16];
-                sprintf(nextSound, "om%03d", meditationState.currentChakra + 1);
-                reqDoc["sound"] = nextSound;
-                reqDoc["sequence"] = ++ambientSound.sequence;
-                String reqMsg;
-                serializeJson(reqDoc, reqMsg);
-                webSocket.sendTXT(reqMsg);
-                
-                ambientSound.name = nextSound;
-                firstAudioChunk = true;
-                lastAudioChunkTime = millis();
-            } else {
-                // Completed all 7 chakras - return to IDLE
-                Serial.println("🧘 Meditation sequence complete - returning to IDLE");
-                meditationState.active = false;
-                isPlayingAmbient = false;
-                isPlayingResponse = false;
-                volumeMultiplier = meditationState.savedVolume;
-                Serial.printf("🔊 Volume restored to %.0f%%\n", volumeMultiplier * 100);
-                startMarquee("COMPLETE", CRGB(255, 255, 255), LED_IDLE);
-            }
-        }
-        return;
-    }
-    
-    // Handle Pomodoro commands
-    if (doc["type"].is<const char*>() && doc["type"] == "pomodoroStart") {
-        // Get custom durations if provided, otherwise use current settings
-        if (doc["focusMinutes"].is<int>()) {
-            pomodoroState.focusDuration = doc["focusMinutes"].as<int>();
-            Serial.printf("🍅 Custom focus duration: %d minutes\n", pomodoroState.focusDuration);
-        }
-        if (doc["shortBreakMinutes"].is<int>()) {
-            pomodoroState.shortBreakDuration = doc["shortBreakMinutes"].as<int>();
-            Serial.printf("🍅 Custom short break: %d minutes\n", pomodoroState.shortBreakDuration);
-        }
-        if (doc["longBreakMinutes"].is<int>()) {
-            pomodoroState.longBreakDuration = doc["longBreakMinutes"].as<int>();
-            Serial.printf("🍅 Custom long break: %d minutes\n", pomodoroState.longBreakDuration);
-        }
-        
-        Serial.println("🍅 Pomodoro started via voice command");
-        currentLEDMode = LED_POMODORO;
-        targetLEDMode = LED_POMODORO;
-        pomodoroState.active = true;
-        pomodoroState.currentSession = PomodoroState::FOCUS;
-        pomodoroState.sessionCount = 0;
-        pomodoroState.totalSeconds = pomodoroState.focusDuration * 60;
-        pomodoroState.paused = false;
-        pomodoroState.startTime = millis();
-        playVolumeChime();
-        return;
-    }
-    
-    if (doc["type"].is<const char*>() && doc["type"] == "pomodoroPause") {
-        Serial.println("🍅 Pomodoro paused via voice command");
-        if (pomodoroState.active && !pomodoroState.paused) {
-            uint32_t elapsed = (millis() - pomodoroState.startTime) / 1000;
-            pomodoroState.pausedTime = pomodoroState.totalSeconds - elapsed;
-            pomodoroState.paused = true;
-            pomodoroState.startTime = 0;
-            playVolumeChime();
-        }
-        return;
-    }
-    
-    if (doc["type"].is<const char*>() && doc["type"] == "pomodoroResume") {
-        Serial.println("🍅 Pomodoro resumed via voice command");
-        if (pomodoroState.active && pomodoroState.paused) {
-            pomodoroState.startTime = millis();
-            pomodoroState.paused = false;
-            playVolumeChime();
-        }
-        return;
-    }
-    
-    if (doc["type"].is<const char*>() && doc["type"] == "pomodoroStop") {
-        Serial.println("🍅 Pomodoro stopped via voice command");
-        pomodoroState.active = false;
-        pomodoroState.paused = false;
-        pomodoroState.sessionCount = 0;
-        currentLEDMode = LED_IDLE;
-        targetLEDMode = LED_IDLE;
-        playShutdownSound();
-        return;
-    }
-    
-    if (doc["type"].is<const char*>() && doc["type"] == "pomodoroSkip") {
-        Serial.println("🍅 Skipping to next Pomodoro session");
-        if (pomodoroState.active) {
-            // Trigger session transition by setting remaining time to 0
-            pomodoroState.startTime = millis() - (pomodoroState.totalSeconds * 1000);
-            pomodoroState.paused = false;
-        }
-        return;
-    }
-    
-    if (doc["type"].is<const char*>() && doc["type"] == "pomodoroStatusRequest") {
-        Serial.println("🍅 Pomodoro status requested");
-        
-        JsonDocument statusDoc;
-        statusDoc["type"] = "pomodoroStatusResponse";
-        
-        if (pomodoroState.active) {
-            uint32_t secondsRemaining;
-            if (pomodoroState.paused) {
-                secondsRemaining = pomodoroState.pausedTime;
-            } else {
-                uint32_t elapsed = (millis() - pomodoroState.startTime) / 1000;
-                secondsRemaining = pomodoroState.totalSeconds > elapsed ? pomodoroState.totalSeconds - elapsed : 0;
-            }
-            int minutes = secondsRemaining / 60;
-            int seconds = secondsRemaining % 60;
-            const char* sessionName = (pomodoroState.currentSession == PomodoroState::FOCUS) ? "Focus" :
-                                     (pomodoroState.currentSession == PomodoroState::SHORT_BREAK) ? "Short Break" : "Long Break";
-            
-            statusDoc["active"] = true;
-            statusDoc["session"] = sessionName;
-            statusDoc["minutesRemaining"] = minutes;
-            statusDoc["secondsRemaining"] = seconds;
-            statusDoc["paused"] = pomodoroState.paused;
-            statusDoc["cycleNumber"] = pomodoroState.sessionCount + 1;
-            
-            Serial.printf("🍅 Status: %s session, %d:%02d remaining, %s, cycle %d/4\n",
-                         sessionName, minutes, seconds, pomodoroState.paused ? "paused" : "running", pomodoroState.sessionCount + 1);
-        } else {
-            statusDoc["active"] = false;
-            Serial.println("🍅 Pomodoro not active");
-        }
-        
-        String statusMsg;
-        serializeJson(statusDoc, statusMsg);
-        webSocket.sendTXT(statusMsg);
-        Serial.println("📤 Sent Pomodoro status to server");
-        return;
-    }
-    
-    // Handle text responses
-    if (doc["type"].is<const char*>() && doc["type"] == "text") {
-        Serial.printf("📝 Text: %s\n", doc["text"].as<const char*>());
-        return;
-    }
-    
-    // Handle errors
-    if (doc["error"].is<const char*>()) {
-        Serial.printf("❌ Error: %s\n", doc["error"].as<const char*>());
-        currentLEDMode = LED_ERROR;
-        return;
     }
 }
 
@@ -2999,7 +2391,7 @@ void updateLEDs() {
             {
                 static uint32_t lastBootDebug = 0;
                 if (millis() - lastBootDebug > 1000) {
-                    Serial.println("🔶 LED_BOOT: Orange pulsing (connecting...)");
+                    Serial.println("ðŸ”¶ LED_BOOT: Orange pulsing (connecting...)");
                     lastBootDebug = millis();
                 }
                 brightness = constrain(100 + (int)(50 * sin(millis() / 500.0)), 0, 255);
@@ -3016,21 +2408,21 @@ void updateLEDs() {
                 float t = (millis() % 5866) / 5866.0;
                 
                 // Create bouncing wave: centered for symmetry at both ends
-                // Range -2.5→13.5→-2.5 (centered at row 5.5, perfectly symmetric)
-                // ORIGINAL (to revert): Range 0→14→0, use "wavePos = (t * 2.0) * 14.0" and "wavePos = ((1.0 - t) * 2.0) * 14.0"
+                // Range -2.5â†’13.5â†’-2.5 (centered at row 5.5, perfectly symmetric)
+                // ORIGINAL (to revert): Range 0â†’14â†’0, use "wavePos = (t * 2.0) * 14.0" and "wavePos = ((1.0 - t) * 2.0) * 14.0"
                 float wavePos;
                 if (t < 0.5) {
-                    // First half: bottom to top (-2.5→13.5)
+                    // First half: bottom to top (-2.5â†’13.5)
                     wavePos = (t * 2.0) * 16.0 - 2.5;
                 } else {
-                    // Second half: top to bottom (13.5→-2.5)
+                    // Second half: top to bottom (13.5â†’-2.5)
                     wavePos = ((1.0 - t) * 2.0) * 16.0 - 2.5;
                 }
                 
                 // Debug every 2 seconds
                 static uint32_t lastIdleDebug = 0;
                 if (millis() - lastIdleDebug > 2000) {
-                    Serial.printf("💙 IDLE: t=%.2f, wavePos=%.2f, hue=160 (blue)\n", t, wavePos);
+                    Serial.printf("ðŸ’™ IDLE: t=%.2f, wavePos=%.2f, hue=160 (blue)\n", t, wavePos);
                     lastIdleDebug = millis();
                 }
                 
@@ -3059,7 +2451,7 @@ void updateLEDs() {
             
         case LED_RECORDING:
             // VU meter during recording - vertical bars on all strips with fade trail
-            // Traditional VU meter colors: green → yellow → red
+            // Traditional VU meter colors: green â†’ yellow â†’ red
             {
                 // Fade all LEDs for trail effect
                 for (int i = 0; i < NUM_LEDS; i++) {
@@ -3077,7 +2469,7 @@ void updateLEDs() {
                         
                         // Bounds check to prevent array overflow
                         if (ledIndex >= NUM_LEDS) {
-                            Serial.printf("⚠️ LED overflow: col=%d, row=%d, idx=%d\n", col, row, ledIndex);
+                            Serial.printf("âš ï¸ LED overflow: col=%d, row=%d, idx=%d\n", col, row, ledIndex);
                             continue;
                         }
                         
@@ -3162,12 +2554,12 @@ void updateLEDs() {
                         
                         // Bounds check to prevent array overflow
                         if (ledIndex >= NUM_LEDS) {
-                            Serial.printf("⚠️ LED overflow: col=%d, row=%d, idx=%d\n", col, row, ledIndex);
+                            Serial.printf("âš ï¸ LED overflow: col=%d, row=%d, idx=%d\n", col, row, ledIndex);
                             continue;
                         }
                         
                         if (row < numRows) {
-                            // Blue → cyan → magenta gradient with distinct color zones
+                            // Blue â†’ cyan â†’ magenta gradient with distinct color zones
                             // More distinct colors for better visibility
                             float progress = (float)row / (float)LEDS_PER_COLUMN;
                             
@@ -3193,7 +2585,7 @@ void updateLEDs() {
                 // Debug: log mode switch
                 static uint32_t lastDebugLog = 0;
                 if (millis() - lastDebugLog > 5000) {
-                    Serial.printf("🌊 LED_TIDE active: state=%s, level=%.2f, mode=%d\n", 
+                    Serial.printf("ðŸŒŠ LED_TIDE active: state=%s, level=%.2f, mode=%d\n", 
                                  tideState.state.c_str(), tideState.waterLevel, currentLEDMode);
                     lastDebugLog = millis();
                 }
@@ -3446,7 +2838,7 @@ void updateLEDs() {
                     
                     // Debug log every 2 seconds
                     if (millis() - lastDebugLog > 2000) {
-                        Serial.printf("🌊 Ocean: Level=%d, Smoothed=%.0f, Rows=%d/%d\n", 
+                        Serial.printf("ðŸŒŠ Ocean: Level=%d, Smoothed=%.0f, Rows=%d/%d\n", 
                                      currentAudioLevel, smoothedWave, 
                                      (int)(constrain(smoothedWave / 500.0f, 0.15f, 0.75f) * LEDS_PER_COLUMN), 
                                      LEDS_PER_COLUMN);
@@ -3466,7 +2858,7 @@ void updateLEDs() {
                     for (int col = 0; col < LED_COLUMNS; col++) {
                         // Phase offset for traveling wave effect
                         float phaseOffset = (float)col / (float)LED_COLUMNS * TWO_PI;
-                        float phaseWave = sin(time + phaseOffset) * 3.0;  // ±3 rows variation (was ±1.5)
+                        float phaseWave = sin(time + phaseOffset) * 3.0;  // Â±3 rows variation (was Â±1.5)
                         
                         int colWaveRows = constrain(waveRows + (int)phaseWave, 1, LEDS_PER_COLUMN);
                         
@@ -3690,7 +3082,7 @@ void updateLEDs() {
                             // Progress from bottom (0.0) to tip (1.0)
                             float progress = (float)row / (float)maxFlameRow;
                             
-                            // Color gradient: deep red → orange → yellow-orange
+                            // Color gradient: deep red â†’ orange â†’ yellow-orange
                             uint8_t hue;
                             if (progress < 0.4f) {
                                 // Bottom 40%: Deep red (0-5)
@@ -3703,7 +3095,7 @@ void updateLEDs() {
                                 hue = 15 + (uint8_t)((progress - 0.7f) * 3.33f * 10.0f);
                             }
                             
-                            // Subtle hue variation (±1 for gentle organic feel)
+                            // Subtle hue variation (Â±1 for gentle organic feel)
                             hue += random(-1, 2);
                             
                             // Brightness gradient: dimmer at base, brighter at tips
@@ -3714,7 +3106,7 @@ void updateLEDs() {
                                 brightness = 200 + (uint8_t)((progress - 0.5f) * 2.0f * 55.0f);  // 200-255
                             }
                             
-                            // Gentle brightness variation (±5 for subtle glow)
+                            // Gentle brightness variation (Â±5 for subtle glow)
                             brightness += random(-5, 6);
                             brightness = constrain(brightness, 100, 255);
                             
@@ -3793,14 +3185,14 @@ void updateLEDs() {
                         activeLED = constrain((int)(progress * LEDS_PER_COLUMN), 0, LEDS_PER_COLUMN - 1);
                     } else {
                         // Countdown: active LED moves from top (11) to bottom (0)
-                        // As progress goes 0→1, active LED goes 11→0
+                        // As progress goes 0â†’1, active LED goes 11â†’0
                         activeLED = constrain(LEDS_PER_COLUMN - 1 - (int)(progress * LEDS_PER_COLUMN), 0, LEDS_PER_COLUMN - 1);
                     }
                     
                     // Debug logging (every 5 seconds)
                     static uint32_t lastPomodoroDebug = 0;
                     if (millis() - lastPomodoroDebug > 5000) {
-                        Serial.printf("🍅 Progress: %.1f%%, Active LED row: %d, Pulse: %.2f, Paused: %d, Remaining: %ds\n",
+                        Serial.printf("ðŸ… Progress: %.1f%%, Active LED row: %d, Pulse: %.2f, Paused: %d, Remaining: %ds\n",
                                      progress * 100, activeLED, activePulse, pomodoroState.paused, secondsRemaining);
                         lastPomodoroDebug = millis();
                     }
@@ -3884,7 +3276,7 @@ void updateLEDs() {
                         lastChakra = meditationState.currentChakra;
                         colorTransitionStart = millis();
                         
-                        Serial.printf("🎨 Chakra changed to %s: RGB(%d,%d,%d) - starting 3s color fade\n", 
+                        Serial.printf("ðŸŽ¨ Chakra changed to %s: RGB(%d,%d,%d) - starting 3s color fade\n", 
                                      CHAKRA_NAMES[meditationState.currentChakra],
                                      currentColor.r, currentColor.g, currentColor.b);
                     }
@@ -3917,7 +3309,7 @@ void updateLEDs() {
                             phaseElapsed = 0;
                             
                             const char* phaseNames[] = {"INHALE", "HOLD_TOP", "EXHALE", "HOLD_BOTTOM"};
-                            Serial.printf("🧘 Breath phase: %s\n", phaseNames[meditationState.phase]);
+                            Serial.printf("ðŸ§˜ Breath phase: %s\n", phaseNames[meditationState.phase]);
                         }
                         
                         // CRITICAL: Capture phase state at start of frame to prevent mid-frame changes
@@ -4003,7 +3395,7 @@ void updateLEDs() {
                                 frontMarquee.start();
                             }
                             
-                            Serial.printf("🕐 Clock updated: %02d:%02d\n", currentHour, currentMinute);
+                            Serial.printf("ðŸ• Clock updated: %02d:%02d\n", currentHour, currentMinute);
                         }
                         
                         // Update and render the scrolling time
@@ -4038,7 +3430,7 @@ void updateLEDs() {
             
         case LED_LAMP:
             // White lamp with spiral swoosh lighting effect
-            // Button 1: cycle colors (WHITE → RED → GREEN → BLUE)
+            // Button 1: cycle colors (WHITE â†’ RED â†’ GREEN â†’ BLUE)
             {
                 if (lampState.active) {
                     const uint32_t FADE_DURATION_MS = 150;  // Quick fade-up per LED
@@ -4077,7 +3469,7 @@ void updateLEDs() {
                                 if (lampState.currentRow >= LEDS_PER_COLUMN) {
                                     lampState.fullyLit = true;
                                     lampState.transitioning = false;
-                                    Serial.println("💡 Lamp fully lit");
+                                    Serial.println("ðŸ’¡ Lamp fully lit");
                                 }
                             }
                         }
@@ -4263,7 +3655,7 @@ void updateLEDs() {
                 if (frontMarquee.isComplete()) {
                     frontMarquee.stop();
                     currentLEDMode = targetLEDMode;
-                    Serial.printf("📜 Marquee complete, switching to mode %d\n", targetLEDMode);
+                    Serial.printf("ðŸ“œ Marquee complete, switching to mode %d\n", targetLEDMode);
                     
                     // If switching to ambient mode, request the audio now
                     if (targetLEDMode == LED_AMBIENT) {
@@ -4274,7 +3666,7 @@ void updateLEDs() {
                         ambientDoc["sequence"] = ambientSound.sequence;
                         String ambientMsg;
                         serializeJson(ambientDoc, ambientMsg);
-                        Serial.printf("📤 Ambient audio request: %s (seq %d)\n", ambientMsg.c_str(), ambientSound.sequence);
+                        Serial.printf("ðŸ“¤ Ambient audio request: %s (seq %d)\n", ambientMsg.c_str(), ambientSound.sequence);
                         webSocket.sendTXT(ambientMsg);
                     }
                     
@@ -4282,7 +3674,7 @@ void updateLEDs() {
                     if (targetLEDMode == LED_POMODORO && pomodoroState.active && pomodoroState.paused) {
                         pomodoroState.startTime = millis();
                         pomodoroState.paused = false;
-                        Serial.println("▶️  Pomodoro timer auto-started");
+                        Serial.println("â–¶ï¸  Pomodoro timer auto-started");
                         playZenBell();  // Play zen bell on start
                     }
                     
@@ -4306,11 +3698,11 @@ void updateLEDs() {
                         reqDoc["sequence"] = ++ambientSound.sequence;
                         String reqMsg;
                         serializeJson(reqDoc, reqMsg);
-                        Serial.printf("📤 Meditation starting: %s (seq %d)\n", reqMsg.c_str(), ambientSound.sequence);
+                        Serial.printf("ðŸ“¤ Meditation starting: %s (seq %d)\n", reqMsg.c_str(), ambientSound.sequence);
                         webSocket.sendTXT(reqMsg);
                         meditationState.streaming = true;
                         
-                        Serial.println("🧘 Meditation breathing and audio started (ROOT chakra)");
+                        Serial.println("ðŸ§˜ Meditation breathing and audio started (ROOT chakra)");
                     }
                 }
             }
@@ -4320,7 +3712,7 @@ void updateLEDs() {
             {
                 static uint32_t lastConnDebug = 0;
                 if (millis() - lastConnDebug > 500) {
-                    Serial.println("✅ LED_CONNECTED: Solid green");
+                    Serial.println("âœ… LED_CONNECTED: Solid green");
                     lastConnDebug = millis();
                 }
                 fill_solid(leds, NUM_LEDS, CRGB(0, 255, 0));  // Pure green
@@ -4357,33 +3749,33 @@ void websocketTask(void * parameter) {
             if (startupHeap == 0) {
                 startupHeap = freeHeap;
                 lowestHeap = freeHeap;
-                Serial.printf("📊 Memory baseline: Heap=%u KB, PSRAM=%u KB\n", freeHeap/1024, freePsram/1024);
+                Serial.printf("ðŸ“Š Memory baseline: Heap=%u KB, PSRAM=%u KB\n", freeHeap/1024, freePsram/1024);
             }
             if (freeHeap < lowestHeap) {
                 lowestHeap = freeHeap;
-                Serial.printf("📉 New low heap: %u KB (lost %u KB since startup)\n", 
+                Serial.printf("ðŸ“‰ New low heap: %u KB (lost %u KB since startup)\n", 
                              freeHeap/1024, (startupHeap - freeHeap)/1024);
             }
             
             // Hourly summary for leak detection
             uint32_t uptime = (millis() - startTime) / 1000;
             if (uptime > 0 && uptime % 3600 == 0) {
-                Serial.printf("\n╔══════════════════════════════════════════╗\n");
-                Serial.printf("║  HOURLY MEMORY REPORT - %u hours runtime  ║\n", uptime/3600);
-                Serial.printf("╠══════════════════════════════════════════╣\n");
-                Serial.printf("║  Current Heap:  %6u KB                ║\n", freeHeap/1024);
-                Serial.printf("║  Startup Heap:  %6u KB                ║\n", startupHeap/1024);
-                Serial.printf("║  Lowest Heap:   %6u KB                ║\n", lowestHeap/1024);
-                Serial.printf("║  Heap Lost:     %6u KB                ║\n", (startupHeap - freeHeap)/1024);
-                Serial.printf("║  PSRAM Free:    %6u KB                ║\n", freePsram/1024);
-                Serial.printf("║  Mode: %-30s    ║\n", 
+                Serial.printf("\nâ•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—\n");
+                Serial.printf("â•‘  HOURLY MEMORY REPORT - %u hours runtime  â•‘\n", uptime/3600);
+                Serial.printf("â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•£\n");
+                Serial.printf("â•‘  Current Heap:  %6u KB                â•‘\n", freeHeap/1024);
+                Serial.printf("â•‘  Startup Heap:  %6u KB                â•‘\n", startupHeap/1024);
+                Serial.printf("â•‘  Lowest Heap:   %6u KB                â•‘\n", lowestHeap/1024);
+                Serial.printf("â•‘  Heap Lost:     %6u KB                â•‘\n", (startupHeap - freeHeap)/1024);
+                Serial.printf("â•‘  PSRAM Free:    %6u KB                â•‘\n", freePsram/1024);
+                Serial.printf("â•‘  Mode: %-30s    â•‘\n", 
                     currentLEDMode == LED_IDLE ? "IDLE" :
                     currentLEDMode == LED_AMBIENT ? "AMBIENT" :
                     currentLEDMode == LED_AMBIENT_VU ? "VU METER" :
                     currentLEDMode == LED_SEA_GOOSEBERRY ? "SEA GOOSEBERRY" :
                     currentLEDMode == LED_POMODORO ? "POMODORO" :
                     currentLEDMode == LED_MEDITATION ? "MEDITATION" : "OTHER");
-                Serial.printf("╚══════════════════════════════════════════╝\n\n");
+                Serial.printf("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•\n\n");
             }
             
             lastRSSI = rssi;
@@ -4391,12 +3783,12 @@ void websocketTask(void * parameter) {
             
             // Warn if heap is getting low
             if (freeHeap < 50000) {  // Less than 50KB free
-                Serial.printf("⚠️  LOW HEAP WARNING: Only %u KB free!\n", freeHeap/1024);
+                Serial.printf("âš ï¸  LOW HEAP WARNING: Only %u KB free!\n", freeHeap/1024);
             }
             
             // Attempt to reconnect WiFi if signal is very poor but still connected
             if (rssi < -80 && WiFi.status() == WL_CONNECTED) {
-                Serial.println("⚠️  Very weak signal detected - WiFi may drop soon");
+                Serial.println("âš ï¸  Very weak signal detected - WiFi may drop soon");
             }
         }
         
@@ -4427,7 +3819,7 @@ void ledTask(void * parameter) {
         uint32_t now = millis();
         if (lastLedUpdate > 0 && (now - lastLedUpdate) > 200) {
             ledTaskStalls++;
-            Serial.printf("⚠️ LED task stalled #%d: %dms since last update\n", 
+            Serial.printf("âš ï¸ LED task stalled #%d: %dms since last update\n", 
                          ledTaskStalls, now - lastLedUpdate);
         }
         
@@ -4439,7 +3831,7 @@ void ledTask(void * parameter) {
             updateCount++;
             
             if (millis() - lastUpdateLog > 30000) {
-                // Serial.printf("🔄 LED task: %u updates in 30s (expect ~990)\n", updateCount);  // Disabled for clean logging
+                // Serial.printf("ðŸ”„ LED task: %u updates in 30s (expect ~990)\n", updateCount);  // Disabled for clean logging
                 updateCount = 0;
                 lastUpdateLog = millis();
             }

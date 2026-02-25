@@ -69,6 +69,12 @@ volatile bool conversationMode = false;  // Track if we're in conversation windo
 uint32_t conversationWindowStart = 0;  // Timestamp when conversation window opened
 bool conversationRecording = false;  // Track if current recording was triggered from conversation mode
 
+// ---- I2S_NUM_0 ownership ----
+// audioTask is the SOLE caller of i2s_read(I2S_NUM_0). Other tasks must NOT call it directly.
+// Results are shared via these two volatile values:
+volatile int32_t ambientMicRows = 0;       // Pre-computed VU row count; LED renderer reads this
+volatile bool   conversationVADDetected = false;  // audioTask sets this when VAD fires during conv. window
+
 // Audio level delay buffer for LED sync (compensates for I2S buffer latency)
 // Size: ~240ms delay for optimal LED/audio sync (8 frames @ 30ms each)
 // Tuning: Increase for more latency compensation, decrease for tighter sync (may see LED lag)
@@ -1679,70 +1685,32 @@ void loop() {
         }
         
         if (elapsed < CONVERSATION_WINDOW_MS) {
-            // Window is open - check for voice activity
-            static int16_t windowBuffer[320];  // 20ms at 16kHz for quick VAD check
-            size_t bytes_read = 0;
+            // Voice activity is detected by audioTask (the sole I2S_NUM_0 reader).
+            // It sets conversationVADDetected = true when amplitude exceeds threshold.
+            // We just need to check that flag here.
             
-            // Safety: Only read if not playing alarm
+            // Safety: don't start recording if alarm is active
             if (isPlayingAlarm) {
                 return;
             }
             
-            esp_err_t result = i2s_read(I2S_NUM_0, windowBuffer, sizeof(windowBuffer), &bytes_read, 10);
-            
-            if (result == ESP_OK && bytes_read > 0) {
-                size_t samples_read = bytes_read / sizeof(int16_t);
+            if (conversationVADDetected) {
+                conversationVADDetected = false;  // Consume the flag
                 
-                // Apply same 16x gain as normal recording (INMP441 has low output)
-                const int16_t GAIN = 16;
-                for (size_t i = 0; i < samples_read; i++) {
-                    int32_t amplified = (int32_t)windowBuffer[i] * GAIN;
-                    // Clamp to int16_t range
-                    if (amplified > 32767) amplified = 32767;
-                    if (amplified < -32768) amplified = -32768;
-                    windowBuffer[i] = (int16_t)amplified;
-                }
+                // Voice detected - log and start recording
+                Serial.printf("🎤 Voice detected in conversation window - avgAmp=%d, starting recording\n", (int)currentAudioLevel);
                 
-                // Calculate amplitude
-                int32_t sum = 0;
-                for (size_t i = 0; i < samples_read; i++) {
-                    sum += abs(windowBuffer[i]);
-                }
-                int32_t avgAmplitude = sum / samples_read;
+                // Exit conversation mode and start recording
+                conversationMode = false;
+                conversationRecording = true;
+                recordingActive = true;
+                recordingStartTime = millis();
+                lastVoiceActivityTime = millis();
+                processingStartTime = 0;  // CRITICAL: Reset processing timer to prevent immediate timeout
+                currentLEDMode = LED_RECORDING;
+                lastDebounceTime = millis();
                 
-                // Debug sound detection
-                static uint32_t lastSoundPrint = 0;
-                if (avgAmplitude > 100 && millis() - lastSoundPrint > 500) {
-                    Serial.printf("🔊 Sound: %d (threshold=%d, bytes=%d)\n", avgAmplitude, VAD_CONVERSATION_THRESHOLD, bytes_read);
-                    lastSoundPrint = millis();
-                }
-                
-                // Use lower threshold during conversation window for faster response
-                if (samples_read > 0 && avgAmplitude > VAD_CONVERSATION_THRESHOLD) {
-                    // Voice detected! Start recording immediately
-                    Serial.printf("🎤 Voice detected in conversation window - avgAmp=%d, starting recording\n", avgAmplitude);
-                    
-                    // Set audio level immediately for instant VU meter feedback
-                    currentAudioLevel = avgAmplitude;
-                    
-                    // Exit conversation mode and start recording
-                    conversationMode = false;  // Exit window mode
-                    conversationRecording = true;  // Flag for longer silence timeout
-                    recordingActive = true;
-                    recordingStartTime = millis();
-                    lastVoiceActivityTime = millis();
-                    processingStartTime = 0;  // CRITICAL: Reset processing timer to prevent immediate timeout
-                    currentLEDMode = LED_RECORDING;
-                    lastDebounceTime = millis();  // Reset debounce to prevent immediate stop
-                    
-                    Serial.printf("✅ Recording mode activated: LED=%d, audioLevel=%d\n", currentLEDMode, currentAudioLevel);
-                }
-            } else {
-                static uint32_t lastErrorPrint = 0;
-                if (millis() - lastErrorPrint > 3000) {
-                    Serial.printf("⚠️  I2S error: result=%d, bytes=%d\n", result, bytes_read);
-                    lastErrorPrint = millis();
-                }
+                Serial.printf("✅ Recording mode activated: LED=%d, audioLevel=%d\n", currentLEDMode, (int)currentAudioLevel);
             }
         } else {
             // Window expired with no voice - return to visualizations or idle
@@ -1953,6 +1921,67 @@ void audioTask(void * parameter) {
                     }
                 }
             }
+        } else if (conversationMode || ambientVUMode) {
+            // audioTask is the sole reader of I2S_NUM_0. When the main loop opens a
+            // conversation window, or the LED task needs ambient VU levels, this branch
+            // reads the mic and posts results via the two volatile shared values above.
+            // Neither loop() nor ledTask call i2s_read(I2S_NUM_0) directly.
+            static int16_t micBuf[MIC_FRAME_SIZE];  // 320 samples = 20ms at 16kHz
+            
+            // Auto-gain state for VU meter (persists across calls)
+            static float vuAutoGain   = 25.0f;
+            static float vuPeakRMS    = 100.0f;
+            static float vuSmoothedRMS = 0.0f;
+            static uint32_t lastGainAdjust = 0;
+            
+            size_t mic_bytes = 0;
+            if (i2s_read(I2S_NUM_0, micBuf, sizeof(micBuf), &mic_bytes, 0) == ESP_OK && mic_bytes > 0) {
+                size_t samples = mic_bytes / sizeof(int16_t);
+                
+                // Apply gain and accumulate stats in one pass
+                const int16_t GAIN = 16;
+                int64_t sumSq  = 0;
+                int32_t sumAbs = 0;
+                for (size_t i = 0; i < samples; i++) {
+                    int32_t amp = (int32_t)micBuf[i] * GAIN;
+                    if (amp >  32767) amp =  32767;
+                    if (amp < -32768) amp = -32768;
+                    micBuf[i] = (int16_t)amp;
+                    sumSq  += (int64_t)amp * amp;
+                    sumAbs += abs(amp);
+                }
+                
+                // --- Conversation window VAD ---
+                if (conversationMode && samples > 0) {
+                    int32_t avgAmp = sumAbs / samples;
+                    if (avgAmp > VAD_CONVERSATION_THRESHOLD) {
+                        currentAudioLevel = avgAmp;
+                        conversationVADDetected = true;  // loop() checks this flag
+                    }
+                }
+                
+                // --- Ambient VU meter ---
+                if (ambientVUMode && samples > 0) {
+                    float rms = sqrtf((float)sumSq / samples);
+                    
+                    // Peak tracking + auto-gain
+                    vuPeakRMS = vuPeakRMS * 0.995f + rms * 0.005f;
+                    if (rms > vuPeakRMS) vuPeakRMS = rms;
+                    
+                    uint32_t nowMs = millis();
+                    if (nowMs - lastGainAdjust > 50) {
+                        if (vuPeakRMS < 150  && vuAutoGain < 50.0f) vuAutoGain *= 1.15f;
+                        else if (vuPeakRMS > 2500 && vuAutoGain >  3.0f) vuAutoGain *= 0.85f;
+                        lastGainAdjust = nowMs;
+                    }
+                    
+                    float gained = rms * vuAutoGain;
+                    if (gained > 1500) gained = 1500 + (gained - 1500) * 0.3f;
+                    vuSmoothedRMS = vuSmoothedRMS * 0.80f + gained * 0.20f;
+                    ambientMicRows = map(constrain((int)vuSmoothedRMS, 150, 1600), 150, 1600, 0, LEDS_PER_COLUMN);
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));  // 5 ms = ~200 Hz mic poll rate (plenty for VAD)
         } else {
             // Nothing to do - sleep briefly
             vTaskDelay(pdMS_TO_TICKS(1));
@@ -3079,91 +3108,35 @@ void updateLEDs() {
             break;
             
         case LED_AMBIENT_VU:
-            // Ambient sound VU meter - vertical bars on all strips with fade trail
-            // Each strip is a vertical VU meter synced together
+            // Ambient sound VU meter - vertical bars on all strips with fade trail.
+            // Row count is computed by audioTask (the sole I2S_NUM_0 reader) and
+            // stored in the volatile ambientMicRows global - no i2s_read here.
             {
-                static int16_t ambientBuffer[640];  // 40ms at 16kHz (640 samples)
-                size_t bytes_read = 0;
-                
                 // Fade all LEDs slightly for trail effect (instead of clearing)
                 for (int i = 0; i < NUM_LEDS; i++) {
                     leds[i].fadeToBlackBy(80);  // Gentle fade creates smooth trail
                 }
                 
-                // Read from microphone
-                if (i2s_read(I2S_NUM_0, ambientBuffer, sizeof(ambientBuffer), &bytes_read, 0) == ESP_OK) {
-                    size_t samples_read = bytes_read / sizeof(int16_t);
-                    
-                    // Calculate RMS amplitude
-                    int64_t sum = 0;
-                    for (size_t i = 0; i < samples_read; i++) {
-                        int32_t sample = ambientBuffer[i];
-                        sum += (int64_t)sample * sample;
-                    }
-                    float rms = sqrt(sum / samples_read);
-                    
-                    // Auto-gain control with peak limiting
-                    static float autoGain = 25.0f;  // Start with high gain for ambient sounds
-                    static float peakRMS = 100.0f;  // Track peak levels
-                    static uint32_t lastGainAdjust = 0;
-                    
-                    // Update peak tracker (decay slowly)
-                    peakRMS = peakRMS * 0.995f + rms * 0.005f;
-                    if (rms > peakRMS) peakRMS = rms;
-                    
-                    // Adjust gain based on recent peak levels (every 50ms for faster response)
-                    if (millis() - lastGainAdjust > 50) {
-                        // Target peak around 800-1500 for good range
-                        if (peakRMS < 150 && autoGain < 50.0f) {
-                            autoGain *= 1.15f;  // Increase gain faster for quiet sounds
-                        } else if (peakRMS > 2500 && autoGain > 3.0f) {
-                            autoGain *= 0.85f;  // Decrease gain for loud sounds
-                        }
-                        lastGainAdjust = millis();
-                    }
-                    
-                    // Apply auto-gain
-                    float gainedRMS = rms * autoGain;
-                    
-                    // Soft compression: reduce peaks above threshold
-                    if (gainedRMS > 1500) {
-                        // Logarithmic compression for peaks
-                        gainedRMS = 1500 + (gainedRMS - 1500) * 0.3f;
-                    }
-                    
-                    // Smooth the value for more stable display and better visibility of sustained sounds
-                    static float smoothedRMS = 0.0f;
-                    smoothedRMS = smoothedRMS * 0.80f + gainedRMS * 0.20f;  // 80/20 for more smoothing
-                    
-                    // Map to row count (0-12 rows) instead of total LED count
-                    // Adjusted range: 150-1600 for good sensitivity
-                    int numRows = map(constrain((int)smoothedRMS, 150, 1600), 150, 1600, 0, LEDS_PER_COLUMN);
-                    
-                    // Debug output every 2 seconds
-                    static uint32_t lastDebug = 0;
-                    if (millis() - lastDebug > 2000) {
-                        Serial.printf("🎵 VU: raw=%.0f gain=%.1f gained=%.0f smooth=%.0f rows=%d\n", 
-                                     rms, autoGain, gainedRMS, smoothedRMS, numRows);
-                        lastDebug = millis();
-                    }
-                    
-                    // VU meter gradient - vertical on all strips (column-based)
-                    for (int col = 0; col < LED_COLUMNS; col++) {
-                        for (int row = 0; row < LEDS_PER_COLUMN; row++) {
-                            int ledIndex = col * LEDS_PER_COLUMN + row;
-                            
-                            if (row < numRows) {
-                                // Gradient based on row height
-                                if (row < LEDS_PER_COLUMN * 0.5) {
-                                    leds[ledIndex] = CRGB(0, 255, 0);  // Green (bottom 50% - 6 LEDs)
-                                } else if (row < LEDS_PER_COLUMN * 0.83) {
-                                    leds[ledIndex] = CRGB(255, 255, 0);  // Yellow (50-83% - 4 LEDs)
-                                } else {
-                                    leds[ledIndex] = CRGB(255, 0, 0);  // Red (top 83-100% - 2 LEDs)
-                                }
+                // Row count is produced by audioTask via the full auto-gain + compression
+                // + smoothing pipeline.  Just read it atomically.
+                int numRows = ambientMicRows;
+                
+                // VU meter gradient - vertical on all strips (column-based)
+                for (int col = 0; col < LED_COLUMNS; col++) {
+                    for (int row = 0; row < LEDS_PER_COLUMN; row++) {
+                        int ledIndex = col * LEDS_PER_COLUMN + row;
+                        
+                        if (row < numRows) {
+                            // Gradient based on row height
+                            if (row < LEDS_PER_COLUMN * 0.5) {
+                                leds[ledIndex] = CRGB(0, 255, 0);  // Green (bottom 50% - 6 LEDs)
+                            } else if (row < LEDS_PER_COLUMN * 0.83) {
+                                leds[ledIndex] = CRGB(255, 255, 0);  // Yellow (50-83% - 4 LEDs)
+                            } else {
+                                leds[ledIndex] = CRGB(255, 0, 0);  // Red (top 83-100% - 2 LEDs)
                             }
-                            // LEDs above numRows will keep their faded value from fadeToBlackBy
                         }
+                        // LEDs above numRows keep their faded value from fadeToBlackBy
                     }
                 }
             }

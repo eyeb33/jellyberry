@@ -1408,7 +1408,8 @@ void loop() {
                                      effectiveMode == LED_AMBIENT   ||
                                      effectiveMode == LED_LAMP      ||
                                      effectiveMode == LED_POMODORO  ||
-                                     meditationState.active);  // Voice-triggered meditation may be in AUDIO_REACTIVE during verbal response
+                                     meditationState.active         ||  // Voice-triggered meditation may be in AUDIO_REACTIVE during verbal response
+                                     lampState.active);                 // Voice-triggered lamp may be in AUDIO_REACTIVE during verbal response
             if (!isPersistentMode) {
                 // Open 10-second conversation window
                 conversationMode = true;

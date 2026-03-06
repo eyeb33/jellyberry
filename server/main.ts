@@ -76,6 +76,8 @@ interface ClientConnection {
   audioChunkCount?: number;     // Total audio chunks received
   lastAudioChunkTime?: number;  // Timestamp of last audio chunk
   lastMessageType?: string;     // Type of last message received
+  turnAudioChunks?: number;     // Audio chunks in current turn
+  turnAudioBytes?: number;      // PCM bytes sent in current turn
 }
 
 const connections = new Map<string, ClientConnection>();
@@ -1549,9 +1551,13 @@ async function connectToGemini(connection: ClientConnection) {
         
         connection.lastMessageType = msgType;
         
-        // Log message with timing info
-        const preview = JSON.stringify(json).substring(0, 150);
-        console.log(`[${connection.deviceId}] 📩 Gemini #${msgNum} [${msgType}] @${timeSinceConnect}s: ${preview}${json.serverContent ? '...' : ''}`);
+        // Log message with timing info — skip audio-only modelTurn spam
+        const isAudioOnlyTurn = msgType === "modelTurn" &&
+          json.serverContent?.modelTurn?.parts?.every((p: any) => p.inlineData);
+        if (!isAudioOnlyTurn) {
+          const preview = JSON.stringify(json).substring(0, 150);
+          console.log(`[${connection.deviceId}] 📩 Gemini #${msgNum} [${msgType}] @${timeSinceConnect}s: ${preview}${json.serverContent ? '...' : ''}`);
+        }
         
         // Handle setup complete
         if (json.setupComplete) {
@@ -1926,12 +1932,9 @@ async function connectToGemini(connection: ClientConnection) {
               
               // Track audio chunk statistics
               connection.audioChunkCount = (connection.audioChunkCount || 0) + 1;
+              connection.turnAudioChunks = (connection.turnAudioChunks || 0) + 1;
               const now = Date.now();
-              const gapMs = connection.lastAudioChunkTime ? (now - connection.lastAudioChunkTime) : 0;
               connection.lastAudioChunkTime = now;
-              
-              const chunkNum = connection.audioChunkCount;
-              console.log(`[${connection.deviceId}] 🔊 Audio chunk #${chunkNum}: ${base64Audio.length} chars base64, gap=${gapMs}ms, mimeType=${mimeType}`);
               
               // Decode base64 to raw PCM bytes (16-bit little-endian)
               const binaryString = atob(base64Audio);
@@ -1958,7 +1961,7 @@ async function connectToGemini(connection: ClientConnection) {
                 chunksInThisPart++;
               }
               
-              console.log(`[${connection.deviceId}] 📤 ESP32 Raw PCM: ${totalBytesSent} bytes in ${chunksInThisPart} chunks (${(totalBytesSent / 2 / 24000 * 1000).toFixed(0)}ms audio)`);
+              connection.turnAudioBytes = (connection.turnAudioBytes || 0) + totalBytesSent;
             }
             
             // Handle text responses
@@ -1971,7 +1974,10 @@ async function connectToGemini(connection: ClientConnection) {
         
         // Handle turn complete
         if (json.serverContent?.turnComplete) {
-          console.log(`[${connection.deviceId}] Turn complete`);
+          const audioMs = ((connection.turnAudioBytes || 0) / 2 / 24000 * 1000).toFixed(0);
+          console.log(`[${connection.deviceId}] Turn complete — audio: ${connection.turnAudioChunks || 0} chunks, ${audioMs}ms`);
+          connection.turnAudioChunks = 0;
+          connection.turnAudioBytes = 0;
           connection.socket.send(JSON.stringify({ type: "turnComplete" }));
         }
         

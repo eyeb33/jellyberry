@@ -749,8 +749,8 @@ void loop() {
                     pomodoroState.paused = true;  // Will auto-start after marquee
                 }
                 
-                DEBUG_PRINTLN("ðŸ… Pomodoro mode activated (will auto-start after marquee)");
-                startMarquee("POMODORO", CRGB(255, 100, 0), LED_POMODORO);  // Orange for pomodoro
+                DEBUG_PRINTLN("Pomodoro mode activated");
+                currentLEDMode = LED_POMODORO;
             } else if (modeToCheck == LED_POMODORO) {
                 // Exit Pomodoro and go to Meditation
                 DEBUG_PRINTLN("â¹ï¸  Pomodoro mode stopped");
@@ -1389,12 +1389,57 @@ void loop() {
         
         // Check if turn is complete - if so, decide what to show
         if (turnComplete) {
-            // Always open conversation window first (10 second listening period)
-            // Visualizations will show after conversation window closes
-            conversationMode = true;
-            conversationWindowStart = millis();
-            currentLEDMode = LED_CONVERSATION_WINDOW;
-            Serial.println("ðŸ’¬ Conversation window opened - speak anytime in next 10 seconds");
+            LEDMode effectiveMode = currentLEDMode;
+            bool isPersistentMode = (effectiveMode == LED_MEDITATION ||
+                                     effectiveMode == LED_AMBIENT   ||
+                                     effectiveMode == LED_LAMP      ||
+                                     effectiveMode == LED_POMODORO  ||
+                                     meditationState.active);  // Voice-triggered meditation may be in AUDIO_REACTIVE during verbal response
+            if (!isPersistentMode) {
+                // Open 10-second conversation window
+                conversationMode = true;
+                conversationWindowStart = millis();
+                currentLEDMode = LED_CONVERSATION_WINDOW;
+                Serial.println("Conversation window opened - speak anytime in next 10 seconds");
+            } else {
+                Serial.printf("Skipping conversation window - entering persistent mode %d\n", effectiveMode);
+                // If Gemini's verbal response set currentLEDMode to a transient state (AUDIO_REACTIVE
+                // etc.), we need to explicitly return to the active persistent mode now that audio is done.
+                if (currentLEDMode == LED_AUDIO_REACTIVE || currentLEDMode == LED_RECORDING || currentLEDMode == LED_PROCESSING) {
+                    if (meditationState.active) {
+                        currentLEDMode = LED_MEDITATION;
+                        Serial.println("Returning to MEDITATION after Gemini response");
+                        // Start deferred meditation if it was queued (Gemini was talking when it began)
+                        if (meditationState.phaseStartTime == 0 && !meditationState.streaming) {
+                            meditationState.phaseStartTime = millis();
+                            ambientSound.name = "om001";
+                            ambientSound.active = true;
+                            isPlayingAmbient = true;
+                            isPlayingResponse = false;
+                            firstAudioChunk = true;
+                            lastAudioChunkTime = millis();
+                            JsonDocument reqDoc;
+                            reqDoc["action"] = "requestAmbient";
+                            reqDoc["sound"] = "om001";
+                            reqDoc["sequence"] = ++ambientSound.sequence;
+                            String reqMsg;
+                            serializeJson(reqDoc, reqMsg);
+                            webSocket.sendTXT(reqMsg);
+                            meditationState.streaming = true;
+                            Serial.println("Deferred meditation started: Gemini turn complete");
+                        }
+                    } else if (pomodoroState.active) {
+                        currentLEDMode = LED_POMODORO;
+                        Serial.println("Returning to POMODORO after Gemini response");
+                    } else if (ambientSound.active) {
+                        currentLEDMode = LED_AMBIENT;
+                        Serial.println("Returning to AMBIENT after Gemini response");
+                    } else if (lampState.active) {
+                        currentLEDMode = LED_LAMP;
+                        Serial.println("Returning to LAMP after Gemini response");
+                    }
+                }
+            }
         } else {
             // Turn not complete - show visualizations or return to idle/ambient
             // Priority: Pomodoro > Timer > Moon > Tide > Ambient VU > Idle

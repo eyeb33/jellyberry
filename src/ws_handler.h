@@ -17,9 +17,7 @@ extern SemaphoreHandle_t       ledMutex;
 
 extern LEDMode    currentLEDMode;
 
-extern bool     startupSoundPlayed;
 extern bool     turnComplete;
-extern bool     waitingForGreeting;
 extern bool     responseInterrupted;
 extern bool     firstAudioChunk;
 extern bool     isPlayingAlarm;
@@ -45,7 +43,6 @@ extern AmbientSoundType   currentAmbientSoundType;
 extern const char* CHAKRA_NAMES[];
 
 // ── Helper functions defined in main.cpp ──
-void playStartupSound();
 void playVolumeChime();
 void updateDayNightBrightness();
 void playShutdownSound();

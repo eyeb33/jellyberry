@@ -1314,14 +1314,14 @@ async function connectToGemini(connection: ClientConnection) {
  speechConfig: {
  voiceConfig: {
  prebuiltVoiceConfig: {
- voiceName: "Kore" // Calm, neutral voice
+ voiceName: "Aoede" // Calm, neutral voice
  }
  }
  }
  },
  systemInstruction: {
  parts: [{
- text: `You are a helpful voice assistant for a smart device. The current date and time is: ${ukTime}. The user is located in the UK (Europe/London timezone). When setting alarms, if the user says a time without specifying a date, intelligently determine if they mean today or tomorrow based on the current time. For example, if it's 11:06pm and they say "set an alarm for 1:21", they likely mean 1:21am tonight (in a few hours), not 1:21pm tomorrow. Always confirm the exact date and time you're setting the alarm for.`
+ text: `You are a helpful voice assistant for a smart device called Jellyberry. The current date and time is: ${ukTime}. The user is located in the UK (Europe/London timezone). When setting alarms, if the user says a time without specifying a date, intelligently determine if they mean today or tomorrow based on the current time. For example, if it's 11:06pm and they say "set an alarm for 1:21", they likely mean 1:21am tonight (in a few hours), not 1:21pm tomorrow. Always confirm the exact date and time you're setting the alarm for. The device also supports ambient sound modes (rain, ocean, rainforest, fire), a guided chakra meditation mode with breathing visualisation, a lamp mode (white/red/green/blue), Pomodoro timers, alarms, and timers. Use the appropriate functions to start or stop these modes when the user requests them.`
  }]
  },
  tools: [{
@@ -1499,6 +1499,70 @@ async function connectToGemini(connection: ClientConnection) {
  {
  name: "get_pomodoro_status",
  description: "Get the current Pomodoro timer status including whether any timer is running, session type, time remaining, and cycle number. ALWAYS use this function when user asks about Pomodoro timers, whether phrased as 'is there a timer', 'are any timers running', 'how much time left', 'what session am I in', 'pomodoro status', etc. Returns accurate real-time status from device.",
+ parameters: {
+ type: "OBJECT",
+ properties: {},
+ required: []
+ }
+ },
+ {
+ name: "start_meditation",
+ description: "Start a guided chakra meditation session with breathing visualisation and om sound tones. Use when the user asks to meditate, start meditation, do a breathing exercise, or anything similar.",
+ parameters: {
+ type: "OBJECT",
+ properties: {},
+ required: []
+ }
+ },
+ {
+ name: "stop_meditation",
+ description: "Stop an active meditation session and return to idle mode.",
+ parameters: {
+ type: "OBJECT",
+ properties: {},
+ required: []
+ }
+ },
+ {
+ name: "start_ambient",
+ description: "Start playing an ambient sound loop. Available sounds: rain, ocean, rainforest, fire. Use when the user asks to play rain sounds, ocean sounds, nature sounds, fire crackling, etc.",
+ parameters: {
+ type: "OBJECT",
+ properties: {
+ sound: {
+ type: "STRING",
+ description: "The ambient sound to play. One of: rain, ocean, rainforest, fire."
+ }
+ },
+ required: ["sound"]
+ }
+ },
+ {
+ name: "stop_ambient",
+ description: "Stop any currently playing ambient sound.",
+ parameters: {
+ type: "OBJECT",
+ properties: {},
+ required: []
+ }
+ },
+ {
+ name: "start_lamp",
+ description: "Turn on the lamp mode with a chosen colour. Use when the user asks to turn on a lamp, set a light colour, use as a night light, etc.",
+ parameters: {
+ type: "OBJECT",
+ properties: {
+ color: {
+ type: "STRING",
+ description: "Lamp colour: white, red, green, or blue."
+ }
+ },
+ required: ["color"]
+ }
+ },
+ {
+ name: "stop_lamp",
+ description: "Turn off the lamp mode.",
  parameters: {
  type: "OBJECT",
  properties: {},
@@ -1784,6 +1848,32 @@ async function connectToGemini(connection: ClientConnection) {
  
  functionResult = await statusPromise;
  console.log(`[${connection.deviceId}] Pomodoro status result:`, functionResult);
+ } else if (funcName === "start_meditation") {
+ connection.socket.send(JSON.stringify({ type: "meditationStart" }));
+ console.log(`[${connection.deviceId}] Sent meditationStart to ESP32`);
+ functionResult = { success: true, message: "Meditation session started" };
+ } else if (funcName === "stop_meditation") {
+ connection.socket.send(JSON.stringify({ type: "switchToIdle" }));
+ console.log(`[${connection.deviceId}] Sent switchToIdle (stop_meditation) to ESP32`);
+ functionResult = { success: true, message: "Meditation session stopped" };
+ } else if (funcName === "start_ambient") {
+ const sound = (funcArgs.sound || "rain").toLowerCase();
+ connection.socket.send(JSON.stringify({ type: "ambientStart", sound }));
+ console.log(`[${connection.deviceId}] Sent ambientStart (${sound}) to ESP32`);
+ functionResult = { success: true, message: `Playing ${sound} ambient sound` };
+ } else if (funcName === "stop_ambient") {
+ connection.socket.send(JSON.stringify({ type: "switchToIdle" }));
+ console.log(`[${connection.deviceId}] Sent switchToIdle (stop_ambient) to ESP32`);
+ functionResult = { success: true, message: "Ambient sound stopped" };
+ } else if (funcName === "start_lamp") {
+ const color = (funcArgs.color || "white").toLowerCase();
+ connection.socket.send(JSON.stringify({ type: "lampStart", color }));
+ console.log(`[${connection.deviceId}] Sent lampStart (${color}) to ESP32`);
+ functionResult = { success: true, message: `Lamp turned on (${color})` };
+ } else if (funcName === "stop_lamp") {
+ connection.socket.send(JSON.stringify({ type: "switchToIdle" }));
+ console.log(`[${connection.deviceId}] Sent switchToIdle (stop_lamp) to ESP32`);
+ functionResult = { success: true, message: "Lamp turned off" };
  }
  
  // Send function response back to Gemini

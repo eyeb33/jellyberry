@@ -1,8 +1,8 @@
-#include "front_text_marquee.h"
+﻿#include "front_text_marquee.h"
 
 // ============== FONT DEFINITION ==============
 //
-// Simple 3×8 glyphs matching Arduino prototype.
+// Simple 3├ù8 glyphs matching Arduino prototype.
 // Each glyph is 3 columns wide, 8 rows tall.
 // Bits read bottom-to-top within each column.
 //

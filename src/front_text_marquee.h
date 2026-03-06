@@ -1,4 +1,4 @@
-#ifndef FRONT_TEXT_MARQUEE_H
+﻿#ifndef FRONT_TEXT_MARQUEE_H
 #define FRONT_TEXT_MARQUEE_H
 
 #include <Arduino.h>
@@ -8,7 +8,7 @@
 // ============== FRONT TEXT MARQUEE ==============
 //
 // Self-contained scrolling text system for the full circumference display.
-// Uses simple 3×8 glyphs (centered vertically in 12-row strips)
+// Uses simple 3├ù8 glyphs (centered vertically in 12-row strips)
 // matching the Arduino prototype design.
 //
 // Text scrolls around all 12 strips, visible from any viewing angle.

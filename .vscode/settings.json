@@ -1,0 +1,4 @@
+{
+  "deno.enablePaths": ["server"],
+  "deno.suggest.imports.autoDiscover": false
+}

@@ -12,13 +12,6 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
     // Handle server ready message
     if (doc["type"].is<const char*>() && doc["type"] == "ready") {
         Serial.printf("✓ Server: %s\n", doc["message"].as<const char*>());
-        
-        // Play startup sound once after WebSocket is ready
-        if (!startupSoundPlayed) {
-            startupSoundPlayed = true;
-            Serial.println("🔊 Playing startup sound...");
-            playStartupSound();
-        }
         return;
     }
     
@@ -36,12 +29,6 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
         // Don't change LED mode here - let the audio finish playing naturally
         // isPlayingResponse will be set to false when audio actually stops
         // Conversation window will open after audio completes
-        
-        // Clear greeting flag ONLY if this was the startup greeting
-        if (waitingForGreeting) {
-            waitingForGreeting = false;
-            Serial.println("👋 Startup greeting complete!");
-        }
         
         // Clear interrupt flag - old turn is done, ready for new response
         if (responseInterrupted) {

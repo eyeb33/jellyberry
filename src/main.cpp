@@ -50,9 +50,7 @@ volatile bool isPlayingAmbient = false;  // Track ambient sound playback separat
 bool isPlayingAlarm = false;      // Track alarm sound playback
 bool turnComplete = false;  // Track when Gemini has finished its turn
 bool responseInterrupted = false;  // Flag to ignore audio after interrupt
-bool waitingForGreeting = false;  // Flag to skip timeout when waiting for startup greeting
 bool shutdownSoundPlayed = false;  // Flag to prevent repeated shutdown sounds during reconnection
-bool firstConnection = true;  // Track if this is the first connection (cold boot)
 uint32_t recordingStartTime = 0;
 uint32_t lastVoiceActivityTime = 0;
 uint32_t lastAudioChunkTime = 0;  // Track when we last received audio
@@ -104,9 +102,6 @@ bool ambientVUMode = false;  // Toggle for ambient sound VU meter mode
 // Ambient sound type (for cycling within AMBIENT mode)
 AmbientSoundType currentAmbientSoundType = SOUND_RAIN;
 
-// Startup sound flag
-bool startupSoundPlayed = false;
-
 // Tide visualization state
 TideState tideState = {"", 0.0, 0, 0, false};
 
@@ -153,7 +148,6 @@ bool initI2SSpeaker();
 #include "ws_handler.h"
 bool detectVoiceActivity(int16_t* samples, size_t count);
 void sendAudioChunk(uint8_t* data, size_t length);
-void playStartupSound();
 void playZenBell();
 void playShutdownSound();
 void playVolumeChime();
@@ -1394,8 +1388,7 @@ void loop() {
             DEBUG_PRINT("â¹ï¸  Audio playback complete (timeout + queue drained to %u), turnComplete=%d\n", queueDepth, turnComplete);
         
         // Check if turn is complete - if so, decide what to show
-        // Skip conversation mode for startup greeting
-        if (turnComplete && !waitingForGreeting) {
+        if (turnComplete) {
             // Always open conversation window first (10 second listening period)
             // Visualizations will show after conversation window closes
             conversationMode = true;
@@ -1895,21 +1888,6 @@ void audioTask(void * parameter) {
 }
 
 // ============== AUDIO FEEDBACK ==============
-void playStartupSound() {
-    // Request startup sound from server
-    if (!isWebSocketConnected) {
-        Serial.println("âš ï¸  Cannot play startup sound - WebSocket not connected");
-        return;
-    }
-    
-    JsonDocument startupDoc;
-    startupDoc["action"] = "requestStartup";
-    String startupMsg;
-    serializeJson(startupDoc, startupMsg);
-    webSocket.sendTXT(startupMsg);
-    Serial.println("ðŸ”Š Requesting startup sound from server");
-}
-
 void playZenBell() {
     // Request zen bell sound from server
     if (!isWebSocketConnected) {

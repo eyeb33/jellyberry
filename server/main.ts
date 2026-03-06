@@ -1183,6 +1183,54 @@ Deno.serve({
           return;
         }
         
+        // Handle device state snapshot sent at the start of each recording
+        if (data.type === "recordingStart") {
+          connection.deviceState = data;
+
+          // Build natural-language state string for Gemini context
+          const parts: string[] = [];
+
+          if (data.pomodoro?.active) {
+            const p = data.pomodoro as any;
+            const mins = Math.floor(p.secondsRemaining / 60);
+            const secs = p.secondsRemaining % 60;
+            const timeStr = `${mins}m ${secs}s`;
+            const status = p.paused ? "paused" : "running";
+            parts.push(`Pomodoro active — ${p.session} session, ${timeStr} remaining (${status})`);
+          } else {
+            parts.push("Pomodoro: inactive");
+          }
+
+          if (data.meditation?.active) {
+            const m = data.meditation as any;
+            parts.push(`Meditation active — ${m.chakra} chakra`);
+          } else {
+            parts.push("Meditation: inactive");
+          }
+
+          if (data.ambient?.active) {
+            const a = data.ambient as any;
+            parts.push(`Ambient sound active — ${a.sound}`);
+          } else {
+            parts.push("Ambient sound: inactive");
+          }
+
+          if (data.timer?.active) {
+            const t = data.timer as any;
+            const mins = Math.floor(t.secondsRemaining / 60);
+            const secs = t.secondsRemaining % 60;
+            parts.push(`Timer active — ${mins}m ${secs}s remaining`);
+          } else {
+            parts.push("Timer: inactive");
+          }
+
+          const stateText = `SYSTEM: Current device state — ${parts.join(". ")}.`;
+          console.log(`[${deviceId}] 📋 Device state: ${stateText}`);
+          // State is stored in connection.deviceState for reference; not injected into
+          // the Gemini audio stream — mixing clientContent text turns with binary PCM
+          // audio frames in the same turn causes a 1008 Policy Violation.
+          return;
+        }
         // Forward audio/messages to Gemini
         if (connection.geminiSocket && connection.geminiSocket.readyState === WebSocket.OPEN) {
           const logData = typeof event.data === "string" ? event.data : `[binary ${event.data.byteLength} bytes]`;

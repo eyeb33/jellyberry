@@ -1858,6 +1858,7 @@ void audioTask(void * parameter) {
                     // On first chunk of each recording, send device state context to server
                     if (!recordingStartSent) {
                         recordingStartSent = true;
+                        turnComplete = false;  // New user turn starting - clear previous turn's flag
                         JsonDocument stateDoc;
                         stateDoc["type"] = "recordingStart";
 
@@ -2305,10 +2306,10 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     if (queueDepth >= MIN_PREBUFFER) {
                         isPlayingResponse = true;
                         
-                        // Only reset turn state for non-ambient audio
-                        if (!isPlayingAmbient && !isPlayingAlarm) {
-                            turnComplete = false;  // New Gemini turn starting
-                        }
+                        // NOTE: turnComplete is NOT reset here to avoid a race condition where
+                        // Gemini's turnComplete message arrives before the prebuffer fills (common
+                        // for short responses like the boot greeting). Instead, turnComplete is
+                        // reset at recordingStart (when the user begins a new turn).
                         
                         recordingActive = false;  // Ensure recording is stopped
                         

@@ -1414,6 +1414,7 @@ void loop() {
                 // Open 10-second conversation window
                 conversationMode = true;
                 conversationWindowStart = millis();
+                conversationVADDetected = false;  // Flush any residual VAD from speaker resonance
                 currentLEDMode = LED_CONVERSATION_WINDOW;
                 Serial.println("Conversation window opened - speak anytime in next 10 seconds");
             } else {
@@ -1606,6 +1607,7 @@ void loop() {
                          currentLEDMode, recordingActive, isPlayingResponse, alarmState.ringing);
             conversationMode = true;
             conversationWindowStart = millis();
+            conversationVADDetected = false;  // Flush any residual VAD from speaker resonance
             currentLEDMode = LED_CONVERSATION_WINDOW;
             Serial.println("Conversation window opened - speak anytime in next 10 seconds");
         }
@@ -1628,12 +1630,16 @@ void loop() {
             // It sets conversationVADDetected = true when amplitude exceeds threshold.
             // We just need to check that flag here.
             
+            // Guard: ignore VAD for first 800ms after window opens to let speaker resonance die down.
+            // Without this, the tail of Gemini's audio playback can false-trigger a new recording.
+            const uint32_t VAD_GUARD_MS = 800;
+            
             // Safety: don't start recording if alarm is active
             if (isPlayingAlarm) {
                 return;
             }
             
-            if (conversationVADDetected) {
+            if (elapsed >= VAD_GUARD_MS && conversationVADDetected) {
                 conversationVADDetected = false;  // Consume the flag
                 
                 // Voice detected - log and start recording

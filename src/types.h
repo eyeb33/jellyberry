@@ -14,6 +14,18 @@ struct AudioChunk {
 
 enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU, LED_AMBIENT, LED_POMODORO, LED_MEDITATION, LED_CLOCK, LED_LAMP, LED_SEA_GOOSEBERRY, LED_EYES, LED_ALARM, LED_CONVERSATION_WINDOW };
 
+// Conversation state machine (main-loop only — not safe to read from other FreeRTOS tasks).
+// Cross-task coordination still uses the volatile flags: recordingActive, isPlayingResponse,
+// conversationMode. ConvState is the canonical UX view of those flags, used for timeouts and
+// LED decisions inside loop() only.
+enum class ConvState : uint8_t {
+    IDLE,       // Idle animation; waiting for user input
+    RECORDING,  // Microphone active; user is speaking
+    WAITING,    // Recording stopped; waiting for Gemini audio (LED ramps from RECORDING to PROCESSING)
+    PLAYING,    // Playing Gemini's audio response (LED_AUDIO_REACTIVE)
+    WINDOW,     // 10-second follow-up window (LED_CONVERSATION_WINDOW)
+};
+
 enum AmbientSoundType { SOUND_RAIN, SOUND_OCEAN, SOUND_RAINFOREST, SOUND_FIRE };
 
 // Tide visualization state

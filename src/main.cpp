@@ -9,6 +9,7 @@
 #include <freertos/task.h>
 #include <time.h>
 #include "Config.h"
+#include "types.h"
 #include "display_mapping.h"
 #include "front_text_marquee.h"
 #include "SeaGooseberryVisualizer.h"
@@ -54,7 +55,8 @@ bool shutdownSoundPlayed = false; // Flag to prevent repeated shutdown sounds du
 uint32_t recordingStartTime = 0;
 uint32_t lastVoiceActivityTime = 0;
 uint32_t lastAudioChunkTime = 0; // Track when we last received audio
-uint32_t processingStartTime = 0; // Track when PROCESSING mode started
+ConvState convState = ConvState::IDLE;   // Main-loop UX state machine (not cross-task)
+uint32_t waitingEnteredAt = 0;           // When we entered WAITING; drives thinking-animation and 60s timeout
 uint32_t lastWebSocketSendTime = 0; // Track last successful send
 uint32_t webSocketSendFailures = 0; // Count send failures
 // NOTE: lastWiFiCheck is declared as a static local inside loop() - no global needed.
@@ -1185,6 +1187,8 @@ void loop() {
             recordingActive = true;
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
+            convState = ConvState::RECORDING;
+            waitingEnteredAt = 0;
             currentLEDMode = LED_RECORDING;
             DEBUG_PRINT(" Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
         }
@@ -1321,6 +1325,8 @@ void loop() {
             recordingActive = true;
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
+            convState = ConvState::RECORDING;
+            waitingEnteredAt = 0;
             currentLEDMode = LED_RECORDING;
             DEBUG_PRINT(" Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
             }  // End of shouldStartRecording block
@@ -1329,10 +1335,10 @@ void loop() {
         // Stop recording only on timeout (manual stop removed - rely on VAD)
         if (recordingActive && (millis() - recordingStartTime) > MAX_RECORDING_DURATION_MS) {
             recordingActive = false;
-            // Don't change LED mode if ambient sound is already active
             if (!ambientSound.active) {
-                currentLEDMode = LED_PROCESSING;
-                processingStartTime = millis();
+                // LED stays at RECORDING; thinking animation fires after THINKING_ANIMATION_DELAY_MS
+                convState = ConvState::WAITING;
+                waitingEnteredAt = millis();
             }
             DEBUG_PRINT("  Recording stopped - Duration: %dms (max duration reached)\n", millis() - recordingStartTime);
         }
@@ -1347,26 +1353,29 @@ void loop() {
         conversationRecording = false;  // Reset flag for next recording
         // Don't change LED mode if ambient sound is already active
         if (!ambientSound.active) {
-            // Don't show thinking animation yet - wait to see if response is fast
-            processingStartTime = millis();
-            // Stay in recording mode for now
+            // LED stays at RECORDING; thinking animation fires after THINKING_ANIMATION_DELAY_MS
+            convState = ConvState::WAITING;
+            waitingEnteredAt = millis();
         }
         DEBUG_PRINTLN("  Recording stopped - Silence detected");
     }
     
-    // Show thinking animation if response is taking too long (after delay)
-    if (currentLEDMode == LED_RECORDING && processingStartTime > 0 && 
-        (millis() - processingStartTime) > THINKING_ANIMATION_DELAY_MS && 
-        (millis() - processingStartTime) < 60000) {
+    // Show thinking animation once we've been WAITING long enough.
+    // Decoupled from currentLEDMode so nothing externally can invalidate it.
+    if (convState == ConvState::WAITING &&
+        (millis() - waitingEnteredAt) > THINKING_ANIMATION_DELAY_MS) {
         currentLEDMode = LED_PROCESSING;
         DEBUG_PRINTLN(" Response delayed - showing thinking animation");
     }
-    
-    // Timeout PROCESSING mode if no response after 60 seconds (generous for slow/complex Gemini tool calls)
-    if ((currentLEDMode == LED_PROCESSING || currentLEDMode == LED_RECORDING) && 
-        processingStartTime > 0 && (millis() - processingStartTime) > 60000) {
-        DEBUG_PRINT("  Processing timeout after 60s - no response received (mode was %d)\n", currentLEDMode);
-        processingStartTime = 0;
+
+    // Hard timeout: Gemini never responded (accommodates 40+ second tool calls).
+    // Checked against convState==WAITING, not against currentLEDMode, so visualizations
+    // (tide/moon/timer) cannot accidentally reset or suppress the guard.
+    if (convState == ConvState::WAITING &&
+        (millis() - waitingEnteredAt) > 60000) {
+        Serial.printf("  Gemini response timeout after 60s (LED=%d)\n", currentLEDMode);
+        convState = ConvState::IDLE;
+        waitingEnteredAt = 0;
         
         // Return to visualizations if active, otherwise IDLE
         if (pomodoroState.active) {
@@ -1393,16 +1402,20 @@ void loop() {
     // Timeout only if BOTH: (1) no new packets for 2s AND (2) queue nearly drained
     // This prevents cutting off audio that's still queued but TCP-delayed
     if (isPlayingResponse && !isPlayingAmbient) {
+        // Transition to PLAYING as soon as audio is confirmed active (cancels thinking animation)
+        if (convState == ConvState::WAITING) {
+            convState = ConvState::PLAYING;
+        }
         uint32_t queueDepth = uxQueueMessagesWaiting(audioOutputQueue);
         bool noNewPackets = (millis() - lastAudioChunkTime) > 2000;
         bool queueDrained = queueDepth < 3;  // < 120ms of audio remaining
         
         if (noNewPackets && queueDrained) {
             isPlayingResponse = false;
-            Serial.printf("[DRAIN] Audio done: queueDepth=%u, turnComplete=%d, convMode=%d, procAge=%dms\n",
-                         queueDepth, turnComplete, conversationMode,
-                         processingStartTime > 0 ? (int)(millis() - processingStartTime) : -1);
-        
+            Serial.printf("[DRAIN] Audio done: queueDepth=%u, turnComplete=%d, convState=%d, waitAge=%dms\n",
+                         queueDepth, turnComplete, (int)convState,
+                         waitingEnteredAt > 0 ? (int)(millis() - waitingEnteredAt) : -1);
+
         // Check if turn is complete - if so, decide what to show
         if (turnComplete) {
             LEDMode effectiveMode = currentLEDMode;
@@ -1414,6 +1427,7 @@ void loop() {
                                      lampState.active);                 // Voice-triggered lamp may be in AUDIO_REACTIVE during verbal response
             if (!isPersistentMode) {
                 // Open 10-second conversation window
+                convState = ConvState::WINDOW;
                 conversationMode = true;
                 conversationWindowStart = millis();
                 conversationVADDetected = false;  // Flush any residual VAD from speaker resonance
@@ -1421,6 +1435,7 @@ void loop() {
                 Serial.println("Conversation window opened - speak anytime in next 10 seconds");
             } else {
                 Serial.printf("Skipping conversation window - entering persistent mode %d\n", effectiveMode);
+                convState = ConvState::IDLE;  // Persistent mode: no follow-up window
                 // If Gemini's verbal response set currentLEDMode to a transient state (AUDIO_REACTIVE
                 // etc.), we need to explicitly return to the active persistent mode now that audio is done.
                 if (currentLEDMode == LED_AUDIO_REACTIVE || currentLEDMode == LED_RECORDING || currentLEDMode == LED_PROCESSING) {
@@ -1440,8 +1455,12 @@ void loop() {
                 }
             }
         } else {
-            // Turn not complete - show visualizations or return to idle/ambient
-            // Priority: Pomodoro > Meditation > Timer > Moon > Tide > Ambient VU > Idle
+            // Audio finished but turnComplete not yet received.
+            // Re-enter WAITING with a fresh timer so the auto-transition block can open
+            // the conversation window as soon as turnComplete arrives (or timeout after 60s).
+            convState = ConvState::WAITING;
+            waitingEnteredAt = millis();
+            // Show visualization while we wait: Pomodoro > Meditation > Timer > Moon > Tide > Ambient VU > Idle
             if (pomodoroState.active) {
                 currentLEDMode = LED_POMODORO;
                 DEBUG_PRINTLN(" Audio playback complete - switching to POMODORO display");
@@ -1584,54 +1603,53 @@ void loop() {
         ambientSound.name = "";
     }
     
-    // Periodic state dump in PROCESSING/RECORDING to help diagnose stuck states
-    if (currentLEDMode == LED_PROCESSING || currentLEDMode == LED_RECORDING) {
-        static uint32_t lastProcessingDump = 0;
-        if (millis() - lastProcessingDump > 3000) {
-            Serial.printf("[PROC] mode=%d turnComplete=%d isPlaying=%d recording=%d convMode=%d procAge=%dms\n",
-                         currentLEDMode, turnComplete, isPlayingResponse, recordingActive, conversationMode,
-                         processingStartTime > 0 ? (int)(millis() - processingStartTime) : -1);
-            lastProcessingDump = millis();
+    // Periodic state dump while WAITING for Gemini response (shows thinking animation, timeout countdown)
+    if (convState == ConvState::WAITING) {
+        static uint32_t lastWaitingDump = 0;
+        if (millis() - lastWaitingDump > 3000) {
+            Serial.printf("[WAIT] LED=%d turnComplete=%d isPlaying=%d recording=%d waitAge=%dms\n",
+                         currentLEDMode, turnComplete, isPlayingResponse, recordingActive,
+                         waitingEnteredAt > 0 ? (int)(millis() - waitingEnteredAt) : -1);
+            lastWaitingDump = millis();
         }
     }
 
-    // Auto-transition from visualizations to conversation window
-    // After 10 seconds of showing tide/moon/timer, open conversation window if turn is complete
+    // Auto-transition to conversation window when Gemini's turn is complete.
+    // In WAITING state, convState already tells us we're expecting turnComplete.
+    // Tide/Moon visualizations are respected with their own display timers.
     if (turnComplete && !conversationMode && !isPlayingResponse && !recordingActive) {
         bool shouldOpenConversation = false;
-        
-        if (currentLEDMode == LED_PROCESSING || currentLEDMode == LED_RECORDING) {
-            // Gemini completed its turn without sending any audio (e.g. interrupted turn,
-            // or a pure function-call turn where no verbal response was generated).
-            // Open the conversation window immediately so the user can follow up.
-            Serial.println("turnComplete with no audio - opening conversation window from PROCESSING/RECORDING");
-            processingStartTime = 0;
-            shouldOpenConversation = true;
-        } else if (currentLEDMode == LED_IDLE || currentLEDMode == LED_AUDIO_REACTIVE) {
-            // turnComplete arrived after audio already drained (common for short responses
-            // where the last audio packet plays out before the turnComplete message lands).
-            // The audio-completion block already set mode to IDLE/AUDIO_REACTIVE; we just
-            // missed the window there. Open it now.
-            Serial.println("turnComplete after audio drained - opening conversation window");
-            shouldOpenConversation = true;
-        } else if (currentLEDMode == LED_TIDE && tideState.active) {
-            if (millis() - tideState.displayStartTime > 10000) {
-                Serial.println("Tide display complete - opening conversation window");
-                tideState.active = false;
-                shouldOpenConversation = true;
-            }
-        } else if (currentLEDMode == LED_MOON && moonState.active) {
-            if (millis() - moonState.displayStartTime > 10000) {
-                Serial.println("Moon display complete - opening conversation window");
-                moonState.active = false;
+
+        if (convState == ConvState::WAITING) {
+            // General case: covers zero-audio turns, short-audio turns where audio drained
+            // before turnComplete, and viz turns where audio finished + waiting for complete.
+            // Tide / Moon get extra display time before the window opens.
+            if (currentLEDMode == LED_TIDE && tideState.active) {
+                if (millis() - tideState.displayStartTime > 10000) {
+                    Serial.println("Tide display complete - opening conversation window");
+                    tideState.active = false;
+                    shouldOpenConversation = true;
+                }
+            } else if (currentLEDMode == LED_MOON && moonState.active) {
+                if (millis() - moonState.displayStartTime > 10000) {
+                    Serial.println("Moon display complete - opening conversation window");
+                    moonState.active = false;
+                    shouldOpenConversation = true;
+                }
+            } else {
+                Serial.printf("turnComplete in WAITING state (LED=%d, waitAge=%dms) - opening conversation window\n",
+                             currentLEDMode,
+                             waitingEnteredAt > 0 ? (int)(millis() - waitingEnteredAt) : -1);
                 shouldOpenConversation = true;
             }
         }
-        // Note: Timer has its own expiry logic and shouldn't auto-transition
+        // Note: Timer has its own expiry logic and doesn't use this block.
         
         if (shouldOpenConversation) {
-            Serial.printf("Transition to conversation: LED=%d, recording=%d, playing=%d, alarm=%d\n",
-                         currentLEDMode, recordingActive, isPlayingResponse, alarmState.ringing);
+            Serial.printf("Opening conversation window: LED=%d, waitAge=%dms\n",
+                         currentLEDMode,
+                         waitingEnteredAt > 0 ? (int)(millis() - waitingEnteredAt) : -1);
+            convState = ConvState::WINDOW;
             conversationMode = true;
             conversationWindowStart = millis();
             conversationVADDetected = false;  // Flush any residual VAD from speaker resonance
@@ -1678,7 +1696,8 @@ void loop() {
                 recordingActive = true;
                 recordingStartTime = millis();
                 lastVoiceActivityTime = millis();
-                processingStartTime = 0;  // CRITICAL: Reset processing timer to prevent immediate timeout
+                convState = ConvState::RECORDING;
+                waitingEnteredAt = 0;
                 currentLEDMode = LED_RECORDING;
                 lastDebounceTime = millis();
                 
@@ -1688,6 +1707,7 @@ void loop() {
             // Window expired with no voice - return to visualizations or idle
             Serial.println("Conversation window expired");
             conversationMode = false;
+            convState = ConvState::IDLE;
             
             // Priority: Pomodoro > Meditation > Timer > Moon > Tide > Idle
             if (pomodoroState.active) {
@@ -2338,9 +2358,9 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     
                     if (queueDepth >= MIN_PREBUFFER) {
                         isPlayingResponse = true;
-                        Serial.printf("[PREBUF] Playback start: queueDepth=%u, turnComplete=%d, mode=%d, procAge=%dms\n",
-                                     queueDepth, turnComplete, currentLEDMode,
-                                     processingStartTime > 0 ? (int)(millis() - processingStartTime) : -1);
+                        Serial.printf("[PREBUF] Playback start: queueDepth=%u, turnComplete=%d, convState=%d, waitAge=%dms\n",
+                                     queueDepth, turnComplete, (int)convState,
+                                     waitingEnteredAt > 0 ? (int)(millis() - waitingEnteredAt) : -1);
                         
                         // NOTE: turnComplete is NOT reset here to avoid a race condition where
                         // Gemini's turnComplete message arrives before the prebuffer fills (common

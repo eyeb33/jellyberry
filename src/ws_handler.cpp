@@ -24,16 +24,16 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  
  // Handle turn complete
  if (doc["type"].is<const char*>() && doc["type"] == "turnComplete") {
- // Ignore turnComplete if we're actively recording - it's a stale completion
- // from the previous Gemini turn that arrived late. The current recording will
- // generate its own turnComplete when Gemini finishes responding.
+ // Always store turnComplete, even during recording.
+ // Gemini sends exactly ONE turnComplete per turn. If we discard it because
+ // recordingActive=true, no second one will ever arrive and the device hangs.
+ // The auto-transition block already guards on !recordingActive, so the
+ // conversation window cannot open while the user is still speaking.
  if (recordingActive) {
- // Discard: the user is still speaking. Gemini will continue receiving audio
- // and will send a real turnComplete (with audio) once we stop recording.
- Serial.println("Turn complete (ignored - recording in progress)");
- return;
- }
+ Serial.println("Turn complete (stored - recording still active)");
+ } else {
  Serial.println("Turn complete");
+ }
  turnComplete = true; // Mark turn as finished
  // Don't change LED mode here - let the audio finish playing naturally
  // isPlayingResponse will be set to false when audio actually stops
@@ -199,7 +199,9 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  // onWebSocketEvent(WStype_BIN) will set it once enough packets have buffered.
  // Forcing it here caused the LED to switch before audio arrived (visual glitch)
  // and the 300ms delay was blocking the WebSocket task.
- processingStartTime = 0; // Clear processing timeout so it doesn't blank the timer
+ // Clear waiting guard so the thinking animation doesn't fire for the timer-expiry response
+ convState = ConvState::IDLE;
+ waitingEnteredAt = 0;
  Serial.println("Timer expired - waiting for Gemini audio notification...");
  return;
  }

@@ -28,7 +28,8 @@ extern volatile bool  isPlayingResponse;
 extern volatile bool  isPlayingAmbient;
 extern volatile float volumeMultiplier;
 extern uint32_t lastAudioChunkTime;
-extern uint32_t processingStartTime;
+extern ConvState convState;
+extern uint32_t waitingEnteredAt;
 extern QueueHandle_t audioOutputQueue;
 
 extern TideState       tideState;

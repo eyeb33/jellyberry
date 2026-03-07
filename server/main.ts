@@ -1,4 +1,6 @@
+// deno-lint-ignore no-import-prefix
 import "https://deno.land/std@0.204.0/dotenv/load.ts";
+// deno-lint-ignore-file no-explicit-any
 
 // Deno Edge Server for Jellyberry - WebSocket Proxy to Gemini Live API
 // Deploy to Deno Deploy: deno deploy --project=jellyberry-server main.ts
@@ -70,6 +72,7 @@ interface ClientConnection {
  alarmStreamCancel?: (() => void) | null; // Cancel function for alarm streaming
  pomodoroStatusResolver?: ((status: any) => void) | undefined; // Promise resolver for Pomodoro status
  pendingModeMessage?: object | null; // Mode command to send to ESP32 after Gemini finishes speaking
+ deviceState?: Record<string, unknown>; // Latest device state snapshot from recordingStart
  
  // Session tracking for diagnostics
  geminiConnectedAt?: number; // Timestamp when Gemini connected
@@ -567,7 +570,7 @@ function getWeatherDescription(code: number): string {
 }
 
 // Get weather forecast
-function getWeather(deviceId: string, timeframe: string = "current") {
+function getWeather(_deviceId: string, timeframe: string = "current") {
  try {
  const data = weatherDataCache;
  
@@ -818,7 +821,7 @@ Deno.serve({
  port: 8000,
  // Increase idle timeout to prevent disconnects during audio streaming
  idleTimeout: 120 // 120 seconds (default is 30-60s)
-}, (req) => {
+}, (req: Request) => {
  const url = new URL(req.url);
  
  // Health check endpoint
@@ -1280,6 +1283,7 @@ Deno.serve({
 });
 
 // Connect to Gemini Live API
+// deno-lint-ignore require-await
 async function connectToGemini(connection: ClientConnection) {
  if (connection.geminiSocket && connection.geminiSocket.readyState === WebSocket.OPEN) {
  console.log(`[${connection.deviceId}] Already connected to Gemini`);
@@ -2020,7 +2024,7 @@ async function connectToGemini(connection: ClientConnection) {
  // Handle audio data
  if (part.inlineData?.data) {
  const base64Audio = part.inlineData.data;
- const mimeType = part.inlineData.mimeType || "unknown";
+ const _mimeType = part.inlineData.mimeType || "unknown";
  
  // Track audio chunk statistics
  connection.audioChunkCount = (connection.audioChunkCount || 0) + 1;

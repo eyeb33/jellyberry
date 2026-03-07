@@ -1235,7 +1235,19 @@ Deno.serve({
  // State is stored in connection.deviceState for reference; not injected into
  // the Gemini audio stream mixing clientContent text turns with binary PCM
  // audio frames in the same turn causes a 1008 Policy Violation.
+ if (connection.geminiSocket?.readyState === WebSocket.OPEN) {
+  connection.geminiSocket.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
+  console.log(`[${deviceId}] activityStart → Gemini`);
+ }
  return;
+ }
+ // Handle recording stop - signal Gemini that user has finished speaking
+ if (data.type === "recordingStop") {
+  if (connection.geminiSocket?.readyState === WebSocket.OPEN) {
+   connection.geminiSocket.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
+   console.log(`[${deviceId}] activityEnd → Gemini`);
+  }
+  return;
  }
  // Forward audio/messages to Gemini
  if (connection.geminiSocket && connection.geminiSocket.readyState === WebSocket.OPEN) {
@@ -1323,6 +1335,9 @@ async function connectToGemini(connection: ClientConnection) {
  }
  }
  }
+ },
+ realtimeInputConfig: {
+  automaticActivityDetection: { disabled: true }
  },
  systemInstruction: {
  parts: [{
@@ -1901,126 +1916,6 @@ async function connectToGemini(connection: ClientConnection) {
  // Handle audio in serverContent
  if (json.serverContent?.modelTurn?.parts) {
  for (const part of json.serverContent.modelTurn.parts) {
- // Handle function calls
- if (part.functionCall) {
- const funcName = part.functionCall.name;
- const funcArgs = part.functionCall.args;
- console.log(`[${connection.deviceId}] Function call: ${funcName}`, funcArgs);
- 
- // Execute the function
- let functionResult: any = { success: false, error: "Unknown function" };
- 
- if (funcName === "get_tide_status") {
- functionResult = await getTideStatus();
- 
- // Forward tide data to ESP32 for LED visualization
- if (functionResult.success) {
- connection.socket.send(JSON.stringify({
- type: "tideData",
- state: functionResult.state,
- waterLevel: functionResult.waterLevel,
- nextChangeMinutes: functionResult.nextChangeMinutes
- }));
- console.log(`[${connection.deviceId}] Sent tide data to ESP32: ${functionResult.state}, level: ${functionResult.waterLevel.toFixed(2)}`);
- }
- } else if (funcName === "get_current_time") {
- functionResult = getCurrentTime();
- console.log(`[${connection.deviceId}] Current time: ${functionResult.time} on ${functionResult.date}`);
- } else if (funcName === "set_alarm") {
- const alarmTime = funcArgs.alarm_time || "";
- functionResult = setAlarm(connection.deviceId, alarmTime);
- 
- // Send alarm data to ESP32
- if (functionResult.success) {
- connection.socket.send(JSON.stringify({
- type: "setAlarm",
- alarmID: functionResult.alarmID,
- triggerTime: functionResult.triggerTime
- }));
- console.log(`[${connection.deviceId}] Sent alarm to ESP32: ID=${functionResult.alarmID}, time=${functionResult.formattedTime}`);
- }
- } else if (funcName === "cancel_alarm") {
- const which = funcArgs.which || "next";
- functionResult = cancelAlarm(connection.deviceId, which);
- 
- // Send cancel request to ESP32
- if (functionResult.success) {
- connection.socket.send(JSON.stringify({
- type: "cancelAlarm",
- which: which
- }));
- console.log(`[${connection.deviceId}] Sent alarm cancel request: ${which}`);
- }
- } else if (funcName === "list_alarms") {
- functionResult = listAlarms(connection.deviceId);
- 
- // Request alarm list from ESP32
- if (functionResult.success) {
- connection.socket.send(JSON.stringify({
- type: "listAlarms"
- }));
- console.log(`[${connection.deviceId}] Requested alarm list from ESP32`);
- }
- } else if (funcName === "set_timer") {
- const durationMinutes = funcArgs.duration_minutes || 0;
- functionResult = setTimer(connection.deviceId, durationMinutes);
- 
- // Send timer data to ESP32
- if (functionResult.success) {
- connection.socket.send(JSON.stringify({
- type: "timerSet",
- durationSeconds: functionResult.durationSeconds
- }));
- }
- } else if (funcName === "check_timer") {
- functionResult = checkTimer(connection.deviceId);
- } else if (funcName === "cancel_timer") {
- functionResult = cancelTimer(connection.deviceId);
- 
- // Notify ESP32
- if (functionResult.success) {
- connection.socket.send(JSON.stringify({
- type: "timerCancelled"
- }));
- }
- } else if (funcName === "get_weather_forecast") {
- const timeframe = funcArgs.timeframe || "current";
- 
- // Fetch fresh weather data on first call
- if (!weatherDataCache) {
- await fetchWeatherData();
- }
- 
- functionResult = getWeather(connection.deviceId, timeframe);
- console.log(`[${connection.deviceId}] Weather (${timeframe}): ${functionResult.summary || functionResult.error}`);
- } else if (funcName === "get_moon_phase") {
- functionResult = getMoonPhase();
- console.log(`[${connection.deviceId}] Moon phase: ${functionResult.phaseName} ${functionResult.phaseEmoji} (${functionResult.illumination}% illuminated)`);
- 
- // Send moon data to ESP32 for LED visualization
- if (functionResult.success) {
- connection.socket.send(JSON.stringify({
- type: "moonData",
- phaseName: functionResult.phaseName,
- illumination: functionResult.illumination,
- moonAge: functionResult.moonAge
- }));
- }
- }
- 
- // Send function response back to Gemini
- const functionResponse = {
- toolResponse: {
- functionResponses: [{
- id: part.functionCall.id || "func_" + Date.now(),
- name: funcName,
- response: functionResult
- }]
- }
- };
- connection.geminiSocket!.send(JSON.stringify(functionResponse));
- }
- 
  // Handle audio data
  if (part.inlineData?.data) {
  const base64Audio = part.inlineData.data;

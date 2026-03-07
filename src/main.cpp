@@ -1335,6 +1335,8 @@ void loop() {
         // Stop recording only on timeout (manual stop removed - rely on VAD)
         if (recordingActive && (millis() - recordingStartTime) > MAX_RECORDING_DURATION_MS) {
             recordingActive = false;
+            webSocket.sendTXT("{\"type\":\"recordingStop\"}");
+            Serial.println("[WS] recordingStop sent");
             if (!ambientSound.active) {
                 // LED stays at RECORDING; thinking animation fires after THINKING_ANIMATION_DELAY_MS
                 convState = ConvState::WAITING;
@@ -1350,6 +1352,8 @@ void loop() {
     uint32_t silenceTimeout = conversationRecording ? VAD_CONVERSATION_SILENCE_MS : VAD_SILENCE_MS;
     if (recordingActive && (millis() - lastVoiceActivityTime) > silenceTimeout) {
         recordingActive = false;
+        webSocket.sendTXT("{\"type\":\"recordingStop\"}");
+        Serial.println("[WS] recordingStop sent");
         conversationRecording = false;  // Reset flag for next recording
         // Don't change LED mode if ambient sound is already active
         if (!ambientSound.active) {

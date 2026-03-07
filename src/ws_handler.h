@@ -23,6 +23,7 @@ extern bool     turnComplete;
 extern bool     responseInterrupted;
 extern bool     firstAudioChunk;
 extern bool     isPlayingAlarm;
+extern volatile bool  recordingActive;
 extern volatile bool  isPlayingResponse;
 extern volatile bool  isPlayingAmbient;
 extern volatile float volumeMultiplier;

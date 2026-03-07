@@ -2510,7 +2510,6 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 
 // ============== LED CONTROLLER ==============
 void updateLEDs() {
- static uint8_t hue = 0;
  static uint8_t brightness = 100;
  
  // Smooth the audio level with exponential moving average

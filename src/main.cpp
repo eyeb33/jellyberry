@@ -1365,8 +1365,9 @@ void loop() {
     }
     
     // Show thinking animation once we've been WAITING long enough.
-    // Decoupled from currentLEDMode so nothing externally can invalidate it.
+    // Guard on !isPlayingResponse: once audio starts arriving the VU meter must win.
     if (convState == ConvState::WAITING &&
+        !isPlayingResponse &&
         (millis() - waitingEnteredAt) > THINKING_ANIMATION_DELAY_MS) {
         currentLEDMode = LED_PROCESSING;
         DEBUG_PRINTLN(" Response delayed - showing thinking animation");

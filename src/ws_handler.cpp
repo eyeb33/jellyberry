@@ -18,7 +18,11 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  // Handle setup complete message
  if (doc["type"].is<const char*>() && doc["type"] == "setupComplete") {
  Serial.println("Setup complete - ready for interaction");
- // Greeting feature removed for simplicity - ready immediately
+ // Prime state machine for the incoming boot greeting: treat it like a pending Gemini response.
+ // Without this, convState stays IDLE and the auto-transition block (which guards on WAITING)
+ // never opens the conversation window after the greeting finishes.
+ convState = ConvState::WAITING;
+ waitingEnteredAt = millis();
  return;
  }
  

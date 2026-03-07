@@ -19,7 +19,7 @@ extern SemaphoreHandle_t       ledMutex;
 
 extern LEDMode    currentLEDMode;
 
-extern bool     turnComplete;
+extern volatile bool turnComplete;
 extern bool     responseInterrupted;
 extern bool     firstAudioChunk;
 extern bool     isPlayingAlarm;

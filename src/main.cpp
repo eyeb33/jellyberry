@@ -49,7 +49,7 @@ volatile bool recordingActive = false;
 volatile bool isPlayingResponse = false;
 volatile bool isPlayingAmbient = false; // Track ambient sound playback separately
 bool isPlayingAlarm = false; // Track alarm sound playback
-bool turnComplete = false; // Track when Gemini has finished its turn
+volatile bool turnComplete = false; // Track when Gemini has finished its turn
 bool responseInterrupted = false; // Flag to ignore audio after interrupt
 bool shutdownSoundPlayed = false; // Flag to prevent repeated shutdown sounds during reconnection
 uint32_t recordingStartTime = 0;
@@ -1338,7 +1338,7 @@ void loop() {
             webSocket.sendTXT("{\"type\":\"recordingStop\"}");
             Serial.println("[WS] recordingStop sent");
             if (!ambientSound.active) {
-                // LED stays at RECORDING; thinking animation fires after THINKING_ANIMATION_DELAY_MS
+                currentLEDMode = LED_PROCESSING;
                 convState = ConvState::WAITING;
                 waitingEnteredAt = millis();
             }
@@ -1357,7 +1357,7 @@ void loop() {
         conversationRecording = false;  // Reset flag for next recording
         // Don't change LED mode if ambient sound is already active
         if (!ambientSound.active) {
-            // LED stays at RECORDING; thinking animation fires after THINKING_ANIMATION_DELAY_MS
+            currentLEDMode = LED_PROCESSING;
             convState = ConvState::WAITING;
             waitingEnteredAt = millis();
         }
@@ -1465,7 +1465,8 @@ void loop() {
             // the conversation window as soon as turnComplete arrives (or timeout after 60s).
             convState = ConvState::WAITING;
             waitingEnteredAt = millis();
-            // Show visualization while we wait: Pomodoro > Meditation > Timer > Moon > Tide > Ambient VU > Idle
+            // Show PROCESSING so user knows we're still waiting - NOT idle
+            // Pomodoro/Meditation/Timer/viz take priority if active
             if (pomodoroState.active) {
                 currentLEDMode = LED_POMODORO;
                 DEBUG_PRINTLN(" Audio playback complete - switching to POMODORO display");
@@ -1488,8 +1489,8 @@ void loop() {
                 currentLEDMode = LED_AMBIENT_VU;
                 DEBUG_PRINTLN(" Audio playback complete - returning to AMBIENT VU mode");
             } else {
-                currentLEDMode = LED_IDLE;
-                DEBUG_PRINTLN(" Audio playback complete - switching to IDLE");
+                currentLEDMode = LED_PROCESSING;
+                DEBUG_PRINTLN(" Audio playback complete - waiting for turnComplete (LED_PROCESSING)");
             }
         }
         }
@@ -1802,10 +1803,19 @@ bool detectVoiceActivity(int16_t* samples, size_t count) {
  sum += abs(samples[i]);
  }
  int32_t avgAmplitude = sum / count;
- 
+
+ // Require 3 consecutive frames above threshold before treating as real speech.
+ // A single 20ms spike from ambient noise / tap will NOT reset the silence timer.
+ // 3 frames * 20ms = 60ms of sustained audio required.
+ static int consecutiveFrames = 0;
  if (avgAmplitude > VAD_THRESHOLD) {
- lastVoiceActivityTime = millis();
- return true;
+ consecutiveFrames++;
+ if (consecutiveFrames >= 3) {
+  lastVoiceActivityTime = millis();
+  return true;
+ }
+ } else {
+ consecutiveFrames = 0;
  }
  return false;
 }
@@ -2600,8 +2610,12 @@ void updateLEDs() {
                 }
                 
                 // Map audio level to row count (0-12 rows)
-                // Typical range: 0-5000 (after 16x gain), map to 0-12 rows
-                int numRows = map(constrain((int)smoothedAudioLevel, 0, 5000), 0, 5000, 0, LEDS_PER_COLUMN);
+                // Apply a noise floor matching the VAD threshold so ambient noise
+                // doesn't flash the bottom green LEDs. Only actual voice-level audio
+                // (above ~VAD_THRESHOLD) starts lighting the meter.
+                const int RECORDING_NOISE_FLOOR = 600; // just below VAD_THRESHOLD (700)
+                int levelAboveNoise = max(0, (int)smoothedAudioLevel - RECORDING_NOISE_FLOOR);
+                int numRows = map(constrain(levelAboveNoise, 0, 4400), 0, 4400, 0, LEDS_PER_COLUMN);
                 
                 // Light all strips identically (column-based)
                 for (int col = 0; col < LED_COLUMNS; col++) {
@@ -2634,10 +2648,8 @@ void updateLEDs() {
             break;
             
         case LED_PROCESSING:
-            hue = (millis() / 10) % 256;
-            for (int i = 0; i < NUM_LEDS; i++) {
-                leds[i] = CHSV(hue + (i * 28), 255, 255);  // 28 = 256/9 for even spread
-            }
+            // Go dark while processing - clean, unambiguous "thinking" state
+            fill_solid(leds, NUM_LEDS, CRGB::Black);
             break;
             
         case LED_AMBIENT_VU:

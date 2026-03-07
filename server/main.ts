@@ -1233,7 +1233,7 @@ Deno.serve({
  const stateText = `SYSTEM: Current device state ${parts.join(". ")}.`;
  console.log(`[${deviceId}] Device state: ${stateText}`);
  // State is stored in connection.deviceState for reference; not injected into
- // the Gemini audio stream mixing clientContent text turns with binary PCM
+ // the Gemini audio stream - mixing clientContent text turns with binary PCM
  // audio frames in the same turn causes a 1008 Policy Violation.
  if (connection.geminiSocket?.readyState === WebSocket.OPEN) {
   connection.geminiSocket.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));

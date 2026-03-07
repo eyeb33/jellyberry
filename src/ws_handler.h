@@ -6,6 +6,8 @@
 #include <FastLED.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <freertos/queue.h>
+#include <driver/i2s.h>
 #include <time.h>
 #include "Config.h"
 #include "types.h"
@@ -26,6 +28,7 @@ extern volatile bool  isPlayingAmbient;
 extern volatile float volumeMultiplier;
 extern uint32_t lastAudioChunkTime;
 extern uint32_t processingStartTime;
+extern QueueHandle_t audioOutputQueue;
 
 extern TideState       tideState;
 extern DayNightData    dayNightData;

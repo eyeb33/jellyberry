@@ -526,6 +526,13 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  firstAudioChunk = true;
  lastAudioChunkTime = millis();
 
+ // Flush any stale Gemini audio still queued to prevent overlap with ambient
+ {
+ AudioChunk dummy;
+ while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {}
+ i2s_zero_dma_buffer(I2S_NUM_1);
+ }
+
  // Request ambient audio from server immediately
  {
  JsonDocument ambientDoc;
@@ -636,7 +643,14 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  lampState.transitioning = false;
  for (int i = 0; i < NUM_LEDS; i++) lampState.ledStartTimes[i] = 0;
 
+ // Only switch LED mode immediately if Gemini audio has finished.
+ // If audio is still draining, lampState.active=true is enough - the
+ // isPersistentMode recovery block will transition to LED_LAMP cleanly.
+ if (!isPlayingResponse) {
  currentLEDMode = LED_LAMP;
+ } else {
+ Serial.println("lampStart: audio still playing, will switch to LED_LAMP after drain");
+ }
  return;
  }
 

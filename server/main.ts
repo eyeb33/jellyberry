@@ -69,6 +69,7 @@ interface ClientConnection {
  ambientSequence?: number; // Current ambient stream sequence number
  alarmStreamCancel?: (() => void) | null; // Cancel function for alarm streaming
  pomodoroStatusResolver?: ((status: any) => void) | undefined; // Promise resolver for Pomodoro status
+ pendingModeMessage?: object | null; // Mode command to send to ESP32 after Gemini finishes speaking
  
  // Session tracking for diagnostics
  geminiConnectedAt?: number; // Timestamp when Gemini connected
@@ -1849,30 +1850,31 @@ async function connectToGemini(connection: ClientConnection) {
  functionResult = await statusPromise;
  console.log(`[${connection.deviceId}] Pomodoro status result:`, functionResult);
  } else if (funcName === "start_meditation") {
- connection.socket.send(JSON.stringify({ type: "meditationStart" }));
- console.log(`[${connection.deviceId}] Sent meditationStart to ESP32`);
+ // Defer to after Gemini finishes speaking so the verbal confirmation plays cleanly
+ connection.pendingModeMessage = { type: "meditationStart" };
+ console.log(`[${connection.deviceId}] Queued meditationStart (will send after turnComplete)`);
  functionResult = { success: true, message: "Meditation session started" };
  } else if (funcName === "stop_meditation") {
- connection.socket.send(JSON.stringify({ type: "switchToIdle" }));
- console.log(`[${connection.deviceId}] Sent switchToIdle (stop_meditation) to ESP32`);
+ connection.pendingModeMessage = { type: "switchToIdle" };
+ console.log(`[${connection.deviceId}] Queued switchToIdle/stop_meditation (will send after turnComplete)`);
  functionResult = { success: true, message: "Meditation session stopped" };
  } else if (funcName === "start_ambient") {
  const sound = (funcArgs.sound || "rain").toLowerCase();
- connection.socket.send(JSON.stringify({ type: "ambientStart", sound }));
- console.log(`[${connection.deviceId}] Sent ambientStart (${sound}) to ESP32`);
+ connection.pendingModeMessage = { type: "ambientStart", sound };
+ console.log(`[${connection.deviceId}] Queued ambientStart (${sound}) (will send after turnComplete)`);
  functionResult = { success: true, message: `Playing ${sound} ambient sound` };
  } else if (funcName === "stop_ambient") {
- connection.socket.send(JSON.stringify({ type: "switchToIdle" }));
- console.log(`[${connection.deviceId}] Sent switchToIdle (stop_ambient) to ESP32`);
+ connection.pendingModeMessage = { type: "switchToIdle" };
+ console.log(`[${connection.deviceId}] Queued switchToIdle/stop_ambient (will send after turnComplete)`);
  functionResult = { success: true, message: "Ambient sound stopped" };
  } else if (funcName === "start_lamp") {
  const color = (funcArgs.color || "white").toLowerCase();
- connection.socket.send(JSON.stringify({ type: "lampStart", color }));
- console.log(`[${connection.deviceId}] Sent lampStart (${color}) to ESP32`);
+ connection.pendingModeMessage = { type: "lampStart", color };
+ console.log(`[${connection.deviceId}] Queued lampStart (${color}) (will send after turnComplete)`);
  functionResult = { success: true, message: `Lamp turned on (${color})` };
  } else if (funcName === "stop_lamp") {
- connection.socket.send(JSON.stringify({ type: "switchToIdle" }));
- console.log(`[${connection.deviceId}] Sent switchToIdle (stop_lamp) to ESP32`);
+ connection.pendingModeMessage = { type: "switchToIdle" };
+ console.log(`[${connection.deviceId}] Queued switchToIdle/stop_lamp (will send after turnComplete)`);
  functionResult = { success: true, message: "Lamp turned off" };
  }
  
@@ -2068,6 +2070,12 @@ async function connectToGemini(connection: ClientConnection) {
  console.log(`[${connection.deviceId}] Turn complete audio: ${connection.turnAudioChunks || 0} chunks, ${audioMs}ms`);
  connection.turnAudioChunks = 0;
  connection.turnAudioBytes = 0;
+ // Flush any deferred mode command now that Gemini has finished speaking
+ if (connection.pendingModeMessage) {
+ console.log(`[${connection.deviceId}] Flushing deferred mode command:`, JSON.stringify(connection.pendingModeMessage));
+ connection.socket.send(JSON.stringify(connection.pendingModeMessage));
+ connection.pendingModeMessage = null;
+ }
  connection.socket.send(JSON.stringify({ type: "turnComplete" }));
  }
  

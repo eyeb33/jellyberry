@@ -1357,15 +1357,15 @@ void loop() {
     // Show thinking animation if response is taking too long (after delay)
     if (currentLEDMode == LED_RECORDING && processingStartTime > 0 && 
         (millis() - processingStartTime) > THINKING_ANIMATION_DELAY_MS && 
-        (millis() - processingStartTime) < 30000) {
+        (millis() - processingStartTime) < 60000) {
         currentLEDMode = LED_PROCESSING;
         DEBUG_PRINTLN(" Response delayed - showing thinking animation");
     }
     
-    // Timeout PROCESSING mode if no response after 30 seconds (generous for slow/complex Gemini turns)
+    // Timeout PROCESSING mode if no response after 60 seconds (generous for slow/complex Gemini tool calls)
     if ((currentLEDMode == LED_PROCESSING || currentLEDMode == LED_RECORDING) && 
-        processingStartTime > 0 && (millis() - processingStartTime) > 30000) {
-        DEBUG_PRINT("  Processing timeout after 30s - no response received (mode was %d)\n", currentLEDMode);
+        processingStartTime > 0 && (millis() - processingStartTime) > 60000) {
+        DEBUG_PRINT("  Processing timeout after 60s - no response received (mode was %d)\n", currentLEDMode);
         processingStartTime = 0;
         
         // Return to visualizations if active, otherwise IDLE
@@ -1399,7 +1399,9 @@ void loop() {
         
         if (noNewPackets && queueDrained) {
             isPlayingResponse = false;
-            DEBUG_PRINT("  Audio playback complete (timeout + queue drained to %u), turnComplete=%d\n", queueDepth, turnComplete);
+            Serial.printf("[DRAIN] Audio done: queueDepth=%u, turnComplete=%d, convMode=%d, procAge=%dms\n",
+                         queueDepth, turnComplete, conversationMode,
+                         processingStartTime > 0 ? (int)(millis() - processingStartTime) : -1);
         
         // Check if turn is complete - if so, decide what to show
         if (turnComplete) {
@@ -1582,12 +1584,37 @@ void loop() {
         ambientSound.name = "";
     }
     
+    // Periodic state dump in PROCESSING/RECORDING to help diagnose stuck states
+    if (currentLEDMode == LED_PROCESSING || currentLEDMode == LED_RECORDING) {
+        static uint32_t lastProcessingDump = 0;
+        if (millis() - lastProcessingDump > 3000) {
+            Serial.printf("[PROC] mode=%d turnComplete=%d isPlaying=%d recording=%d convMode=%d procAge=%dms\n",
+                         currentLEDMode, turnComplete, isPlayingResponse, recordingActive, conversationMode,
+                         processingStartTime > 0 ? (int)(millis() - processingStartTime) : -1);
+            lastProcessingDump = millis();
+        }
+    }
+
     // Auto-transition from visualizations to conversation window
     // After 10 seconds of showing tide/moon/timer, open conversation window if turn is complete
     if (turnComplete && !conversationMode && !isPlayingResponse && !recordingActive) {
         bool shouldOpenConversation = false;
         
-        if (currentLEDMode == LED_TIDE && tideState.active) {
+        if (currentLEDMode == LED_PROCESSING || currentLEDMode == LED_RECORDING) {
+            // Gemini completed its turn without sending any audio (e.g. interrupted turn,
+            // or a pure function-call turn where no verbal response was generated).
+            // Open the conversation window immediately so the user can follow up.
+            Serial.println("turnComplete with no audio - opening conversation window from PROCESSING/RECORDING");
+            processingStartTime = 0;
+            shouldOpenConversation = true;
+        } else if (currentLEDMode == LED_IDLE || currentLEDMode == LED_AUDIO_REACTIVE) {
+            // turnComplete arrived after audio already drained (common for short responses
+            // where the last audio packet plays out before the turnComplete message lands).
+            // The audio-completion block already set mode to IDLE/AUDIO_REACTIVE; we just
+            // missed the window there. Open it now.
+            Serial.println("turnComplete after audio drained - opening conversation window");
+            shouldOpenConversation = true;
+        } else if (currentLEDMode == LED_TIDE && tideState.active) {
             if (millis() - tideState.displayStartTime > 10000) {
                 Serial.println("Tide display complete - opening conversation window");
                 tideState.active = false;
@@ -2311,6 +2338,9 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     
                     if (queueDepth >= MIN_PREBUFFER) {
                         isPlayingResponse = true;
+                        Serial.printf("[PREBUF] Playback start: queueDepth=%u, turnComplete=%d, mode=%d, procAge=%dms\n",
+                                     queueDepth, turnComplete, currentLEDMode,
+                                     processingStartTime > 0 ? (int)(millis() - processingStartTime) : -1);
                         
                         // NOTE: turnComplete is NOT reset here to avoid a race condition where
                         // Gemini's turnComplete message arrives before the prebuffer fills (common

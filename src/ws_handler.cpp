@@ -28,6 +28,8 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  // from the previous Gemini turn that arrived late. The current recording will
  // generate its own turnComplete when Gemini finishes responding.
  if (recordingActive) {
+ // Discard: the user is still speaking. Gemini will continue receiving audio
+ // and will send a real turnComplete (with audio) once we stop recording.
  Serial.println("Turn complete (ignored - recording in progress)");
  return;
  }

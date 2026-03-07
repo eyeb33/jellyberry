@@ -1357,15 +1357,15 @@ void loop() {
     // Show thinking animation if response is taking too long (after delay)
     if (currentLEDMode == LED_RECORDING && processingStartTime > 0 && 
         (millis() - processingStartTime) > THINKING_ANIMATION_DELAY_MS && 
-        (millis() - processingStartTime) < 10000) {
+        (millis() - processingStartTime) < 30000) {
         currentLEDMode = LED_PROCESSING;
         DEBUG_PRINTLN(" Response delayed - showing thinking animation");
     }
     
-    // Timeout PROCESSING mode if no response after 10 seconds
+    // Timeout PROCESSING mode if no response after 30 seconds (generous for slow/complex Gemini turns)
     if ((currentLEDMode == LED_PROCESSING || currentLEDMode == LED_RECORDING) && 
-        processingStartTime > 0 && (millis() - processingStartTime) > 10000) {
-        DEBUG_PRINT("  Processing timeout after 10s - no response received (mode was %d)\n", currentLEDMode);
+        processingStartTime > 0 && (millis() - processingStartTime) > 30000) {
+        DEBUG_PRINT("  Processing timeout after 30s - no response received (mode was %d)\n", currentLEDMode);
         processingStartTime = 0;
         
         // Return to visualizations if active, otherwise IDLE

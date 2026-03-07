@@ -24,6 +24,13 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  
  // Handle turn complete
  if (doc["type"].is<const char*>() && doc["type"] == "turnComplete") {
+ // Ignore turnComplete if we're actively recording - it's a stale completion
+ // from the previous Gemini turn that arrived late. The current recording will
+ // generate its own turnComplete when Gemini finishes responding.
+ if (recordingActive) {
+ Serial.println("Turn complete (ignored - recording in progress)");
+ return;
+ }
  Serial.println("Turn complete");
  turnComplete = true; // Mark turn as finished
  // Don't change LED mode here - let the audio finish playing naturally

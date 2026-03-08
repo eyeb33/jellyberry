@@ -15,6 +15,26 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  return;
  }
  
+ // Handle lazy-reconnect in-progress signal: Gemini was idle and is reconnecting.
+ // Show LED_PROCESSING so the user knows the device is working, not frozen.
+ // convState stays IDLE (the button press that triggered this was dropped);
+ // the user just needs to press again once reconnectComplete arrives.
+ if (doc["type"].is<const char*>() && doc["type"] == "reconnecting") {
+ Serial.println("Gemini reconnecting after idle — showing connecting animation");
+ currentLEDMode = LED_PROCESSING;
+ convState = ConvState::IDLE;
+ return;
+ }
+
+ // Handle lazy-reconnect complete: Gemini is ready again.
+ // Return to idle so the user can speak normally.
+ if (doc["type"].is<const char*>() && doc["type"] == "reconnectComplete") {
+ Serial.println("Gemini reconnect complete — ready for interaction");
+ currentLEDMode = LED_IDLE;
+ convState = ConvState::IDLE;
+ return;
+ }
+
  // Handle setup complete message
  if (doc["type"].is<const char*>() && doc["type"] == "setupComplete") {
  Serial.println("Setup complete - ready for interaction");
@@ -184,21 +204,12 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  if (doc["type"].is<const char*>() && doc["type"] == "timerExpired") {
  Serial.println("Timer expired!");
  timerState.active = false;
- // Flash LEDs for completion (with mutex)
- for (int i = 0; i < 3; i++) {
- if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
- fill_solid(leds, NUM_LEDS, CRGB::Green);
- FastLED.show();
- xSemaphoreGive(ledMutex);
- }
- delay(200);
- if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
- fill_solid(leds, NUM_LEDS, CRGB::Black);
- FastLED.show();
- xSemaphoreGive(ledMutex);
- }
- delay(200);
- }
+ // Trigger non-blocking flash animation (runs in loop() — does NOT block WebSocket task).
+ // The old delay(200) loop blocked this task for 1200ms total, causing audio dropouts
+ // whenever a timer expired during playback.
+ timerState.flashing = true;
+ timerState.flashCount = 0;
+ timerState.flashStartTime = millis();
  // Do NOT pre-set isPlayingResponse here the standard audio prebuffer path in
  // onWebSocketEvent(WStype_BIN) will set it once enough packets have buffered.
  // Forcing it here caused the LED to switch before audio arrived (visual glitch)
@@ -499,7 +510,84 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  return;
  }
 
- // Handle ambientStart - voice-commanded ambient sound
+ // Handle device state request — returns full device state snapshot to the server
+ // Used by the get_device_state Gemini tool to give the model accurate self-awareness.
+ if (doc["type"].is<const char*>() && doc["type"] == "deviceStateRequest") {
+ Serial.println("Device state requested");
+
+ JsonDocument stateDoc;
+ stateDoc["type"] = "deviceStateResponse";
+
+ // Pomodoro state
+ JsonObject pomDoc = stateDoc["pomodoro"].to<JsonObject>();
+ pomDoc["active"] = pomodoroState.active;
+ if (pomodoroState.active) {
+ const char* sessionName = (pomodoroState.currentSession == PomodoroState::FOCUS) ? "Focus" :
+ (pomodoroState.currentSession == PomodoroState::SHORT_BREAK) ? "Short Break" : "Long Break";
+ pomDoc["session"] = sessionName;
+ pomDoc["paused"] = pomodoroState.paused;
+ uint32_t secsLeft;
+ if (pomodoroState.paused) {
+ secsLeft = pomodoroState.pausedTime;
+ } else if (pomodoroState.startTime > 0) {
+ uint32_t elapsed = (millis() - pomodoroState.startTime) / 1000;
+ secsLeft = pomodoroState.totalSeconds > elapsed ? pomodoroState.totalSeconds - elapsed : 0;
+ } else {
+ secsLeft = pomodoroState.totalSeconds;
+ }
+ pomDoc["secondsRemaining"] = secsLeft;
+ pomDoc["cycleNumber"] = pomodoroState.sessionCount + 1;
+ }
+
+ // Meditation state
+ JsonObject medDoc = stateDoc["meditation"].to<JsonObject>();
+ medDoc["active"] = meditationState.active;
+ if (meditationState.active) {
+ medDoc["chakra"] = CHAKRA_NAMES[meditationState.currentChakra];
+ }
+
+ // Ambient sound state
+ JsonObject ambDoc = stateDoc["ambient"].to<JsonObject>();
+ ambDoc["active"] = ambientSound.active;
+ if (ambientSound.active) {
+ ambDoc["sound"] = ambientSound.name;
+ }
+
+ // Lamp state
+ JsonObject lampDoc = stateDoc["lamp"].to<JsonObject>();
+ lampDoc["active"] = lampState.active;
+ if (lampState.active) {
+ const char* colorName = "white";
+ if (lampState.currentColor == LampState::RED) colorName = "red";
+ else if (lampState.currentColor == LampState::GREEN) colorName = "green";
+ else if (lampState.currentColor == LampState::BLUE) colorName = "blue";
+ lampDoc["color"] = colorName;
+ }
+
+ // Alarm list
+ JsonArray alarmArray = stateDoc["alarms"].to<JsonArray>();
+ struct tm timeinfo;
+ if (getLocalTime(&timeinfo)) {
+ for (int i = 0; i < MAX_ALARMS; i++) {
+ if (alarms[i].enabled) {
+ JsonObject alarmObj = alarmArray.add<JsonObject>();
+ alarmObj["alarmID"] = alarms[i].alarmID;
+ alarmObj["triggerTime"] = (long long)alarms[i].triggerTime * 1000; // ms
+ struct tm alarmTimeinfo;
+ localtime_r(&alarms[i].triggerTime, &alarmTimeinfo);
+ char timeStr[16];
+ strftime(timeStr, sizeof(timeStr), "%H:%M", &alarmTimeinfo);
+ alarmObj["formattedTime"] = timeStr;
+ }
+ }
+ }
+
+ String stateMsg;
+ serializeJson(stateDoc, stateMsg);
+ webSocket.sendTXT(stateMsg);
+ Serial.printf("Sent deviceStateResponse (%d chars)\n", stateMsg.length());
+ return;
+ }
  if (doc["type"].is<const char*>() && doc["type"] == "ambientStart") {
  const char* sound = doc["sound"] | "rain";
  Serial.printf("ambientStart: %s\n", sound);

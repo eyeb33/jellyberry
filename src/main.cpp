@@ -54,7 +54,7 @@ bool responseInterrupted = false; // Flag to ignore audio after interrupt
 bool shutdownSoundPlayed = false; // Flag to prevent repeated shutdown sounds during reconnection
 uint32_t recordingStartTime = 0;
 uint32_t lastVoiceActivityTime = 0;
-uint32_t lastAudioChunkTime = 0; // Track when we last received audio
+volatile uint32_t lastAudioChunkTime = 0; // Track when we last received audio (volatile: written by audioTask + onWebSocketEvent, read by loop)
 ConvState convState = ConvState::IDLE;   // Main-loop UX state machine (not cross-task)
 uint32_t waitingEnteredAt = 0;           // When we entered WAITING; drives thinking-animation and 60s timeout
 uint32_t lastWebSocketSendTime = 0; // Track last successful send
@@ -76,10 +76,11 @@ bool recordingStartSent = false;    // Track if recordingStart state message has
 volatile int32_t ambientMicRows = 0; // Pre-computed VU row count; LED renderer reads this
 volatile bool conversationVADDetected = false; // audioTask sets this when VAD fires during conv. window
 
-// Audio level delay buffer for LED sync (compensates for I2S buffer latency)
-// Size: ~240ms delay for optimal LED/audio sync (8 frames @ 30ms each)
-// Tuning: Increase for more latency compensation, decrease for tighter sync (may see LED lag)
-#define AUDIO_DELAY_BUFFER_SIZE 8
+// Audio level delay buffer for LED sync.
+// Size 1: reads the value just written — no artificial delay.
+// The I2S DMA latency (~42ms) is small enough that the 30ms LED frame period
+// adequately masks any visible lead. Increase to 2 if LEDs visibly lead audio.
+#define AUDIO_DELAY_BUFFER_SIZE 1
 int audioLevelBuffer[AUDIO_DELAY_BUFFER_SIZE] = {0};
 int audioBufferIndex = 0;
 
@@ -108,7 +109,7 @@ AmbientSoundType currentAmbientSoundType = SOUND_RAIN;
 TideState tideState = {"", 0.0, 0, 0, false};
 
 // Timer visualization state
-TimerState timerState = {0, 0, false};
+TimerState timerState = {0, 0, false, false, 0, 0};
 
 // Moon phase visualization state
 MoonState moonState = {"", 0, 0.0, 0, false};
@@ -630,6 +631,8 @@ void loop() {
             // Start Gemini recording
             responseInterrupted = false;
             conversationRecording = false;
+            tideState.active = false;  // New question - clear viz state
+            moonState.active = false;
             recordingActive = true;
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
@@ -1183,7 +1186,8 @@ void loop() {
             responseInterrupted = true;  // Flag to ignore remaining audio chunks
             isPlayingResponse = false;
             i2s_zero_dma_buffer(I2S_NUM_1);  // Stop audio immediately
-            
+            tideState.active = false;
+            moonState.active = false;
             recordingActive = true;
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
@@ -1321,7 +1325,9 @@ void loop() {
                 ambientVUMode = false;
                 DEBUG_PRINTLN(" Ambient VU meter mode disabled");
             }
-            
+
+            tideState.active = false;  // New question - clear viz state so it doesn't re-display
+            moonState.active = false;
             recordingActive = true;
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
@@ -1402,6 +1408,24 @@ void loop() {
             DEBUG_PRINTLN("  Timeout - returning to IDLE");
         }
     }
+
+    // Hard timeout: audio drained into PLAYING state but turnComplete never arrived.
+    // Prevents the device being silently stuck with no LEDs and no response.
+    if (convState == ConvState::PLAYING &&
+        !isPlayingResponse &&
+        waitingEnteredAt > 0 &&
+        (millis() - waitingEnteredAt) > 60000) {
+        Serial.printf("  PLAYING timeout - turnComplete never arrived after 60s\n");
+        convState = ConvState::IDLE;
+        waitingEnteredAt = 0;
+        if (pomodoroState.active) {
+            currentLEDMode = LED_POMODORO;
+        } else if (timerState.active) {
+            currentLEDMode = LED_TIMER;
+        } else {
+            currentLEDMode = LED_IDLE;
+        }
+    }
     
     // Check for audio playback completion
     // Timeout only if BOTH: (1) no new packets for 2s AND (2) queue nearly drained
@@ -1431,6 +1455,22 @@ void loop() {
                                      meditationState.active         ||  // Voice-triggered meditation may be in AUDIO_REACTIVE during verbal response
                                      lampState.active);                 // Voice-triggered lamp may be in AUDIO_REACTIVE during verbal response
             if (!isPersistentMode) {
+                // Tide/Moon: show the visualization for 10s first, then auto-transition opens window.
+                // The auto-transition block (convState==WAITING + tideState.active + 10s timer)
+                // handles the tide→window transition correctly.
+                if (tideState.active) {
+                    convState = ConvState::WAITING;
+                    waitingEnteredAt = millis();
+                    currentLEDMode = LED_TIDE;
+                    tideState.displayStartTime = millis();
+                    Serial.println("Tide active - displaying 10s then opening conversation window");
+                } else if (moonState.active) {
+                    convState = ConvState::WAITING;
+                    waitingEnteredAt = millis();
+                    currentLEDMode = LED_MOON;
+                    moonState.displayStartTime = millis();
+                    Serial.println("Moon active - displaying 10s then opening conversation window");
+                } else {
                 // Open 10-second conversation window
                 convState = ConvState::WINDOW;
                 conversationMode = true;
@@ -1438,6 +1478,7 @@ void loop() {
                 conversationVADDetected = false;  // Flush any residual VAD from speaker resonance
                 currentLEDMode = LED_CONVERSATION_WINDOW;
                 Serial.println("Conversation window opened - speak anytime in next 10 seconds");
+                }
             } else {
                 Serial.printf("Skipping conversation window - entering persistent mode %d\n", effectiveMode);
                 convState = ConvState::IDLE;  // Persistent mode: no follow-up window
@@ -1461,10 +1502,9 @@ void loop() {
             }
         } else {
             // Audio finished but turnComplete not yet received.
-            // Re-enter WAITING with a fresh timer so the auto-transition block can open
-            // the conversation window as soon as turnComplete arrives (or timeout after 60s).
-            convState = ConvState::WAITING;
-            waitingEnteredAt = millis();
+            // Stay in PLAYING — do not re-enter WAITING. Re-entering WAITING restarts the
+            // 60s timeout and re-triggers the thinking animation (dark-screen glitch).
+            // The auto-transition block below handles turnComplete arriving while PLAYING.
             // Show PROCESSING so user knows we're still waiting - NOT idle
             // Pomodoro/Meditation/Timer/viz take priority if active
             if (pomodoroState.active) {
@@ -1509,6 +1549,29 @@ void loop() {
             if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
                 if (pomodoroState.flashCount % 2 == 0) {
                     fill_solid(leds, NUM_LEDS, CRGB::White);
+                } else {
+                    fill_solid(leds, NUM_LEDS, CRGB::Black);
+                }
+                FastLED.show();
+                xSemaphoreGive(ledMutex);
+            }
+        }
+    }
+
+    // Handle non-blocking timer flash animation (triggered by timerExpired WebSocket message).
+    // Runs at 200ms intervals in loop() — WebSocket task is never blocked.
+    if (timerState.flashing && (millis() - timerState.flashStartTime) >= 200) {
+        timerState.flashCount++;
+        timerState.flashStartTime = millis();
+
+        if (timerState.flashCount >= 6) {
+            // Animation complete (3 on/off cycles = 6 state changes)
+            timerState.flashing = false;
+        } else {
+            // Toggle LEDs green/black
+            if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
+                if (timerState.flashCount % 2 == 0) {
+                    fill_solid(leds, NUM_LEDS, CRGB::Green);
                 } else {
                     fill_solid(leds, NUM_LEDS, CRGB::Black);
                 }
@@ -1648,6 +1711,29 @@ void loop() {
                              waitingEnteredAt > 0 ? (int)(millis() - waitingEnteredAt) : -1);
                 shouldOpenConversation = true;
             }
+        } else if (convState == ConvState::PLAYING) {
+            // turnComplete arrived after audio already drained (device stayed in PLAYING).
+            // Decide whether to open a conversation window or return to a persistent mode.
+            LEDMode effectiveMode = currentLEDMode;
+            bool isPersistentMode = (effectiveMode == LED_MEDITATION ||
+                                     effectiveMode == LED_AMBIENT   ||
+                                     effectiveMode == LED_LAMP      ||
+                                     effectiveMode == LED_POMODORO  ||
+                                     meditationState.active         ||
+                                     lampState.active);
+            if (!isPersistentMode) {
+                Serial.printf("turnComplete in PLAYING state (LED=%d) - opening conversation window\n", effectiveMode);
+                shouldOpenConversation = true;
+            } else {
+                Serial.printf("turnComplete in PLAYING state - persistent mode %d, skipping window\n", effectiveMode);
+                convState = ConvState::IDLE;
+                if (currentLEDMode == LED_AUDIO_REACTIVE || currentLEDMode == LED_RECORDING || currentLEDMode == LED_PROCESSING) {
+                    if (meditationState.active)    { currentLEDMode = LED_MEDITATION; }
+                    else if (pomodoroState.active) { currentLEDMode = LED_POMODORO; }
+                    else if (ambientSound.active)  { currentLEDMode = LED_AMBIENT; }
+                    else if (lampState.active)     { currentLEDMode = LED_LAMP; }
+                }
+            }
         }
         // Note: Timer has its own expiry logic and doesn't use this block.
         
@@ -1699,6 +1785,8 @@ void loop() {
                 // Exit conversation mode and start recording
                 conversationMode = false;
                 conversationRecording = true;
+                tideState.active = false;   // New question - clear viz state so it doesn't re-display
+                moonState.active = false;
                 recordingActive = true;
                 recordingStartTime = millis();
                 lastVoiceActivityTime = millis();
@@ -1725,14 +1813,17 @@ void loop() {
             } else if (timerState.active) {
                 currentLEDMode = LED_TIMER;
                 Serial.println("Returning to TIMER display");
-            } else if (moonState.active) {
-                currentLEDMode = LED_MOON;
-                moonState.displayStartTime = millis();
-                Serial.println("Returning to MOON display");
             } else if (tideState.active) {
-                currentLEDMode = LED_TIDE;
-                tideState.displayStartTime = millis();
-                Serial.println("Returning to TIDE display");
+                // Clear tide - user had their chance during the window.
+                // Re-entering LED_TIDE with convState=IDLE causes a stuck state
+                // (auto-transition requires WAITING). Go straight to idle.
+                tideState.active = false;
+                currentLEDMode = LED_IDLE;
+                Serial.println("Returning to IDLE (tide already shown)");
+            } else if (moonState.active) {
+                moonState.active = false;
+                currentLEDMode = LED_IDLE;
+                Serial.println("Returning to IDLE (moon already shown)");
             } else {
                 currentLEDMode = LED_IDLE;
                 Serial.println("Returning to IDLE");
@@ -1972,6 +2063,24 @@ void audioTask(void * parameter) {
                             int remaining = timerState.totalSeconds > (int)elapsed ? timerState.totalSeconds - (int)elapsed : 0;
                             timDoc["secondsRemaining"] = remaining;
                         }
+
+                        // Lamp state
+                        JsonObject lamDoc = stateDoc["lamp"].to<JsonObject>();
+                        lamDoc["active"] = lampState.active;
+                        if (lampState.active) {
+                            const char* colorName = "white";
+                            if (lampState.currentColor == LampState::RED) colorName = "red";
+                            else if (lampState.currentColor == LampState::GREEN) colorName = "green";
+                            else if (lampState.currentColor == LampState::BLUE) colorName = "blue";
+                            lamDoc["color"] = colorName;
+                        }
+
+                        // Alarm count (quick summary — full list available via deviceStateRequest)
+                        int activeAlarmCount = 0;
+                        for (int i = 0; i < MAX_ALARMS; i++) {
+                            if (alarms[i].enabled) activeAlarmCount++;
+                        }
+                        stateDoc["alarmCount"] = activeAlarmCount;
 
                         String stateMsg;
                         serializeJson(stateDoc, stateMsg);
@@ -2367,9 +2476,12 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                         recordingActive = false;
                     }
                     
-                    // Wait for prebuffer before starting playback to eliminate initial stutter
+                    // Activate the LED VU meter as soon as the first audio packet arrives.
+                    // audioTask starts playing immediately from packet 1, so activating here
+                    // ensures the LEDs light up at the same moment audio begins.
+                    // The AUDIO_DELAY_BUFFER_SIZE ring buffer handles the fine-grained level delay.
                     uint32_t queueDepth = uxQueueMessagesWaiting(audioOutputQueue);
-                    const uint32_t MIN_PREBUFFER = 8;  // ~320ms buffer (8 packets  40ms)
+                    const uint32_t MIN_PREBUFFER = 1;  // activate on first packet
                     
                     if (queueDepth >= MIN_PREBUFFER) {
                         isPlayingResponse = true;
@@ -2513,7 +2625,9 @@ void updateLEDs() {
  static uint8_t brightness = 100;
  
  // Smooth the audio level with exponential moving average
- const float smoothing = 0.18f; // Balanced response time
+// Fast rise (α=0.5, ~43ms time constant) so peaks track speech closely.
+        // Decay is handled separately below (0.60× per frame when silent).
+        const float smoothing = 0.50f;
  smoothedAudioLevel = smoothedAudioLevel * (1.0f - smoothing) + currentAudioLevel * smoothing;
  
  // Faster decay when no audio to prevent LEDs lingering after speech ends

@@ -42,6 +42,10 @@ struct TimerState {
     int totalSeconds;
     uint32_t startTime;
     bool active;
+    // Non-blocking flash animation state (driven by loop(), triggered on timerExpired)
+    bool flashing;           // Currently flashing completion indicator
+    uint8_t flashCount;      // Number of flashes completed (0-6: on/off/on/off/on/off)
+    uint32_t flashStartTime; // When current flash state started
 };
 
 // Moon phase visualization state

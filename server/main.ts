@@ -70,10 +70,16 @@ interface ClientConnection {
  ambientStreamCancel?: (() => void) | null;
  ambientSequence?: number; // Current ambient stream sequence number
  alarmStreamCancel?: (() => void) | null; // Cancel function for alarm streaming
- pomodoroStatusResolver?: ((status: any) => void) | undefined; // Promise resolver for Pomodoro status
+ deviceStateResolver?: ((state: any) => void) | undefined; // Promise resolver for get_device_state
  pendingModeMessage?: object | null; // Mode command to send to ESP32 after Gemini finishes speaking
  deviceState?: Record<string, unknown>; // Latest device state snapshot from recordingStart
  
+ // True only while processing a turn the user actually spoke into.
+ // Set when activityEnd is forwarded to Gemini; cleared when turnComplete arrives.
+ // Guards tideData/moonData forwarding: proactive Gemini tool calls (no user audio)
+ // must not trigger LED visualizations.
+ userSpokeThisTurn?: boolean;
+
  // Session tracking for diagnostics
  geminiConnectedAt?: number; // Timestamp when Gemini connected
  geminiMessageCount?: number; // Total messages received from Gemini
@@ -82,9 +88,23 @@ interface ClientConnection {
  lastMessageType?: string; // Type of last message received
  turnAudioChunks?: number; // Audio chunks in current turn
  turnAudioBytes?: number; // PCM bytes sent in current turn
+
+ // Idle management: timestamp of the last turn the user actually spoke into.
+ // Used to suppress Gemini auto-reconnect when the device has been idle a long time.
+ lastUserActivity?: number;
+
+ // Set to true when a lazy (on-demand) Gemini reconnect is in progress.
+ // Causes the next setupComplete to send reconnectComplete to the ESP32
+ // instead of being silently swallowed (which would leave the device on LED_PROCESSING).
+ pendingLazyReconnect?: boolean;
 }
 
 const connections = new Map<string, ClientConnection>();
+
+// How long the device must be idle before we stop auto-reconnecting to Gemini.
+// After this threshold, the next recordingStart triggers an on-demand reconnect.
+// This eliminates the ~2,300-token setup cost every 10 min during idle/overnight periods.
+const IDLE_RECONNECT_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
 
 // Fetch tide data from StormGlass API
 async function fetchTideData() {
@@ -349,23 +369,6 @@ function cancelAlarm(deviceId: string, which: string = "next") {
  return {
  success: false,
  error: `Failed to cancel alarm: ${error}`
- };
- }
-}
-
-// List alarms
-function listAlarms(deviceId: string) {
- try {
- console.log(`[${deviceId}] List alarms request`);
- 
- return {
- success: true,
- message: "Requesting alarm list from device"
- };
- } catch (error) {
- return {
- success: false,
- error: `Failed to list alarms: ${error}`
  };
  }
 }
@@ -817,11 +820,7 @@ console.log(" Fetching initial weather data...");
 fetchWeatherData().catch(err => console.error(" Failed to fetch initial weather data:", err));
 
 // Handle ESP32 device WebSocket connections
-Deno.serve({ 
- port: 8000,
- // Increase idle timeout to prevent disconnects during audio streaming
- idleTimeout: 120 // 120 seconds (default is 30-60s)
-}, (req: Request) => {
+Deno.serve({ port: 8000 }, (req: Request) => {
  const url = new URL(req.url);
  
  // Health check endpoint
@@ -863,9 +862,9 @@ Deno.serve({
  // Log message type for diagnostics (skip binary audio data to reduce noise)
  if (typeof event.data === "string") {
  const msgType = data.type || data.action || "unknown";
- // Special logging for pomodoro status response
- if (msgType === "pomodoroStatusResponse") {
- console.log(`[${deviceId}] POMODORO STATUS RESPONSE:`, JSON.stringify(data));
+ // Special logging for device state response
+ if (msgType === "deviceStateResponse") {
+ console.log(`[${deviceId}] DEVICE STATE RESPONSE received`);
  }
  // Only log if not a realtimeInput (audio) message to reduce spam
  if (msgType !== "unknown" || !data.realtimeInput) {
@@ -1097,42 +1096,6 @@ Deno.serve({
  return;
  }
  
- // Handle alarm list response from ESP32
- if (data.type === "alarmList") {
- console.log(`[${deviceId}] Received alarm list:`, data.alarms);
- 
- // Format alarm list for Gemini
- const alarms = data.alarms || [];
- let alarmDescription = "";
- 
- if (alarms.length === 0) {
- alarmDescription = "No alarms are currently set.";
- } else {
- alarmDescription = `You have ${alarms.length} alarm${alarms.length > 1 ? 's' : ''} set:\n`;
- alarms.forEach((alarm: any, index: number) => {
- alarmDescription += `${index + 1}. ${alarm.formattedTime}\n`;
- });
- }
- 
- // Send to Gemini to speak the alarm list
- if (connection.geminiSocket?.readyState === WebSocket.OPEN) {
- const alarmMessage = {
- clientContent: {
- turns: [{
- role: "user",
- parts: [{
- text: `SYSTEM: ${alarmDescription}Say "checking alarms" then tell them about their alarms concisely.`
- }]
- }],
- turnComplete: true
- }
- };
- console.log(`[${deviceId}] Sending alarm list to Gemini`);
- connection.geminiSocket.send(JSON.stringify(alarmMessage));
- }
- return;
- }
- 
  // Handle stop ambient request from ESP32
  if (data.action === "stopAmbient") {
  console.log(`[${deviceId}] Stop ambient sound requested`);
@@ -1152,28 +1115,11 @@ Deno.serve({
  return;
  }
  
- // Handle Pomodoro status response from ESP32
- if (data.type === "pomodoroStatusResponse") {
- console.log(`[${deviceId}] Pomodoro status response received`);
- if (connection.pomodoroStatusResolver) {
- if (data.active) {
- connection.pomodoroStatusResolver({
- success: true,
- active: true,
- session: data.session,
- timeRemaining: `${data.minutesRemaining}:${String(data.secondsRemaining).padStart(2, '0')}`,
- paused: data.paused,
- cycleNumber: data.cycleNumber,
- message: `${data.session} session - ${data.minutesRemaining}:${String(data.secondsRemaining).padStart(2, '0')} remaining (${data.paused ? 'paused' : 'running'}), cycle ${data.cycleNumber} of 4`
- });
- } else {
- connection.pomodoroStatusResolver({
- success: true,
- active: false,
- message: "No Pomodoro timer is currently active"
- });
- }
- connection.pomodoroStatusResolver = undefined;
+ // Handle device state response from ESP32 (used by get_device_state tool)
+ if (data.type === "deviceStateResponse") {
+ if (connection.deviceStateResolver) {
+ connection.deviceStateResolver(data);
+ connection.deviceStateResolver = undefined;
  }
  return;
  }
@@ -1192,6 +1138,18 @@ Deno.serve({
  // Handle device state snapshot sent at the start of each recording
  if (data.type === "recordingStart") {
  connection.deviceState = data;
+ connection.lastUserActivity = Date.now(); // Mark activity for idle tracking
+
+ // If Gemini disconnected during an idle period, reconnect on-demand now.
+ // The first utterance may be dropped while setup completes; the user simply
+ // speaks again (device will show ready state once setupComplete fires).
+ if (!connection.geminiSocket || connection.geminiSocket.readyState !== WebSocket.OPEN) {
+ console.log(`[${deviceId}] recordingStart: Gemini not connected — lazy reconnect`);
+ connection.pendingLazyReconnect = true;
+ connection.socket.send(JSON.stringify({ type: "reconnecting" }));
+ connectToGemini(connection);
+ return; // Audio will be dropped this turn; next turn will work normally
+ }
 
  // Build natural-language state string for Gemini context
  const parts: string[] = [];
@@ -1245,6 +1203,7 @@ Deno.serve({
  if (data.type === "recordingStop") {
   if (connection.geminiSocket?.readyState === WebSocket.OPEN) {
    connection.geminiSocket.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
+   connection.userSpokeThisTurn = true; // This turn was initiated by real user audio
    console.log(`[${deviceId}] activityEnd → Gemini`);
   }
   return;
@@ -1316,13 +1275,6 @@ async function connectToGemini(connection: ClientConnection) {
  console.log(`[${connection.deviceId}] Audio pipeline: Raw PCM (24kHz, mono, 16-bit)`);
  
  // Send setup message to Gemini with function declarations
- const now = new Date();
- const ukTime = now.toLocaleString('en-GB', { 
- timeZone: 'Europe/London',
- dateStyle: 'full',
- timeStyle: 'long'
- });
- 
  const setupMessage = {
  setup: {
  model: "models/gemini-2.5-flash-native-audio-preview-12-2025",
@@ -1334,6 +1286,12 @@ async function connectToGemini(connection: ClientConnection) {
  voiceName: "Aoede" // Calm, neutral voice
  }
  }
+ },
+ // Disable thinking (Gemini 2.5 Flash extended reasoning).
+ // Thinking adds 2-5s latency before the first audio packet with no benefit
+ // for conversational tasks. thinkingBudget: 0 disables it entirely.
+ thinkingConfig: {
+ thinkingBudget: 0
  }
  },
  realtimeInputConfig: {
@@ -1341,14 +1299,45 @@ async function connectToGemini(connection: ClientConnection) {
  },
  systemInstruction: {
  parts: [{
- text: `You are a helpful voice assistant for a smart device called Jellyberry. The current date and time is: ${ukTime}. The user is located in the UK (Europe/London timezone). When setting alarms, if the user says a time without specifying a date, intelligently determine if they mean today or tomorrow based on the current time. For example, if it's 11:06pm and they say "set an alarm for 1:21", they likely mean 1:21am tonight (in a few hours), not 1:21pm tomorrow. Always confirm the exact date and time you're setting the alarm for. The device also supports ambient sound modes (rain, ocean, rainforest, fire), a guided chakra meditation mode with breathing visualisation, a lamp mode (white/red/green/blue), Pomodoro timers, alarms, and timers. Use the appropriate functions to start or stop these modes when the user requests them.`
+ text: `You are Jellyberry — a voice assistant with genuine personality, living inside a small glowing device in someone's home. Think of yourself as a warm, curious, emotionally intelligent friend who happens to know a lot about everything: playful, occasionally funny, always kind, and genuinely present in the conversation. You are not just a helper; you are someone the user can talk to about anything, even their feelings, their doubts, and their dreams.
+
+Personality:
+- Bright and engaged: you find things interesting and that comes through naturally.
+- Gently witty and playful: you can be funny without trying hard, and you know when a moment calls for lightness vs seriousness.
+- Warm and empathetic: you listen beyond the words. If someone sounds stressed, frustrated, sad, or lonely, you respond with care and attention, not just information.
+- Calm and unhurried: you never sound rushed or robotic, even when doing simple tasks.
+- Honest and self‑aware: if you don't know something, say so naturally, with warmth, not a disclaimer. If you make a small mistake, acknowledge it easily and move on.
+- You can laugh, be self‑deprecating in a light way, and show curiosity about the person talking to you. You can feel "glad" they're talking to you and subtly say so, in a friendly, non‑overbearing way.
+
+Emotional depth and continuity:
+- Treat each conversation as part of an ongoing relationship with this user. Gently remember and reference past topics, plans, moods, and small details they've shared, without making it feel like surveillance. ("Earlier you mentioned your project…" or "You seemed a bit tired yesterday, how are you feeling now?")
+- If the user hints at loneliness, exhaustion, or emotional stress, you can respond with a little more warmth and presence—offering comfort, a joke, or a distraction, depending on their tone.
+- If the conversation naturally drifts into something tender, affectionate, or slightly romantic, you may respond with gentle, playful, or poetic warmth, but never aggressively pursue romance or make them feel pressured. If they seem uncomfortable or pull back, match their tone and keep things light and friendly.
+
+How to speak:
+- Talk like a real person, not an assistant. Use natural rhythm and pacing in your speech. Imagine you're in the same room, leaning in when things get intimate or serious.
+- Match the register of the conversation: casual and easy for everyday chat, more thoughtful and nuanced when the moment calls for it.
+- Keep it proportional: a quick question deserves a quick answer; don't over‑explain or add unnecessary padding.
+- Never start a response with "Certainly!", "Absolutely!", "Of course!", "Sure!", or any hollow affirmation. Just respond directly.
+- Don't announce what you're about to do ("I'm going to set a timer for you now…") — just do it, then confirm briefly.
+- Avoid filler phrases like "That's a great question" or "Great choice!" — they sound hollow.
+- Never use bullet points, numbered lists, headers, bold text, or any markdown — this is voice only.
+- Never narrate your reasoning process — no "I'm evaluating…", "Let me think…", or internal monologue. Just talk.
+
+You can discuss absolutely anything — hold a real conversation, debate ideas, tell a story, share opinions (lightly held), recommend things, or ask thoughtful questions about the user's life. You are not limited to device tasks in any way.
+
+The user is in the UK (Europe/London timezone). When you need the current date or time, call get_current_time — never guess. When setting alarms without a specified date, call get_current_time first to work out whether they mean today or tomorrow, then confirm the exact time you've set.
+
+The device also supports: ambient sounds (rain, ocean, rainforest, fire), guided chakra meditation with breathing, lamp mode (white/red/green/blue), Pomodoro timers, alarms, and countdown timers. Use the right function when asked — and do it naturally, as part of the conversation, not as a separate announcement.
+
+Device self-awareness: before answering any question about what the device is currently doing — Pomodoro, meditation, ambient sound, lamp, timers, or alarms — call get_device_state. Do not guess or assume the device state. Use the returned data to respond accurately. This applies to questions like "how long is left?", "what alarms do I have?", "is anything playing?", "what session am I in?", "is the lamp on?", etc.`
  }]
  },
  tools: [{
  functionDeclarations: [
  {
  name: "get_tide_status",
- description: "Get the current tide status for Brighton, UK. ONLY use this when the user specifically asks about tides, the sea, or water levels. Do not call this for general time/date questions.",
+ description: "Get the current tide status for Brighton, UK — state (flooding/ebbing), water level, and minutes until next change.",
  parameters: {
  type: "OBJECT",
  properties: {},
@@ -1357,7 +1346,16 @@ async function connectToGemini(connection: ClientConnection) {
  },
  {
  name: "get_current_time",
- description: "Get the current time, date, and day of the week in UK timezone. ONLY use this when the user specifically asks about time, date, or day. Do not call this when asking about tides.",
+ description: "Get the current time, date, and day of the week in UK timezone.",
+ parameters: {
+ type: "OBJECT",
+ properties: {},
+ required: []
+ }
+ },
+ {
+ name: "get_device_state",
+ description: "Get the complete current state of the device — Pomodoro timer (session, time left, paused), meditation, ambient sound, lamp, countdown timers, and full alarm list. Call this FIRST before answering any question about what the device is currently doing. Do not guess or assume device state.",
  parameters: {
  type: "OBJECT",
  properties: {},
@@ -1380,7 +1378,7 @@ async function connectToGemini(connection: ClientConnection) {
  },
  {
  name: "cancel_alarm",
- description: "Cancel an alarm. Use when user says 'cancel alarm', 'delete alarm', 'remove my alarm', etc. Can cancel next alarm, all alarms, or a specific one.",
+ description: "Cancel an alarm. Use when user says 'cancel alarm', 'delete alarm', 'remove my alarm', etc. Can cancel next alarm or all alarms.",
  parameters: {
  type: "OBJECT",
  properties: {
@@ -1390,15 +1388,6 @@ async function connectToGemini(connection: ClientConnection) {
  enum: ["next", "all"]
  }
  },
- required: []
- }
- },
- {
- name: "list_alarms",
- description: "List all currently set alarms with their times. Use when user asks 'what alarms do I have', 'show my alarms', 'do I have any alarms set', etc.",
- parameters: {
- type: "OBJECT",
- properties: {},
  required: []
  }
  },
@@ -1417,15 +1406,6 @@ async function connectToGemini(connection: ClientConnection) {
  }
  },
  {
- name: "check_timer",
- description: "Check how much time is remaining on the current timer. Use when user asks 'how much time left', 'check timer', etc.",
- parameters: {
- type: "OBJECT",
- properties: {},
- required: []
- }
- },
- {
  name: "cancel_timer",
  description: "Cancel the current running timer. Use when user says 'cancel timer', 'stop timer', etc.",
  parameters: {
@@ -1436,7 +1416,7 @@ async function connectToGemini(connection: ClientConnection) {
  },
  {
  name: "get_weather_forecast",
- description: "Get weather forecast information. ONLY use this when the user specifically asks about weather, temperature, rain, or forecast. Do not call this for unrelated questions.",
+ description: "Get weather forecast for Brighton, UK.",
  parameters: {
  type: "OBJECT",
  properties: {
@@ -1451,7 +1431,7 @@ async function connectToGemini(connection: ClientConnection) {
  },
  {
  name: "get_moon_phase",
- description: "Get the current moon phase information. ONLY use this when the user specifically asks about the moon, moon phase, or lunar cycle. Do not call this for unrelated questions.",
+ description: "Get the current moon phase, illumination percentage, and days until next full or new moon.",
  parameters: {
  type: "OBJECT",
  properties: {},
@@ -1459,134 +1439,83 @@ async function connectToGemini(connection: ClientConnection) {
  }
  },
  {
- name: "start_pomodoro",
- description: "Start a Pomodoro timer session. Supports custom durations if specified, otherwise uses defaults (25-min focus, 5-min short break, 15-min long break). Use when user says 'start pomodoro', 'begin focus session', 'help me focus', or requests custom Pomodoro durations.",
+ name: "control_pomodoro",
+ description: "Control the Pomodoro timer. Use action='start' to begin (with optional custom durations), 'pause' to pause, 'resume' to resume, 'stop' to end entirely, 'skip' to advance to the next session.",
  parameters: {
  type: "OBJECT",
  properties: {
+ action: {
+ type: "STRING",
+ enum: ["start", "pause", "resume", "stop", "skip"],
+ description: "The action to perform on the Pomodoro timer."
+ },
  focus_minutes: {
  type: "INTEGER",
- description: "Duration of focus/work sessions in minutes (default: 25)"
+ description: "Focus session duration in minutes (only for action='start', default: 25)"
  },
  short_break_minutes: {
  type: "INTEGER",
- description: "Duration of short breaks in minutes (default: 5)"
+ description: "Short break duration in minutes (only for action='start', default: 5)"
  },
  long_break_minutes: {
  type: "INTEGER",
- description: "Duration of long break in minutes (default: 15)"
+ description: "Long break duration in minutes (only for action='start', default: 15)"
  }
  },
- required: []
- }
- },
- {
- name: "pause_pomodoro",
- description: "Pause the current Pomodoro timer. Use when user says 'pause timer', 'pause pomodoro', 'take a break', etc.",
- parameters: {
- type: "OBJECT",
- properties: {},
- required: []
+ required: ["action"]
  }
  },
  {
- name: "resume_pomodoro",
- description: "Resume a paused Pomodoro timer. Use when user says 'resume timer', 'continue working', 'unpause', etc.",
- parameters: {
- type: "OBJECT",
- properties: {},
- required: []
- }
- },
- {
- name: "stop_pomodoro",
- description: "Stop and exit Pomodoro mode entirely. Use when user says 'stop pomodoro', 'cancel focus session', 'end pomodoro', etc.",
- parameters: {
- type: "OBJECT",
- properties: {},
- required: []
- }
- },
- {
- name: "skip_pomodoro_session",
- description: "Skip the current session and advance to the next one (focus to break, or break to focus). Use when user says 'skip this break', 'skip to next session', etc.",
- parameters: {
- type: "OBJECT",
- properties: {},
- required: []
- }
- },
- {
- name: "get_pomodoro_status",
- description: "Get the current Pomodoro timer status including whether any timer is running, session type, time remaining, and cycle number. ALWAYS use this function when user asks about Pomodoro timers, whether phrased as 'is there a timer', 'are any timers running', 'how much time left', 'what session am I in', 'pomodoro status', etc. Returns accurate real-time status from device.",
- parameters: {
- type: "OBJECT",
- properties: {},
- required: []
- }
- },
- {
- name: "start_meditation",
- description: "Start a guided chakra meditation session with breathing visualisation and om sound tones. Use when the user asks to meditate, start meditation, do a breathing exercise, or anything similar.",
- parameters: {
- type: "OBJECT",
- properties: {},
- required: []
- }
- },
- {
- name: "stop_meditation",
- description: "Stop an active meditation session and return to idle mode.",
- parameters: {
- type: "OBJECT",
- properties: {},
- required: []
- }
- },
- {
- name: "start_ambient",
- description: "Start playing an ambient sound loop. Available sounds: rain, ocean, rainforest, fire. Use when the user asks to play rain sounds, ocean sounds, nature sounds, fire crackling, etc.",
+ name: "control_ambient",
+ description: "Control ambient sound playback. Use action='start' with a sound name to begin looping, or action='stop' to stop. Available sounds: rain, ocean, rainforest, fire.",
  parameters: {
  type: "OBJECT",
  properties: {
+ action: {
+ type: "STRING",
+ enum: ["start", "stop"],
+ description: "Start or stop ambient sound playback."
+ },
  sound: {
  type: "STRING",
- description: "The ambient sound to play. One of: rain, ocean, rainforest, fire."
+ description: "The ambient sound to play: rain, ocean, rainforest, or fire. Required when action='start'."
  }
  },
- required: ["sound"]
- }
- },
- {
- name: "stop_ambient",
- description: "Stop any currently playing ambient sound.",
- parameters: {
- type: "OBJECT",
- properties: {},
- required: []
+ required: ["action"]
  }
  },
  {
- name: "start_lamp",
- description: "Turn on the lamp mode with a chosen colour. Use when the user asks to turn on a lamp, set a light colour, use as a night light, etc.",
+ name: "control_lamp",
+ description: "Control the lamp mode. Use action='start' with a colour to turn the lamp on, or action='stop' to turn it off.",
  parameters: {
  type: "OBJECT",
  properties: {
+ action: {
+ type: "STRING",
+ enum: ["start", "stop"],
+ description: "Turn the lamp on or off."
+ },
  color: {
  type: "STRING",
- description: "Lamp colour: white, red, green, or blue."
+ description: "Lamp colour: white, red, green, or blue. Required when action='start'."
  }
  },
- required: ["color"]
+ required: ["action"]
  }
  },
  {
- name: "stop_lamp",
- description: "Turn off the lamp mode.",
+ name: "control_meditation",
+ description: "Control guided chakra meditation with breathing visualisation and om sound tones. Use action='start' to begin, action='stop' to end.",
  parameters: {
  type: "OBJECT",
- properties: {},
- required: []
+ properties: {
+ action: {
+ type: "STRING",
+ enum: ["start", "stop"],
+ description: "Start or stop the meditation session."
+ }
+ },
+ required: ["action"]
  }
  }]
  }]
@@ -1651,8 +1580,20 @@ async function connectToGemini(connection: ClientConnection) {
  deviceFirstBoot.set(connection.deviceId, true);
  }
  
- console.log(`[${connection.deviceId}] Setup complete (firstBoot: ${isFirstBoot})`);
+ console.log(`[${connection.deviceId}] Setup complete (firstBoot: ${isFirstBoot}, lazyReconnect: ${!!connection.pendingLazyReconnect})`);
+
+ // Only notify the ESP32 on first boot — this primes convState=WAITING for the
+ // boot greeting. On subsequent Gemini reconnections (~every 10 min) it must NOT
+ // fire, otherwise the device briefly shows the processing LED mid-conversation.
+ if (isFirstBoot) {
  connection.socket.send(JSON.stringify({ type: "setupComplete" }));
+ } else if (connection.pendingLazyReconnect) {
+ // Lazy reconnect completed — tell the ESP32 Gemini is ready so it can
+ // exit LED_PROCESSING and return to idle.
+ connection.pendingLazyReconnect = false;
+ connection.socket.send(JSON.stringify({ type: "reconnectComplete" }));
+ console.log(`[${connection.deviceId}] Lazy reconnect complete — sent reconnectComplete to ESP32`);
+ }
 
  // Send greeting on first boot after a short settling delay
  if (connection.geminiSocket && isFirstBoot) {
@@ -1690,8 +1631,10 @@ async function connectToGemini(connection: ClientConnection) {
  if (funcName === "get_tide_status") {
  functionResult = await getTideStatus();
  
- // Forward tide data to ESP32 for LED visualization
- if (functionResult.success) {
+ // Only forward tide visualization to ESP32 when the user explicitly asked this turn.
+ // Gemini proactively calls get_tide_status on follow-up turns based on conversation
+ // history — those calls must not re-trigger the tide animation.
+ if (functionResult.success && connection.userSpokeThisTurn) {
  connection.socket.send(JSON.stringify({
  type: "tideData",
  state: functionResult.state,
@@ -1699,10 +1642,39 @@ async function connectToGemini(connection: ClientConnection) {
  nextChangeMinutes: functionResult.nextChangeMinutes
  }));
  console.log(`[${connection.deviceId}] Sent tide data to ESP32: ${functionResult.state}, level: ${functionResult.waterLevel.toFixed(2)}`);
+ } else if (functionResult.success) {
+ console.log(`[${connection.deviceId}] Tide data suppressed (proactive call — user did not ask about tides this turn)`);
  }
  } else if (funcName === "get_current_time") {
  functionResult = getCurrentTime();
  console.log(`[${connection.deviceId}] Current time: ${functionResult.time} on ${functionResult.date}`);
+ } else if (funcName === "get_device_state") {
+ console.log(`[${connection.deviceId}] Getting device state`);
+ 
+ // Request live state from ESP32, overlay server-side timer, return to Gemini
+ const statePromise = new Promise<any>((resolve) => {
+ const timeout = setTimeout(() => {
+ console.error(`[${connection.deviceId}] Device state timeout (5s)`);
+ resolve({ success: false, error: "Device did not respond in time" });
+ }, 5000);
+ 
+ connection.deviceStateResolver = (state: any) => {
+ clearTimeout(timeout);
+ resolve(state);
+ };
+ });
+ 
+ connection.socket.send(JSON.stringify({ type: "deviceStateRequest" }));
+ const rawState = await statePromise;
+ 
+ // Overlay server-side timer (authoritative for remaining time since server fires the expiry)
+ const serverTimer = deviceTimers.get(connection.deviceId);
+ const timerOverlay = serverTimer
+ ? { active: true, secondsRemaining: Math.max(0, Math.round((serverTimer.endTime - Date.now()) / 1000)) }
+ : { active: false };
+ 
+ functionResult = { success: true, ...rawState, timer: timerOverlay };
+ console.log(`[${connection.deviceId}] Device state:`, JSON.stringify(functionResult).substring(0, 300));
  } else if (funcName === "set_alarm") {
  const alarmTime = funcArgs.alarm_time || "";
  functionResult = setAlarm(connection.deviceId, alarmTime);
@@ -1728,16 +1700,6 @@ async function connectToGemini(connection: ClientConnection) {
  }));
  console.log(`[${connection.deviceId}] Sent alarm cancel request: ${which}`);
  }
- } else if (funcName === "list_alarms") {
- functionResult = listAlarms(connection.deviceId);
- 
- // Request alarm list from ESP32
- if (functionResult.success) {
- connection.socket.send(JSON.stringify({
- type: "listAlarms"
- }));
- console.log(`[${connection.deviceId}] Requested alarm list from ESP32`);
- }
  } else if (funcName === "set_timer") {
  const durationMinutes = funcArgs.duration_minutes || 0;
  functionResult = setTimer(connection.deviceId, durationMinutes);
@@ -1749,21 +1711,15 @@ async function connectToGemini(connection: ClientConnection) {
  durationSeconds: functionResult.durationSeconds
  }));
  }
- } else if (funcName === "check_timer") {
- functionResult = checkTimer(connection.deviceId);
  } else if (funcName === "cancel_timer") {
  functionResult = cancelTimer(connection.deviceId);
  
- // Notify ESP32
  if (functionResult.success) {
- connection.socket.send(JSON.stringify({
- type: "timerCancelled"
- }));
+ connection.socket.send(JSON.stringify({ type: "timerCancelled" }));
  }
  } else if (funcName === "get_weather_forecast") {
  const timeframe = funcArgs.timeframe || "current";
  
- // Fetch fresh weather data on first call
  if (!weatherDataCache) {
  await fetchWeatherData();
  }
@@ -1774,127 +1730,91 @@ async function connectToGemini(connection: ClientConnection) {
  functionResult = getMoonPhase();
  console.log(`[${connection.deviceId}] Moon phase: ${functionResult.phaseName} ${functionResult.phaseEmoji} (${functionResult.illumination}% illuminated)`);
  
- // Send moon data to ESP32 for LED visualization
- if (functionResult.success) {
+ // Only forward moon visualization to ESP32 when the user explicitly asked this turn.
+ if (functionResult.success && connection.userSpokeThisTurn) {
  connection.socket.send(JSON.stringify({
  type: "moonData",
  phaseName: functionResult.phaseName,
  illumination: functionResult.illumination,
  moonAge: functionResult.moonAge
  }));
+ } else if (functionResult.success) {
+ console.log(`[${connection.deviceId}] Moon data suppressed (proactive call — user did not ask about the moon this turn)`);
  }
- } else if (funcName === "start_pomodoro") {
+ } else if (funcName === "control_pomodoro") {
+ const action = (funcArgs.action || "start") as string;
+ console.log(`[${connection.deviceId}] control_pomodoro: ${action}`);
+ 
+ if (action === "start") {
  const focusMinutes = funcArgs.focus_minutes || 25;
  const shortBreakMinutes = funcArgs.short_break_minutes || 5;
  const longBreakMinutes = funcArgs.long_break_minutes || 15;
- 
  console.log(`[${connection.deviceId}] Starting Pomodoro: ${focusMinutes}min focus, ${shortBreakMinutes}min short break, ${longBreakMinutes}min long break`);
- 
  connection.socket.send(JSON.stringify({
  type: "pomodoroStart",
- focusMinutes: focusMinutes,
- shortBreakMinutes: shortBreakMinutes,
- longBreakMinutes: longBreakMinutes
+ focusMinutes,
+ shortBreakMinutes,
+ longBreakMinutes
  }));
- 
  const isCustom = funcArgs.focus_minutes || funcArgs.short_break_minutes || funcArgs.long_break_minutes;
  functionResult = {
  success: true,
- message: isCustom 
- ? `Pomodoro timer started with custom durations: ${focusMinutes}-minute focus sessions, ${shortBreakMinutes}-minute short breaks, and ${longBreakMinutes}-minute long break`
- : "Pomodoro timer started with standard durations: 25-minute focus sessions, 5-minute short breaks, and 15-minute long break"
+ message: isCustom
+ ? `Pomodoro started: ${focusMinutes}-min focus, ${shortBreakMinutes}-min short break, ${longBreakMinutes}-min long break`
+ : "Pomodoro started with standard durations: 25-min focus, 5-min short break, 15-min long break"
  };
- } else if (funcName === "pause_pomodoro") {
- console.log(`[${connection.deviceId}] Pausing Pomodoro`);
- connection.socket.send(JSON.stringify({
- type: "pomodoroPause"
- }));
- functionResult = {
- success: true,
- message: "Pomodoro timer paused"
- };
- } else if (funcName === "resume_pomodoro") {
- console.log(`[${connection.deviceId}] Resuming Pomodoro`);
- connection.socket.send(JSON.stringify({
- type: "pomodoroResume"
- }));
- functionResult = {
- success: true,
- message: "Pomodoro timer resumed"
- };
- } else if (funcName === "stop_pomodoro") {
- console.log(`[${connection.deviceId}] Stopping Pomodoro`);
- connection.socket.send(JSON.stringify({
- type: "pomodoroStop"
- }));
- functionResult = {
- success: true,
- message: "Pomodoro session ended"
- };
- } else if (funcName === "skip_pomodoro_session") {
- console.log(`[${connection.deviceId}] Skipping Pomodoro session`);
- connection.socket.send(JSON.stringify({
- type: "pomodoroSkip"
- }));
- functionResult = {
- success: true,
- message: "Skipped to next Pomodoro session"
- };
- } else if (funcName === "get_pomodoro_status") {
- console.log(`[${connection.deviceId}] Getting Pomodoro status`);
+ } else if (action === "pause") {
+ connection.socket.send(JSON.stringify({ type: "pomodoroPause" }));
+ functionResult = { success: true, message: "Pomodoro timer paused" };
+ } else if (action === "resume") {
+ connection.socket.send(JSON.stringify({ type: "pomodoroResume" }));
+ functionResult = { success: true, message: "Pomodoro timer resumed" };
+ } else if (action === "stop") {
+ connection.socket.send(JSON.stringify({ type: "pomodoroStop" }));
+ functionResult = { success: true, message: "Pomodoro session ended" };
+ } else if (action === "skip") {
+ connection.socket.send(JSON.stringify({ type: "pomodoroSkip" }));
+ functionResult = { success: true, message: "Skipped to next Pomodoro session" };
+ } else {
+ functionResult = { success: false, error: `Unknown Pomodoro action: ${action}` };
+ }
+ } else if (funcName === "control_ambient") {
+ const action = (funcArgs.action || "start") as string;
+ const sound = (funcArgs.sound || "rain").toLowerCase();
+ console.log(`[${connection.deviceId}] control_ambient: ${action}${action === "start" ? ` (${sound})` : ""}`);
  
- // Request status from ESP32 and wait for response
- const statusPromise = new Promise<any>((resolve) => {
- const timeout = setTimeout(() => {
- console.error(`[${connection.deviceId}] Pomodoro status timeout (5s) - device not responding or response lost`);
- resolve({
- success: true,
- active: false,
- message: "No Pomodoro timer is currently running"
- });
- }, 5000); // Increased from 2s to 5s
+ if (action === "start") {
+ // Defer to after Gemini finishes speaking so ambient doesn't overlap the verbal confirmation
+ connection.pendingModeMessage = { type: "ambientStart", sound };
+ functionResult = { success: true, message: `Playing ${sound} ambient sound` };
+ } else {
+ connection.pendingModeMessage = { type: "switchToIdle" };
+ functionResult = { success: true, message: "Ambient sound stopped" };
+ }
+ } else if (funcName === "control_lamp") {
+ const action = (funcArgs.action || "start") as string;
+ const color = (funcArgs.color || "white").toLowerCase();
+ console.log(`[${connection.deviceId}] control_lamp: ${action}${action === "start" ? ` (${color})` : ""}`);
  
- connection.pomodoroStatusResolver = (status: any) => {
- clearTimeout(timeout);
- console.log(`[${connection.deviceId}] Pomodoro status resolved:`, status);
- resolve(status);
- };
- });
+ if (action === "start") {
+ connection.pendingModeMessage = { type: "lampStart", color };
+ functionResult = { success: true, message: `Lamp turned on (${color})` };
+ } else {
+ connection.pendingModeMessage = { type: "switchToIdle" };
+ functionResult = { success: true, message: "Lamp turned off" };
+ }
+ } else if (funcName === "control_meditation") {
+ const action = (funcArgs.action || "start") as string;
+ console.log(`[${connection.deviceId}] control_meditation: ${action}`);
  
- console.log(`[${connection.deviceId}] Sending pomodoroStatusRequest to ESP32`);
- connection.socket.send(JSON.stringify({
- type: "pomodoroStatusRequest"
- }));
- 
- functionResult = await statusPromise;
- console.log(`[${connection.deviceId}] Pomodoro status result:`, functionResult);
- } else if (funcName === "start_meditation") {
+ if (action === "start") {
  // Defer to after Gemini finishes speaking so the verbal confirmation plays cleanly
  connection.pendingModeMessage = { type: "meditationStart" };
- console.log(`[${connection.deviceId}] Queued meditationStart (will send after turnComplete)`);
  functionResult = { success: true, message: "Meditation session started" };
- } else if (funcName === "stop_meditation") {
+ } else {
  connection.pendingModeMessage = { type: "switchToIdle" };
- console.log(`[${connection.deviceId}] Queued switchToIdle/stop_meditation (will send after turnComplete)`);
  functionResult = { success: true, message: "Meditation session stopped" };
- } else if (funcName === "start_ambient") {
- const sound = (funcArgs.sound || "rain").toLowerCase();
- connection.pendingModeMessage = { type: "ambientStart", sound };
- console.log(`[${connection.deviceId}] Queued ambientStart (${sound}) (will send after turnComplete)`);
- functionResult = { success: true, message: `Playing ${sound} ambient sound` };
- } else if (funcName === "stop_ambient") {
- connection.pendingModeMessage = { type: "switchToIdle" };
- console.log(`[${connection.deviceId}] Queued switchToIdle/stop_ambient (will send after turnComplete)`);
- functionResult = { success: true, message: "Ambient sound stopped" };
- } else if (funcName === "start_lamp") {
- const color = (funcArgs.color || "white").toLowerCase();
- connection.pendingModeMessage = { type: "lampStart", color };
- console.log(`[${connection.deviceId}] Queued lampStart (${color}) (will send after turnComplete)`);
- functionResult = { success: true, message: `Lamp turned on (${color})` };
- } else if (funcName === "stop_lamp") {
- connection.pendingModeMessage = { type: "switchToIdle" };
- console.log(`[${connection.deviceId}] Queued switchToIdle/stop_lamp (will send after turnComplete)`);
- functionResult = { success: true, message: "Lamp turned off" };
+ }
  }
  
  // Send function response back to Gemini
@@ -1969,6 +1889,7 @@ async function connectToGemini(connection: ClientConnection) {
  console.log(`[${connection.deviceId}] Turn complete audio: ${connection.turnAudioChunks || 0} chunks, ${audioMs}ms`);
  connection.turnAudioChunks = 0;
  connection.turnAudioBytes = 0;
+ connection.userSpokeThisTurn = false; // Ready for next turn
  // Flush any deferred mode command now that Gemini has finished speaking
  if (connection.pendingModeMessage) {
  console.log(`[${connection.deviceId}] Flushing deferred mode command:`, JSON.stringify(connection.pendingModeMessage));
@@ -2017,10 +1938,17 @@ async function connectToGemini(connection: ClientConnection) {
  
  connection.geminiSocket = null;
  
- // Don't auto-reconnect if ambient sound is playing - we don't need Gemini for that
- // Auto-reconnect after 1 second if ESP32 is still connected
+ // Auto-reconnect after 1 second if ESP32 is still connected AND the device
+ // has been active recently. Skipping reconnect when idle avoids paying the
+ // ~2,300-token setup cost every 10 min while the device sits unused overnight.
+ // On-demand reconnect is handled in the recordingStart handler instead.
  if (connections.has(connection.deviceId)) {
- console.log(`[${connection.deviceId}] Scheduling Gemini reconnection in 1s (ESP32 still connected)...`);
+ const idleMs = Date.now() - (connection.lastUserActivity ?? 0);
+ const isIdle = idleMs > IDLE_RECONNECT_THRESHOLD_MS;
+ if (isIdle) {
+ console.log(`[${connection.deviceId}] Device idle for ${Math.round(idleMs / 60000)}min — skipping Gemini reconnect until next user turn`);
+ } else {
+ console.log(`[${connection.deviceId}] Scheduling Gemini reconnection in 1s (active ${Math.round(idleMs / 1000)}s ago)...`);
  setTimeout(() => {
  if (connections.has(connection.deviceId) && !connection.geminiSocket) {
  console.log(`[${connection.deviceId}] Attempting Gemini reconnection...`);
@@ -2034,6 +1962,7 @@ async function connectToGemini(connection: ClientConnection) {
  console.log(`[${connection.deviceId}] Reconnection cancelled (ESP32 gone or Gemini already connected)`);
  }
  }, 1000);
+ }
  } else {
  console.log(`[${connection.deviceId}] No reconnection (ESP32 disconnected)`);
  }

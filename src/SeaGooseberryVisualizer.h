@@ -20,7 +20,7 @@
 //
 // Hardware: 12 vertical LED strips, 12 LEDs each (144 total)
 //           Strips 0-11 arranged around spherical shell
-//           Wiring: Serpentine (alternating bottom-top, top-bottom)
+//           Wiring: Uniform — all strips bottom→top (same as display_mapping.cpp)
 //           Display: h=0 is bottom, h=11 is top
 //
 // =======================================================
@@ -37,10 +37,6 @@ public:
     
     // Render current frame to LED buffer
     void render(CRGB* leds, int ledCount);
-    
-    // Configuration (can be called at runtime to adjust behavior)
-    void setWaveSpeed(float speed);      // 0.5-2.0, default 1.0
-    void setBrightness(float brightness); // 0.0-1.0, default 0.8
     
 private:
     // Configuration constants (authentic comb jelly parameters)

@@ -349,7 +349,6 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
  
  // Handle ambient stream completion
- // Handle ambient stream completion
  if (doc["type"].is<const char*>() && doc["type"] == "ambientComplete") {
  String soundName = doc["sound"].as<String>();
  uint16_t sequence = doc["sequence"].as<uint16_t>();
@@ -368,16 +367,14 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  // Auto-advance to next chakra
  meditationState.currentChakra = (MeditationState::Chakra)(meditationState.currentChakra + 1);
  meditationState.phase = MeditationState::HOLD_BOTTOM;
- meditationState.phaseStartTime = millis();
- 
- Serial.printf("Auto-advancing to %s chakra\n", CHAKRA_NAMES[meditationState.currentChakra]);
- 
+        meditationState.phaseStartTime = 0; // Will sync to first arriving audio chunk
  // Request next chakra sound
  JsonDocument reqDoc;
  reqDoc["action"] = "requestAmbient";
  char nextSound[16];
- sprintf(nextSound, "om%03d", meditationState.currentChakra + 1);
+ sprintf(nextSound, "bell%03d", meditationState.currentChakra + 1);
  reqDoc["sound"] = nextSound;
+ reqDoc["loops"] = 8;
  reqDoc["sequence"] = ++ambientSound.sequence;
  String reqMsg;
  serializeJson(reqDoc, reqMsg);
@@ -672,7 +669,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  meditationState.phase = MeditationState::HOLD_BOTTOM;
  meditationState.active = true;
  meditationState.savedVolume = volumeMultiplier;
- volumeMultiplier = 0.50f; // 50% volume for meditation
+ volumeMultiplier = 0.10f; // 10% volume for meditation
 
  if (isPlayingResponse) {
  // Gemini is still speaking its verbal confirmation - defer audio start
@@ -681,10 +678,10 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  meditationState.streaming = false;
  Serial.println("Meditation queued - will start after Gemini finishes speaking");
  } else {
- // No Gemini audio playing - start immediately
- meditationState.phaseStartTime = millis();
+ // No Gemini audio playing - start immediately (phaseStartTime syncs to first chunk)
+ meditationState.phaseStartTime = 0;
  meditationState.streaming = false;
- ambientSound.name = "om001";
+ ambientSound.name = "bell001";
  ambientSound.active = true;
  isPlayingAmbient = true;
  isPlayingResponse = false;
@@ -693,7 +690,8 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  {
  JsonDocument meditationReqDoc;
  meditationReqDoc["action"] = "requestAmbient";
- meditationReqDoc["sound"] = "om001";
+ meditationReqDoc["sound"] = "bell001";
+ meditationReqDoc["loops"] = 8;
  meditationReqDoc["sequence"] = ++ambientSound.sequence;
  String meditationReqMsg;
  serializeJson(meditationReqDoc, meditationReqMsg);

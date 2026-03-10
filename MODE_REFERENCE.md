@@ -6,13 +6,13 @@ Complete documentation of all LED modes, controls, animations, and voice interac
 
 ## Mode Cycling (Button 2)
 Press **Button 2** to cycle through modes in this order:
-1. Idle → Ambient VU → Nature Sounds → Pomodoro → Meditation → Clock → Lamp → Sea Gooseberry → Idle
+1. Idle → Ambient VU → Sea Gooseberry → Nature Sounds → Pomodoro → Meditation → Lamp → Eyes → Idle
+
+> **Note on Button 1 availability:** Button 1 (talk to Gemini) is **disabled** while in Ambient VU, Sea Gooseberry, and Eyes modes. Use a different mode to start a voice conversation.
 
 ---
 
 ## 🔵 IDLE Mode
-
-**Marquee:** "IDLE MODE"
 
 ### Visual
 - **Animation:** Slow wave pattern traveling up and down the LED matrix
@@ -33,8 +33,6 @@ Press **Button 2** to cycle through modes in this order:
 ---
 
 ## 🎵 AMBIENT Mode
-
-**Marquee:** "RAIN" / "OCEAN" / "RAINFOREST" (depending on sound selected)
 
 ### Visual
 - **Animation:** VU meter audio visualization
@@ -60,8 +58,6 @@ Press **Button 2** to cycle through modes in this order:
 
 ## 🍅 POMODORO Mode
 
-**Marquee:** "POMODORO" (on entry)
-
 ### Visual
 - **Animation:** Countdown/countup timer visualization
 - **Focus Sessions (Red):** Countdown from full (top) to empty (bottom)
@@ -71,7 +67,7 @@ Press **Button 2** to cycle through modes in this order:
 - **Progress Display:** Number of lit LEDs indicates time remaining/elapsed
 
 ### Auto-Start Behavior
-- Timer automatically starts after marquee completes with zen bell chime
+- Timer automatically starts with zen bell chime
 - No manual start required
 
 ### Controls
@@ -114,8 +110,6 @@ Press **Button 2** to cycle through modes in this order:
 
 ## 🧘 MEDITATION Mode
 
-**Marquee:** "MEDITATION"
-
 ### Visual
 - **Animation:** Breathing visualization cycling through 7 chakra colors
 - **Breathing Cycle:**
@@ -135,51 +129,26 @@ Press **Button 2** to cycle through modes in this order:
 ### Audio
 - Chakra-specific Om chants (om001.pcm - om007.pcm)
 - Plays continuously during meditation
-- Volume automatically reduced to 20% (restored on exit)
+- Volume automatically reduced to 50% (restored on exit)
 
 ### Controls
 - **Button 1 Press:** Advance to next chakra (Root → Sacral → Solar → Heart → Throat → Third Eye → Crown)
   - After Crown chakra completes, returns to IDLE mode
   - Each chakra plays its corresponding OM frequency audio
-  - Displays chakra name as marquee
 - **Button 2 Long Press (2+ seconds):** Return to IDLE mode and start Gemini recording
-- **Button 2 Short Press:** Cycle to next mode (Clock)
+- **Button 2 Short Press:** Cycle to next mode (Lamp)
 
 ### Voice Commands
 - Not available during meditation (Button 1 controls chakra progression)
 
 ### Notes
-- Volume lowered to 20% for meditation ambiance
+- Volume lowered to 50% for meditation ambiance
 - Audio stops and volume restores when exiting mode
 - Completes after all 7 chakras, then returns to IDLE
 
 ---
 
-## 🕐 CLOCK Mode
-
-**Marquee:** "CLOCK"
-
-### Visual
-- **Animation:** Digital clock display (hours:minutes)
-- **Color:** White/cyan digits
-- **Update:** Every minute
-- **Layout:** Time displayed across LED matrix in readable format
-
-### Controls
-- **Button 1 Short Press:** Talk to Gemini (clock display pauses)
-  - Returns to clock after 10s conversation window
-- **Button 2:** Switch to Lamp mode
-
-### Voice Commands
-- "What time is it?"
-- "What's the current time?"
-- All standard Gemini functions available
-
----
-
-## 💡 LAMP Mode
-
-**Marquee:** "LAMP"
+##  LAMP Mode
 
 ### Visual
 - **Animation:** Solid color fill, all LEDs same color
@@ -203,8 +172,6 @@ Press **Button 2** to cycle through modes in this order:
 ---
 
 ## 🌊 SEA GOOSEBERRY Mode
-
-**Marquee:** "SEA JELLY"
 
 ### Visual
 - **Animation:** Living comb jelly drifting in dark water
@@ -435,39 +402,7 @@ Mimics real sea gooseberries (Pleurobrachia spp.) - transparent comb jellies wit
 
 ---
 
-## 🎭 MARQUEE Mode (Transient)
-
-**Not a selectable mode** - Plays when entering certain modes
-
-### Visual
-- **Animation:** Scrolling text clockwise around full circumference
-- **Display:** Uses all 12 LED strips (full 360° shell)
-- **Font:** Custom 3×8 chunky glyphs, centered at rows 2-9
-- **Spacing:** 4 columns per character (3 for glyph + 1 column spacing)
-- **Color:** Mode-specific (Pomodoro=Orange, Meditation=Purple, etc.)
-- **Speed:** ~4 columns/second (250ms update interval default)
-- **Direction:** Right-to-left scroll (appears to move clockwise)
-
-### Marquee Messages
-- "POMODORO" - Orange
-- "MEDITATION" - Purple  
-- "CLOCK" - White
-- "LAMP" - White
-- "IDLE MODE" - Blue
-- "FOCUS TIME" - Red (Pomodoro transition)
-- "SHORT BREAK" - Green (Pomodoro transition)
-- "LONG BREAK" - Blue (Pomodoro transition)
-- "CYCLE DONE" - Yellow (Pomodoro complete)
-- "RAIN" / "OCEAN" / "RAINFOREST" - Green (Ambient modes)
-
-### Behavior
-- Scrolls text once
-- Automatically switches to target mode when complete
-- Cannot be interrupted (except by Button 2 long press emergency exit)
-
----
-
-## 🆘 Emergency Actions
+##  Emergency Actions
 
 ### Button 2 Long Press (2 seconds)
 **Available in:** Ambient, Pomodoro, Meditation modes
@@ -540,7 +475,7 @@ Mimics real sea gooseberries (Pleurobrachia spp.) - transparent comb jellies wit
 - **Processing:** Real-time amplitude analysis on 640-byte chunks
 
 ### LED Specifications
-- **Matrix:** 12 rows × 21 columns = 252 LEDs
+- **Matrix:** 12 strips × 12 LEDs = 144 total
 - **Controller:** FastLED library
 - **Refresh Rate:** ~33 FPS (expect ~990 updates per 30s)
 - **Color Depth:** 24-bit RGB
@@ -556,9 +491,10 @@ Mimics real sea gooseberries (Pleurobrachia spp.) - transparent comb jellies wit
 ## Mode Transition Summary
 
 ```
-IDLE (Button 2) → AMBIENT VU (Button 2) → NATURE SOUNDS (Button 2) → POMODORO (Button 2) → MEDITATION (Button 2) → CLOCK (Button 2) → LAMP (Button 2) → IDLE
+IDLE (Button 2) → AMBIENT VU (Button 2) → SEA GOOSEBERRY (Button 2) → NATURE SOUNDS (Button 2) → POMODORO (Button 2) → MEDITATION (Button 2) → LAMP (Button 2) → EYES (Button 2) → IDLE
 
-Any Mode + Button 1 Short Press → RECORDING → PROCESSING → AUDIO_REACTIVE → CONVERSATION_WINDOW → Return to Original Mode
+Any Eligible Mode + Button 1 Short Press → RECORDING → PROCESSING → AUDIO_REACTIVE → CONVERSATION_WINDOW → Return to Original Mode
+(Button 1 disabled in: Ambient VU, Sea Gooseberry, Eyes)
 
 Voice "set timer" → TIMER → Return to IDLE after alarm
 
@@ -584,7 +520,7 @@ Alarm Time → ALARM → (Button 1 dismiss) → Return to Previous Mode
 - [ ] Button 2 exits to Pomodoro
 
 ### POMODORO Mode
-- [ ] Auto-starts after marquee with zen bell
+- [ ] Auto-starts with zen bell
 - [ ] Countdown displays correctly (red bars decreasing)
 - [ ] Button 1 short press opens Gemini (timer continues)
 - [ ] Returns to Pomodoro after 10s window
@@ -595,7 +531,7 @@ Alarm Time → ALARM → (Button 1 dismiss) → Return to Previous Mode
 - [ ] Transitions play zen bell
 - [ ] Short breaks display green (count up)
 - [ ] Long break displays blue (count up)
-- [ ] Cycle complete shows yellow marquee
+- [ ] Cycle complete shows yellow indication
 
 ### MEDITATION Mode
 - [ ] Breathing animation cycles correctly (4s phases)
@@ -605,13 +541,6 @@ Alarm Time → ALARM → (Button 1 dismiss) → Return to Previous Mode
 - [ ] Button 1 long press cycles chakras
 - [ ] Audio changes with chakra
 - [ ] Button 2 exits and restores volume
-
-### CLOCK Mode
-- [ ] Time displays correctly
-- [ ] Updates every minute
-- [ ] Button 1 opens Gemini
-- [ ] Returns to clock after conversation
-- [ ] Button 2 cycles to Lamp
 
 ### LAMP Mode
 - [ ] Starts in white

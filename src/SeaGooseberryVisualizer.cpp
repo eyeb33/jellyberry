@@ -8,7 +8,7 @@ SeaGooseberryVisualizer::SeaGooseberryVisualizer()
       breathingPhase(0.0f),
       lastUpdateMs(0),
       lastShuffleMs(0),
-      nextShuffleInterval(3000 + random(0, 2000)),  // 3-5 seconds
+      nextShuffleInterval(300000),  // Shuffle every 5 minutes for gradual pattern variety
       speedMultiplier(1.0f),
       brightnessMultiplier(0.5f)  // Medium-low brightness (30-60% range)
 {
@@ -65,16 +65,6 @@ void SeaGooseberryVisualizer::initializeStrips() {
     }
 }
 
-// ============== CONFIGURATION ==============
-
-void SeaGooseberryVisualizer::setWaveSpeed(float speed) {
-    speedMultiplier = constrain(speed, 0.5f, 2.0f);
-}
-
-void SeaGooseberryVisualizer::setBrightness(float brightness) {
-    brightnessMultiplier = constrain(brightness, 0.0f, 1.0f);
-}
-
 // ============== UPDATE (NON-BLOCKING) ==============
 
 void SeaGooseberryVisualizer::update(uint32_t nowMs) {
@@ -92,8 +82,13 @@ void SeaGooseberryVisualizer::update(uint32_t nowMs) {
         breathingPhase -= 1.0f;
     }
     
-    // Periodic pattern shuffling is disabled — initial randomisation at startup
-    // provides sufficient variety without the sudden visual jumps that shuffling caused.
+    // Periodic pattern shuffling: re-randomize wave counts, spacing and speed every 5 minutes
+    // to prevent the animation from feeling repetitive during extended use.
+    if (lastShuffleMs == 0) lastShuffleMs = nowMs;  // Initialise on first call
+    if (nowMs - lastShuffleMs >= nextShuffleInterval) {
+        shufflePatterns();
+        lastShuffleMs = nowMs;
+    }
     
     // Calculate current speed (constant, per-rib variation applied in render)
     float currentSpeed = BASE_WAVE_SPEED * speedMultiplier;
@@ -169,20 +164,13 @@ void SeaGooseberryVisualizer::render(CRGB* leds, int ledCount) {
 
 // ============== HELPER FUNCTIONS ==============
 
-// LED index mapping with serpentine wiring correction
+// LED index mapping — all strips wired bottom→top (uniform, not serpentine)
 int SeaGooseberryVisualizer::ledIndexForCoord(int strip, int height) {
     if (strip < 0 || strip >= NUM_STRIPS) return -1;
     if (height < 0 || height >= LEDS_PER_STRIP) return -1;
     
-    int baseIndex = strip * LEDS_PER_STRIP;
-    
-    if (strip % 2 == 0) {
-        // Even strips: wired bottom→top
-        return baseIndex + height;
-    } else {
-        // Odd strips: wired top→bottom
-        return baseIndex + (LEDS_PER_STRIP - 1 - height);
-    }
+    // Uniform wiring: all strips run bottom→top, consistent with display_mapping.cpp
+    return strip * LEDS_PER_STRIP + height;
 }
 
 // Get color for band with vertical gradient and per-rib variation

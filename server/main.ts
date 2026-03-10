@@ -70,6 +70,7 @@ interface ClientConnection {
  ambientStreamCancel?: (() => void) | null;
  ambientSequence?: number; // Current ambient stream sequence number
  alarmStreamCancel?: (() => void) | null; // Cancel function for alarm streaming
+ zenBellCancel?: (() => void) | null; // Cancel function for zen bell streaming
  deviceStateResolver?: ((state: any) => void) | undefined; // Promise resolver for get_device_state
  pendingModeMessage?: object | null; // Mode command to send to ESP32 after Gemini finishes speaking
  deviceState?: Record<string, unknown>; // Latest device state snapshot from recordingStart
@@ -425,20 +426,11 @@ function setTimer(deviceId: string, durationMinutes: number) {
  connection.geminiSocket.send(JSON.stringify(notification));
  }
  }
- } else if (remaining % 60 === 0 && remaining > 0) {
- // Send progress update every minute
- const connection = connections.get(deviceId);
- if (connection?.socket.readyState === WebSocket.OPEN) {
- connection.socket.send(JSON.stringify({
- type: "timerUpdate",
- secondsRemaining: remaining
- }));
- }
  }
  }, 1000);
- 
+
  deviceTimers.set(deviceId, timerState);
- 
+
  console.log(`[${deviceId}] Timer set for ${durationMinutes} minutes (${durationSeconds}s)`);
  
  return {
@@ -446,31 +438,6 @@ function setTimer(deviceId: string, durationMinutes: number) {
  durationMinutes,
  durationSeconds,
  expiresAt: new Date(endTime).toLocaleTimeString('en-GB')
- };
-}
-
-// Check timer status
-function checkTimer(deviceId: string) {
- const timer = deviceTimers.get(deviceId);
- 
- if (!timer) {
- return {
- success: false,
- active: false,
- message: "No timer is currently running"
- };
- }
- 
- const remaining = Math.max(0, Math.round((timer.endTime - Date.now()) / 1000));
- const minutes = Math.floor(remaining / 60);
- const seconds = remaining % 60;
- 
- return {
- success: true,
- active: true,
- secondsRemaining: remaining,
- minutesRemaining: minutes,
- displayTime: `${minutes}:${seconds.toString().padStart(2, '0')}`
  };
 }
 
@@ -935,9 +902,18 @@ Deno.serve({ port: 8000 }, (req: Request) => {
  if (data.action === "requestZenBell") {
  console.log(`[${deviceId}] Zen bell requested`);
  
+ // Cancel any previous zen bell still streaming
+ if (connection.zenBellCancel) {
+ connection.zenBellCancel();
+ connection.zenBellCancel = null;
+ }
+ 
  const bellPath = `./audio/zen_bell.pcm`;
  
  try {
+ let cancelled = false;
+ connection.zenBellCancel = () => { cancelled = true; };
+ 
  // Read and send the zen bell PCM file (play once)
  const audioData = await Deno.readFile(bellPath);
  console.log(`[${deviceId}] Loaded zen_bell.pcm (${audioData.byteLength} bytes) - sending...`);
@@ -947,7 +923,7 @@ Deno.serve({ port: 8000 }, (req: Request) => {
  const CHUNKS_PER_BATCH = 5;
  const BATCH_DELAY_MS = 100;
  
- for (let offset = 0; offset < audioData.byteLength; offset += CHUNK_SIZE) {
+ for (let offset = 0; offset < audioData.byteLength && !cancelled; offset += CHUNK_SIZE) {
  const chunk = audioData.slice(offset, offset + CHUNK_SIZE);
  socket.send(chunk);
  
@@ -957,9 +933,15 @@ Deno.serve({ port: 8000 }, (req: Request) => {
  }
  }
  
+ if (cancelled) {
+ console.log(`[${deviceId}] Zen bell cancelled`);
+ } else {
  console.log(`[${deviceId}] Zen bell sent (${audioData.byteLength} bytes)`);
+ }
+ connection.zenBellCancel = null;
  } catch (err) {
  console.error(`[${deviceId}] Failed to load zen bell:`, err);
+ connection.zenBellCancel = null;
  }
  
  return; // Don't pass to Gemini
@@ -968,7 +950,15 @@ Deno.serve({ port: 8000 }, (req: Request) => {
  if (data.action === "requestAmbient") {
  const soundName = data.sound || "rain";
  const sequence = data.sequence || 0;
- console.log(`[${deviceId}] Ambient sound requested: ${soundName} (sequence ${sequence})`);
+ const maxLoops: number = (data.loops as number) || 0; // 0 = loop forever, >0 = stop after N loops
+ console.log(`[${deviceId}] Ambient sound requested: ${soundName} (sequence ${sequence}, loops ${maxLoops || 'infinite'})`);
+ 
+ // Cancel any zen bell still streaming (mode switch mid-chime)
+ if (connection.zenBellCancel) {
+ connection.zenBellCancel();
+ connection.zenBellCancel = null;
+ console.log(`[${deviceId}] Cancelled zen bell for new ambient stream`);
+ }
  
  // Cancel any existing ambient stream for this connection
  if (connection.ambientStreamCancel) {
@@ -992,14 +982,14 @@ Deno.serve({ port: 8000 }, (req: Request) => {
  // Read and stream the PCM file with sequence header
  const audioData = await Deno.readFile(audioPath);
  console.log(`[${deviceId}] Loaded ${soundName}.pcm (${audioData.byteLength} bytes) - looping...`);
- 
- // Stream with flow control - loop continuously until cancelled
+
  const CHUNK_SIZE = 1024;
  const CHUNKS_PER_BATCH = 5;
  const BATCH_DELAY_MS = 100;
  
  let position = 0;
  let chunksInBatch = 0;
+ let loopCount = 0;
  
  while (connection.socket.readyState === WebSocket.OPEN && !cancelled) {
  // Check cancellation before processing
@@ -1046,13 +1036,17 @@ Deno.serve({ port: 8000 }, (req: Request) => {
  
  // Check if file ended
  if (position >= audioData.byteLength) {
- // For meditation sounds (om001-007), play once and send completion
- // For other ambient sounds, loop continuously
- if (soundName.startsWith('om')) {
+ loopCount++;
+ if (maxLoops > 0 && loopCount >= maxLoops) {
+ // Reached requested loop count - stop and send completion
+ console.log(`[${deviceId}] Track ${soundName} completed ${loopCount}/${maxLoops} loop(s) - stopping`);
+ break;
+ } else if (soundName.startsWith('om')) {
+ // Legacy om sounds: play once only
  console.log(`[${deviceId}] Meditation track ${soundName} completed - not looping`);
- break; // Exit loop to trigger completion notification
+ break;
  } else {
- // Loop ambient sounds (rain, ocean, rainforest)
+ // Loop continuously (ambient sounds or bell sounds with infinite loops)
  position = 0;
  }
  }
@@ -1254,8 +1248,7 @@ Deno.serve({ port: 8000 }, (req: Request) => {
 });
 
 // Connect to Gemini Live API
-// deno-lint-ignore require-await
-async function connectToGemini(connection: ClientConnection) {
+function connectToGemini(connection: ClientConnection) {
  if (connection.geminiSocket && connection.geminiSocket.readyState === WebSocket.OPEN) {
  console.log(`[${connection.deviceId}] Already connected to Gemini`);
  return;
@@ -1839,7 +1832,6 @@ Device self-awareness: before answering any question about what the device is cu
  // Handle audio data
  if (part.inlineData?.data) {
  const base64Audio = part.inlineData.data;
- const _mimeType = part.inlineData.mimeType || "unknown";
  
  // Track audio chunk statistics
  connection.audioChunkCount = (connection.audioChunkCount || 0) + 1;

@@ -42,8 +42,6 @@ public:
     void render(CRGB* leds);
     
     void setExpression(Expression expr);
-    void setEyeColor(CRGB color);
-    void setBlinkInterval(unsigned long interval);
     
 private:
     CRGB eyeColor;
@@ -57,23 +55,14 @@ private:
     float transitionProgress;  // 0.0 to 1.0
     bool isTransitioning;
     
-    // Eye state
-    float leftEyeOpenness;   // 0.0 (closed) to 1.0 (open)
-    float rightEyeOpenness;
-    float pupilX, pupilY;    // Pupil position (-1.0 to 1.0)
-    
     // Helper functions
-    void drawEye(CRGB* leds, int stripStart, float openness, float pupilX, float pupilY);
     void drawExpression(CRGB* leds, Expression expr, float progress);
-    void updateAnimation(unsigned long currentMs);
     void clearEyes(CRGB* leds);
     
-    // LED mapping (serpentine wiring)
+    // LED mapping (uniform wiring — all strips bottom→top)
     int ledIndexForCoord(int strip, int height);
     
     // Eye shape helpers
     void drawRectEye(CRGB* leds, int stripStart, int top, int bottom);
-    void drawOvalEye(CRGB* leds, int stripStart, float openness);
     void drawHeartEye(CRGB* leds, int stripStart);
-    void drawPupil(CRGB* leds, int stripStart, float pupilX, float pupilY, float eyeOpenness);
 };

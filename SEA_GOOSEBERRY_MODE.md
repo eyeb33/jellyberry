@@ -12,8 +12,8 @@
 Real sea gooseberries have 8 meridional comb rows running from pole to pole. Each row contains tiny beating cilia that refract light, creating traveling waves of rainbow color (blue, cyan, green, magenta) flowing downward. This is **NOT** true bioluminescence, but rather white light refracted through glass-like comb plates.
 
 ### Our Implementation
-- **8 Primary Comb Rows** (strips 0, 2, 3, 5, 6, 8, 9, 11) - bright, dominant ribs
-- **4 Dimmer Ribs** (strips 1, 4, 7, 10) - 40% brightness, in-between glow
+- **8 Primary Comb Rows** (strips 0, 1, 3, 4, 6, 7, 9, 10) - bright, dominant ribs
+- **4 Dimmer Ribs** (strips 2, 5, 8, 11) - 40% brightness, every third strip
 - **2 Overlapping Waves** - different speeds for visual depth
 - **Phase-Shifted Rotation** - each rib slightly ahead/behind neighbors
 - **Organic Timing** - ±10% speed variation per rib, never mechanical
@@ -40,22 +40,18 @@ public:
     void begin();                    // Initialize state
     void update(uint32_t nowMs);     // Non-blocking animation update
     void render(CRGB* leds, int ledCount);  // Write to LED buffer
-    
-    // Runtime configuration
-    void setWaveSpeed(float speed);      // 0.5-2.0x multiplier
-    void setBrightness(float brightness); // 0.0-1.0
-    void setBreathingEnabled(bool enabled);
 };
 ```
 
 #### 2. **Per-Rib State Tracking**
 ```cpp
-struct RibState {
+struct StripState {
     float phaseOffset;       // Rotation effect (0.0-1.0)
-    float speedVariation;    // Organic speed (0.9-1.1)
-    float brightnessScale;   // Primary vs dimmer ribs
-    float hueOffset;         // Color diversity
-    bool isPrimaryComb;      // True for main 8 ribs
+    float speedVariation;    // Organic speed (0.85-1.20)
+    float hueOffset;         // Color diversity (\u00b115)
+    bool isDimRib;           // True for strips 2, 5, 8, 11 (every third)
+    int waveCount;           // Waves on this strip (1–3, randomised)
+    float waveSpacing;       // Spacing between waves (0.3-0.5)
 };
 ```
 
@@ -79,22 +75,20 @@ Data flows: strip 0 → 1 → 2 ... → 11 → repeat
 
 ### Display Coordinates
 ```cpp
-int ledIndexForStripAndRow(int strip, int row) {
-    // strip: 0-11 (around circumference)
-    // row: 0-11 (0=top pole, 11=bottom pole)
-    int physicalRow = (LEDS_PER_STRIP - 1) - row;
-    return (strip * LEDS_PER_STRIP) + physicalRow;
+int ledIndexForCoord(int strip, int height) {
+    // Uniform wiring — all strips run bottom→top (h=0 is bottom, h=11 is top)
+    return strip * LEDS_PER_STRIP + height;
 }
 ```
 
 ### Primary Comb Row Distribution
 ```
 Strips:  0  1  2  3  4  5  6  7  8  9  10 11
-Type:    P  D  P  P  D  P  P  D  P  P  D  P
-         ^     ^  ^     ^  ^     ^  ^     ^
-         Primary comb rows (bright, like real comb jelly)
+Type:    B  B  D  B  B  D  B  B  D  B  B  D
+         ^  ^     ^  ^     ^  ^     ^  ^
+         Bright main ribs (isDimRib = false)
 ```
-(P = Primary bright rib, D = Dimmer in-between rib)
+(B = Bright comb rib, D = Dim structural rib — every strip where `s % 3 == 2`)
 
 ---
 
@@ -102,8 +96,8 @@ Type:    P  D  P  P  D  P  P  D  P  P  D  P
 
 ### Wave Parameters
 ```cpp
-BASE_WAVE_SPEED = 0.0015f         // 1.5 seconds per full wave
-NUM_WAVES = 2                      // Multiple overlapping waves
+BASE_WAVE_SPEED = 0.000412f       // ~40s per full wave (gentle organic pace)
+NUM_WAVES_PER_STRIP = 1-3         // Randomised per strip at startup, reshuffled every 5 min
 ```
 
 ### Breathing Effect
@@ -114,11 +108,10 @@ BREATHING_DEPTH = 0.3f            // ±30% brightness variation
 
 ### Color Palette (HSV hues 0-255)
 ```cpp
-HUE_BLUE = 160      // Dominant base color
-HUE_CYAN = 128      // Center hue
-HUE_GREEN = 96      // Warm accent
-HUE_MAGENTA = 192   // Cool accent
-HUE_RANGE = 64      // Total rainbow spread
+HUE_BASE = 110       // Green-cyan base
+HUE_RANGE = 70       // Through cyan→green→turquoise→light blue
+SATURATION_BASE = 160  // Medium saturation (not pastel, not full)
+// Hard-limited to hue 96–160 (green→cyan→light blue) — no magenta
 ```
 
 ### Performance
@@ -189,11 +182,11 @@ float getWaveBrightness(float position) {
 ### Visual Verification Checklist
 - [ ] Waves travel smoothly downward (not jumping)
 - [ ] Neighboring ribs are phase-shifted (rotation visible)
-- [ ] Primary ribs (0,2,3,5,6,8,9,11) are brighter than others
-- [ ] Colors shift through blue→cyan→green→magenta
+- [ ] Dim ribs (strips 2, 5, 8, 11) are visibly less bright than bright ribs
+- [ ] Colors shift through green→cyan→light blue (no magenta)
 - [ ] No harsh whites or strobing
 - [ ] Motion feels organic, not mechanical
-- [ ] Breathing effect is subtle (30s cycle)
+- [ ] Breathing effect is subtle (25s cycle)
 
 ### Performance Testing
 ```cpp
@@ -205,19 +198,15 @@ uint32_t duration = micros() - start;
 ```
 
 ### Tuning Parameters
-**To make waves faster:**
+**To adjust wave speed** (modify constant in SeaGooseberryVisualizer.h):
 ```cpp
-seaGooseberry.setWaveSpeed(1.5f);  // 50% faster
+static constexpr float BASE_WAVE_SPEED = 0.000412f;  // Increase for faster waves
 ```
 
-**To make dimmer/brighter:**
+**To adjust brightness** (modify constant in SeaGooseberryVisualizer.h):
 ```cpp
-seaGooseberry.setBrightness(0.8f);  // 80% brightness
-```
-
-**To disable breathing:**
-```cpp
-seaGooseberry.setBreathingEnabled(false);
+static constexpr float BRIGHTNESS_MIN = 0.3f;  // Increase for brighter minimum
+static constexpr float BRIGHTNESS_MAX = 0.6f;  // Increase for brighter maximum
 ```
 
 ---

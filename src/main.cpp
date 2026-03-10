@@ -10,8 +10,6 @@
 #include <time.h>
 #include "Config.h"
 #include "types.h"
-#include "display_mapping.h"
-#include "front_text_marquee.h"
 #include "SeaGooseberryVisualizer.h"
 #include "EyeAnimationVisualizer.h"
 
@@ -33,9 +31,6 @@ const char* CHAKRA_NAMES[NUM_CHAKRAS] = {
 WiFiClientSecure wifiClient;
 WebSocketsClient webSocket;
 CRGB leds[NUM_LEDS];
-
-// Front text marquee system (used by LED_CLOCK for time scrolling)
-FrontTextMarquee frontMarquee;
 
 // Sea Gooseberry visualizer
 SeaGooseberryVisualizer seaGooseberry;
@@ -97,8 +92,6 @@ QueueHandle_t audioOutputQueue; // Queue for playback audio
 // Tuning: Increase for more buffer (higher latency), decrease for lower latency (more underruns)
 #define AUDIO_QUEUE_SIZE 30
 
-#include "types.h"
-
 LEDMode currentLEDMode = LED_IDLE;  // Start directly in idle mode
 bool ambientVUMode = false;  // Toggle for ambient sound VU meter mode
 
@@ -125,9 +118,6 @@ PomodoroState pomodoroState = {PomodoroState::FOCUS, 0, 25 * 60, 0, 0, false, fa
 
 // Meditation mode state
 MeditationState meditationState = {MeditationState::ROOT, MeditationState::INHALE, 0, false, false, 1.0f};
-
-// Clock display state
-ClockState clockState = {-1, -1, 0, 0, false};
 
 // Lamp mode state
 LampState lampState = {LampState::WHITE, LampState::WHITE, 0, 0, 0, {0}, false, false, false};
@@ -423,7 +413,7 @@ void loop() {
             const char* modeNames[] = {
                 "BOOT", "IDLE", "RECORDING", "PROCESSING", "AUDIO_REACTIVE",
                 "CONNECTED", "ERROR", "TIDE", "TIMER", "MOON",
-                "AMBIENT_VU", "AMBIENT", "POMODORO", "MEDITATION", "CLOCK",
+                "AMBIENT_VU", "AMBIENT", "POMODORO", "MEDITATION",
                 "LAMP", "SEA_GOOSEBERRY", "EYES", "ALARM", "CONVERSATION"
             };
             int idx = (int)currentLEDMode;
@@ -611,14 +601,6 @@ void loop() {
                 Serial.printf("Volume restored to %.0f%%\n", volumeMultiplier * 100);
             }
             
-            // Clear Clock
-            if (clockState.active) {
-                clockState.active = false;
-                clockState.lastHour = -1;
-                clockState.lastMinute = -1;
-                clockState.scrollPosition = 0;
-            }
-            
             // Clear Lamp
             if (lampState.active) {
                 lampState.active = false;
@@ -645,7 +627,7 @@ void loop() {
         }
         
         // STOP button short press: Cycle through modes
-        // IDLE -> VU Mode -> Sea Jelly -> Ambient -> Pomodoro -> Meditation -> Clock -> Lamp -> Eyes -> IDLE
+        // IDLE -> VU Mode -> Sea Jelly -> Ambient -> Pomodoro -> Meditation -> Lamp -> Eyes -> IDLE
         // Allow during ambient modes, block only during Gemini responses (non-ambient)
         if (stopRisingEdge && !recordingActive && 
             !(isPlayingResponse && !isPlayingAmbient)) {
@@ -813,17 +795,24 @@ void loop() {
                 // Initialize meditation state
                 meditationState.currentChakra = MeditationState::ROOT;
                 meditationState.phase = MeditationState::HOLD_BOTTOM;  // Start at 20% brightness
-                meditationState.phaseStartTime = millis();
+                meditationState.phaseStartTime = 0; // Will sync to first arriving audio chunk
                 meditationState.active = true;
                 meditationState.streaming = false;
                 
-                // Lower volume slightly for meditation ambiance
+                // Lower volume for meditation ambiance
                 meditationState.savedVolume = volumeMultiplier;
-                volumeMultiplier = 0.50f;  // 50% volume for meditation
-                DEBUG_PRINT(" Volume: %.0f%%  50%% for meditation\n", meditationState.savedVolume * 100);
-                
+                volumeMultiplier = 0.10f;  // 10% volume for meditation
+                DEBUG_PRINT(" Volume: %.0f%%  10%% for meditation\n", meditationState.savedVolume * 100);
+
+                // Flush any in-flight audio (e.g. zen bell still draining from Pomodoro)
+                {
+                    AudioChunk dummy;
+                    while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {}
+                }
+                i2s_zero_dma_buffer(I2S_NUM_1);
+
                 // Request ROOT chakra audio immediately
-                ambientSound.name = "om001";
+                ambientSound.name = "bell001";
                 ambientSound.active = true;
                 isPlayingAmbient = true;
                 isPlayingResponse = false;
@@ -832,7 +821,8 @@ void loop() {
                 {
                     JsonDocument meditationReqDoc;
                     meditationReqDoc["action"] = "requestAmbient";
-                    meditationReqDoc["sound"] = "om001";
+                    meditationReqDoc["sound"] = "bell001";
+                    meditationReqDoc["loops"] = 8;
                     meditationReqDoc["sequence"] = ++ambientSound.sequence;
                     String meditationReqMsg;
                     serializeJson(meditationReqDoc, meditationReqMsg);
@@ -843,7 +833,7 @@ void loop() {
                 Serial.println("Meditation breathing and audio started (ROOT chakra)");
                 currentLEDMode = LED_MEDITATION;
             } else if (modeToCheck == LED_MEDITATION) {
-                // Exit Meditation and go to Clock
+                // Exit Meditation and go to Lamp
                 DEBUG_PRINTLN("  Meditation mode stopped");
                 
                 // Clear meditation state
@@ -869,25 +859,6 @@ void loop() {
                 ambientSound.active = false;
                 ambientSound.name = "";
                 ambientSound.sequence++;
-                
-                // Initialize clock state
-                clockState.active = true;
-                clockState.lastHour = -1;  // Force initial display
-                clockState.lastMinute = -1;
-                clockState.scrollPosition = 0;
-                clockState.lastScrollUpdate = millis();
-                
-                DEBUG_PRINTLN(" Clock mode activated");
-                currentLEDMode = LED_CLOCK;
-            } else if (modeToCheck == LED_CLOCK) {
-                // Exit Clock and go to Lamp
-                DEBUG_PRINTLN("  Clock mode stopped");
-                
-                // Clear clock state
-                clockState.active = false;
-                clockState.lastHour = -1;
-                clockState.lastMinute = -1;
-                clockState.scrollPosition = 0;
                 
                 // Initialize lamp state
                 lampState.active = true;
@@ -938,7 +909,7 @@ void loop() {
         }
         
         // Display-only modes: Button 1 disabled (button 2 advances to next mode)
-        if ((currentLEDMode == LED_AMBIENT_VU || currentLEDMode == LED_SEA_GOOSEBERRY || currentLEDMode == LED_CLOCK || currentLEDMode == LED_EYES) && startRisingEdge) {
+        if ((currentLEDMode == LED_AMBIENT_VU || currentLEDMode == LED_SEA_GOOSEBERRY || currentLEDMode == LED_EYES) && startRisingEdge) {
             DEBUG_PRINTLN("Button 1 disabled in this mode - use button 2 to advance");
             // Do nothing - button 1 is disabled in display-only modes
         }
@@ -1110,13 +1081,14 @@ void loop() {
                 Serial.printf("Advanced to chakra %d (%s) - breathing continues\n", 
                              meditationState.currentChakra, CHAKRA_NAMES[meditationState.currentChakra]);
                 
-                // Request new chakra sound (om001, om002, ..., om007)
+                // Request new chakra sound (bell001, bell002, ..., bell007)
                 char soundName[16];
-                sprintf(soundName, "om%03d", meditationState.currentChakra + 1);
+                sprintf(soundName, "bell%03d", meditationState.currentChakra + 1);
                 
                 JsonDocument reqDoc;
                 reqDoc["action"] = "requestAmbient";
                 reqDoc["sound"] = soundName;
+                reqDoc["loops"] = 8;
                 reqDoc["sequence"] = ++ambientSound.sequence;
                 String reqMsg;
                 serializeJson(reqDoc, reqMsg);
@@ -1293,9 +1265,9 @@ void loop() {
         }
         // Start recording on rising edge (normal case - not interrupting)
         // Block if: recording active, playing response, OR in ambient sound mode, OR conversation window is open,
-        // OR in any display-only/non-Gemini mode (Meditation, Ambient, Lamp, VU, SeaJelly, Pomodoro, Clock, Eyes)
+        // OR in any display-only/non-Gemini mode (Meditation, Ambient, Lamp, VU, SeaJelly, Pomodoro, Eyes)
         // Note: Pomodoro recording is handled above (starts on press for instant VU feedback)
-        else if (!meditationHandled && currentLEDMode != LED_MEDITATION && currentLEDMode != LED_AMBIENT && currentLEDMode != LED_AMBIENT_VU && currentLEDMode != LED_SEA_GOOSEBERRY && currentLEDMode != LED_LAMP && currentLEDMode != LED_POMODORO && currentLEDMode != LED_CLOCK && currentLEDMode != LED_EYES && !recordingActive && !isPlayingResponse && !isPlayingAmbient && !conversationMode) {
+        else if (!meditationHandled && currentLEDMode != LED_MEDITATION && currentLEDMode != LED_AMBIENT && currentLEDMode != LED_AMBIENT_VU && currentLEDMode != LED_SEA_GOOSEBERRY && currentLEDMode != LED_LAMP && currentLEDMode != LED_POMODORO && currentLEDMode != LED_EYES && !recordingActive && !isPlayingResponse && !isPlayingAmbient && !conversationMode) {
             bool shouldStartRecording = startRisingEdge;
             
             if (shouldStartRecording) {
@@ -1354,9 +1326,8 @@ void loop() {
         lastDebounceTime = millis();
     }
     
-    // Auto-stop on silence (VAD) - use longer timeout for conversation mode
-    uint32_t silenceTimeout = conversationRecording ? VAD_CONVERSATION_SILENCE_MS : VAD_SILENCE_MS;
-    if (recordingActive && (millis() - lastVoiceActivityTime) > silenceTimeout) {
+    // Auto-stop on silence (VAD)
+    if (recordingActive && (millis() - lastVoiceActivityTime) > VAD_SILENCE_MS) {
         recordingActive = false;
         webSocket.sendTXT("{\"type\":\"recordingStop\"}");
         Serial.println("[WS] recordingStop sent");
@@ -1482,6 +1453,33 @@ void loop() {
             } else {
                 Serial.printf("Skipping conversation window - entering persistent mode %d\n", effectiveMode);
                 convState = ConvState::IDLE;  // Persistent mode: no follow-up window
+
+                // Deferred meditation start: if meditationStart arrived while Gemini was still
+                // speaking, phaseStartTime was set to 0 (waiting). Now that audio is done, start it.
+                if (meditationState.active && meditationState.phaseStartTime == 0 && !meditationState.streaming) {
+                    meditationState.phaseStartTime = 0; // Stays 0 until first audio chunk arrives
+                    // Flush any residual Gemini audio still in queue
+                    { AudioChunk dummy; while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {} }
+                    i2s_zero_dma_buffer(I2S_NUM_1);
+                    ambientSound.name = "bell001";
+                    ambientSound.active = true;
+                    isPlayingAmbient = true;
+                    isPlayingResponse = false;
+                    firstAudioChunk = true;
+                    lastAudioChunkTime = millis();
+                    JsonDocument meditationReqDoc;
+                    meditationReqDoc["action"] = "requestAmbient";
+                    meditationReqDoc["sound"] = "bell001";
+                    meditationReqDoc["loops"] = 8;
+                    meditationReqDoc["sequence"] = ++ambientSound.sequence;
+                    String meditationReqMsg;
+                    serializeJson(meditationReqDoc, meditationReqMsg);
+                    Serial.printf("Meditation deferred start: %s (seq %d)\n", meditationReqMsg.c_str(), ambientSound.sequence);
+                    webSocket.sendTXT(meditationReqMsg);
+                    meditationState.streaming = true;
+                    Serial.println("Meditation breathing and audio started (ROOT chakra, deferred)");
+                }
+
                 // If Gemini's verbal response set currentLEDMode to a transient state (AUDIO_REACTIVE
                 // etc.), we need to explicitly return to the active persistent mode now that audio is done.
                 if (currentLEDMode == LED_AUDIO_REACTIVE || currentLEDMode == LED_RECORDING || currentLEDMode == LED_PROCESSING) {
@@ -2451,7 +2449,14 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     // Valid ambient chunk - strip magic header + sequence
                     payload += 4;
                     length -= 4;
-                    
+
+                    // Sync meditation breathing animation to first audio chunk
+                    if (meditationState.active && meditationState.phaseStartTime == 0) {
+                        meditationState.phaseStartTime = millis();
+                        meditationState.phase = MeditationState::HOLD_BOTTOM;
+                        Serial.println("[MEDITATION] Breathing synced to first audio chunk");
+                    }
+
                     // Clear drain timer when we receive first packet of new sequence
                     if (ambientSound.drainUntil > 0) {
                         Serial.printf("New sequence %d arrived - drain complete\n", chunkSequence);
@@ -2463,6 +2468,17 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 // Ignore audio if response was interrupted (but not for ambient/alarm sounds)
                 if (responseInterrupted && !isPlayingAmbient && !isPlayingAlarm) {
                     Serial.println("Discarding audio chunk (response was interrupted)");
+                    break;
+                }
+
+                // Discard stale non-ambient audio arriving after a mode switch to meditation/ambient
+                // (e.g. zen bell chunks still in TCP pipeline from previous Pomodoro mode)
+                if (!isAmbientPacket && !isPlayingAlarm && meditationState.active && !isPlayingResponse) {
+                    static uint32_t lastStaleLog = 0;
+                    if (millis() - lastStaleLog > 2000) {
+                        Serial.println("Discarding stale non-ambient chunk during meditation");
+                        lastStaleLog = millis();
+                    }
                     break;
                 }
                 
@@ -2549,6 +2565,10 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 
                 // Queue raw PCM chunk for audio task
                 // Use blocking send with timeout to apply backpressure instead of dropping
+                if (length == 0) {
+                    // Empty chunk after header strip - silently discard
+                    break;
+                }
                 if (length <= sizeof(AudioChunk::data)) {
                     AudioChunk chunk;
                     memcpy(chunk.data, payload, length);
@@ -3011,14 +3031,26 @@ void updateLEDs() {
         case LED_AMBIENT:
             // Single ambient mode with different visualizations based on current sound
             {
+                // Detect sound-type changes and reset the relevant init flag so each
+                // visualizer re-initialises cleanly when its mode is re-entered.
+                static AmbientSoundType lastAmbientType = (AmbientSoundType)-1;
+                static bool rainInitialized = false;
+                static bool oceanInitialized = false;
+                static bool rainforestInitialized = false;
+                if (currentAmbientSoundType != lastAmbientType) {
+                    rainInitialized = false;
+                    oceanInitialized = false;
+                    rainforestInitialized = false;
+                    lastAmbientType = currentAmbientSoundType;
+                }
+
                 if (currentAmbientSoundType == SOUND_RAIN) {
                     // Falling rain effect - drops hit and run down like on a window
                     static uint32_t lastDrop = 0;
                     static float dropPosition[144] = {-1.0f};  // Vertical position of each drop (0=top, 12=bottom, -1=inactive)
                     static float dropSpeed[144] = {0.0f};  // Speed of each drop (randomized)
-                    static bool rainInitialized = false;
-                    
-                    // Reset on first entry to rain mode
+
+                    // Reset on first entry to rain mode (flag declared at outer block scope)
                     if (!rainInitialized) {
                         for (int i = 0; i < 144; i++) {
                             dropPosition[i] = -1.0f;
@@ -3087,9 +3119,8 @@ void updateLEDs() {
                     // Wave height follows audio amplitude from playback stream
                     static float smoothedWave = 0.0f;
                     static uint32_t lastDebugLog = 0;
-                    static bool oceanInitialized = false;
-                    
-                    // Reset on first entry to ocean mode
+
+                    // Reset on first entry to ocean mode (flag declared at outer block scope)
                     if (!oceanInitialized) {
                         smoothedWave = 0.0f;
                         oceanInitialized = true;
@@ -3159,8 +3190,7 @@ void updateLEDs() {
                     static float fireflyPositions[6][3];  // 6 fireflies: [strip, row, brightness]
                     static uint32_t fireflyTimers[6];
                     static float eyePair[3];  // 1 pair: [strip, row, timer]
-                    static bool rainforestInitialized = false;
-                    
+                    // (rainforestInitialized declared at outer block scope)
                     if (!rainforestInitialized) {
                         for (int i = 0; i < 6; i++) {
                             fireflyPositions[i][0] = -1.0f;  // inactive
@@ -3626,66 +3656,6 @@ void updateLEDs() {
                             uint8_t g = (uint8_t)((displayColor.g * 77) / 255);
                             uint8_t b = (uint8_t)((displayColor.b * 77) / 255);
                             leds[i] = CRGB(r, g, b);
-                        }
-                    }
-                } else {
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                }
-            }
-            break;
-            
-        case LED_CLOCK:
-            // Display current time (hours and minutes) revolving around the sphere
-            {
-                if (clockState.active) {
-                    // Get current time from RTC
-                    struct tm timeinfo;
-                    if (getLocalTime(&timeinfo)) {
-                        int currentHour = timeinfo.tm_hour;
-                        int currentMinute = timeinfo.tm_min;
-                        
-                        // Update time string if time has changed
-                        if (currentHour != clockState.lastHour || currentMinute != clockState.lastMinute) {
-                            clockState.lastHour = currentHour;
-                            clockState.lastMinute = currentMinute;
-                            
-                            // Format time string (24-hour format: "HH:MM")
-                            char timeStr[6];
-                            snprintf(timeStr, sizeof(timeStr), "%02d:%02d", currentHour, currentMinute);
-                            
-                            // Update the front marquee with new time (but don't auto-complete)
-                            frontMarquee.setText(timeStr);
-                            frontMarquee.setColor(CRGB::White);
-                            frontMarquee.setSpeed(3);  // Slow scroll for clock
-                            if (!frontMarquee.isActive()) {
-                                frontMarquee.start();
-                            }
-                            
-                            Serial.printf("Clock updated: %02d:%02d\n", currentHour, currentMinute);
-                        }
-                        
-                        // Update and render the scrolling time
-                        frontMarquee.update();
-                        frontMarquee.render(leds);
-                        
-                        // Reset scroll position when it completes to loop seamlessly
-                        if (frontMarquee.isComplete()) {
-                            frontMarquee.start();  // Restart scroll
-                        }
-                    } else {
-                        // If time not available, show error pattern
-                        static uint32_t lastBlink = 0;
-                        static bool blinkState = false;
-                        
-                        if (millis() - lastBlink > 500) {
-                            lastBlink = millis();
-                            blinkState = !blinkState;
-                            
-                            if (blinkState) {
-                                fill_solid(leds, NUM_LEDS, CRGB(50, 0, 0));  // Dim red
-                            } else {
-                                fill_solid(leds, NUM_LEDS, CRGB::Black);
-                            }
                         }
                     }
                 } else {

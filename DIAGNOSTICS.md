@@ -3,7 +3,6 @@
 ## Current Issue Summary
 - **Audio bunching**: Packets may still be arriving in bursts despite server 30ms pacing
 - **Conversation mode timing**: Mode transitions not happening when expected
-- **Library concern**: Using `arduino-libopus` vs reference example's `ArduinoLibOpus`
 
 ## Diagnostic Logging Added
 
@@ -160,57 +159,6 @@
 - Verify `responseInterrupted` is false
 - Add breakpoint in conversation mode condition
 
-### Issue: Opus Decoding Problems
-**Symptoms**:
-- Audio is garbled/robotic
-- High CPU usage
-- `opus_decode()` returns errors
-- Strange byte patterns in "First bytes (hex)" logs
-
-**Library comparison**:
-- **Current**: `pschatzmann/arduino-libopus` - Full libopus port
-- **Reference**: `ArduinoLibOpus` - May have ESP32 optimizations
-
-**To test library**:
-1. Check Opus decode return value (should be 960 samples)
-2. Verify sample rate match: Server 24kHz = ESP32 24kHz
-3. Check frame size: Server 960 samples = ESP32 expecting 960
-
-## Opus Library Investigation
-
-### Current Configuration
-```ini
-; platformio.ini
-lib_deps = https://github.com/pschatzmann/arduino-libopus.git
-
-; Config.h
-#define OPUS_SAMPLE_RATE 24000  // Must match server
-#define OPUS_FRAME_SIZE 320     // 20ms at 16kHz (for RECORDING)
-#define SPEAKER_SAMPLE_RATE 24000
-```
-
-### Server Configuration (from previous analysis)
-```typescript
-// server/main.ts
-const SAMPLE_RATE = 24000;  // 24kHz output
-const FRAME_SIZE = 960;     // 40ms at 24kHz
-const CHANNELS = 1;         // Mono
-```
-
-### Potential Mismatch
-- ESP32 `OPUS_FRAME_SIZE = 320` (for 16kHz recording)
-- Server sending 960-sample frames (40ms at 24kHz)
-- Decoder should handle variable frame sizes, but worth checking
-
-### To Verify
-Add this logging in audio task:
-```cpp
-int numSamples = opus_decode(decoder, playbackChunk.data, playbackChunk.length, pcmBuffer, 5760, 0);
-if (numSamples != 960) {
-    Serial.printf("⚠️  Unexpected Opus frame: %d samples (expected 960)\n", numSamples);
-}
-```
-
 ## Next Steps
 
 1. **Upload firmware with diagnostics**
@@ -221,5 +169,4 @@ if (numSamples != 960) {
 This will give us concrete data about:
 - Whether server pacing is working
 - Where conversation mode is failing
-- If Opus library is an issue
 

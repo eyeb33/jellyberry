@@ -12,7 +12,7 @@ struct AudioChunk {
     size_t length;
 };
 
-enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU, LED_AMBIENT, LED_POMODORO, LED_MEDITATION, LED_CLOCK, LED_LAMP, LED_SEA_GOOSEBERRY, LED_EYES, LED_ALARM, LED_CONVERSATION_WINDOW };
+enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU, LED_AMBIENT, LED_POMODORO, LED_MEDITATION, LED_LAMP, LED_SEA_GOOSEBERRY, LED_EYES, LED_ALARM, LED_CONVERSATION_WINDOW };
 
 // Conversation state machine (main-loop only — not safe to read from other FreeRTOS tasks).
 // Cross-task coordination still uses the volatile flags: recordingActive, isPlayingResponse,
@@ -96,15 +96,6 @@ struct MeditationState {
     bool active;             // Meditation mode active
     bool streaming;          // Currently streaming meditation audio
     float savedVolume;       // User's volume before meditation
-};
-
-// Clock display state
-struct ClockState {
-    int lastHour;            // Last displayed hour
-    int lastMinute;          // Last displayed minute
-    int scrollPosition;      // Horizontal scroll position for rotating display
-    uint32_t lastScrollUpdate; // Last time scroll position updated
-    bool active;             // Clock mode active
 };
 
 // Lamp mode state

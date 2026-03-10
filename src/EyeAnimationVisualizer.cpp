@@ -8,11 +8,7 @@ EyeAnimationVisualizer::EyeAnimationVisualizer()
       lastBlinkMs(0),
       blinkInterval(3000),  // Blink every 3 seconds
       transitionProgress(1.0f),
-      isTransitioning(false),
-      leftEyeOpenness(1.0f),
-      rightEyeOpenness(1.0f),
-      pupilX(0.0f),
-      pupilY(0.0f)
+      isTransitioning(false)
 {
 }
 
@@ -186,24 +182,6 @@ void EyeAnimationVisualizer::drawRectEye(CRGB* leds, int stripStart, int top, in
     }
 }
 
-void EyeAnimationVisualizer::drawOvalEye(CRGB* leds, int stripStart, float openness) {
-    if (openness <= 0.0f) return;
-    
-    int centerY = EYE_HEIGHT / 2;
-    int height = (int)(EYE_HEIGHT * openness * 0.7f);  // 70% of full height
-    
-    int top = centerY - height / 2;
-    int bottom = centerY + height / 2;
-    
-    // Draw oval shape (fuller in middle)
-    for (int s = 0; s < EYE_WIDTH; s++) {
-        for (int h = top; h <= bottom; h++) {
-            int idx = ledIndexForCoord(stripStart + s, h);
-            if (idx >= 0) leds[idx] = eyeColor;
-        }
-    }
-}
-
 void EyeAnimationVisualizer::drawHeartEye(CRGB* leds, int stripStart) {
     // Draw heart shape - guard every index against ledIndexForCoord returning -1
     auto safeSet = [&](int strip, int height, CRGB color) {
@@ -228,48 +206,16 @@ void EyeAnimationVisualizer::drawHeartEye(CRGB* leds, int stripStart) {
     safeSet(stripStart + 1, 8, CRGB::Red);
 }
 
-void EyeAnimationVisualizer::drawPupil(CRGB* leds, int stripStart, float pupilX, float pupilY, float eyeOpenness) {
-    if (eyeOpenness < 0.3f) return;  // Don't draw pupil if eye too closed
-    
-    int centerY = EYE_HEIGHT / 2;
-    int pupilH = centerY + (int)(pupilY * 2.0f);
-    int pupilS = pupilX > 0 ? 1 : 0;  // Left or right strip
-    
-    // Draw small dark pupil
-    int idx = ledIndexForCoord(stripStart + pupilS, pupilH);
-    if (idx >= 0) {
-        leds[idx] = CRGB::Black;
-        // Add a dim pixel above/below for size
-        int idx2 = ledIndexForCoord(stripStart + pupilS, pupilH + 1);
-        if (idx2 >= 0) leds[idx2] = CRGB(40, 40, 40);
-    }
-}
-
 int EyeAnimationVisualizer::ledIndexForCoord(int strip, int height) {
     if (strip < 0 || strip >= NUM_STRIPS) return -1;
     if (height < 0 || height >= LEDS_PER_STRIP) return -1;
     
-    int baseIndex = strip * LEDS_PER_STRIP;
-    
-    if (strip % 2 == 0) {
-        // Even strips: wired bottom→top
-        return baseIndex + height;
-    } else {
-        // Odd strips: wired top→bottom
-        return baseIndex + (LEDS_PER_STRIP - 1 - height);
-    }
+    // Uniform wiring: all strips run bottom→top, consistent with display_mapping.cpp
+    return strip * LEDS_PER_STRIP + height;
 }
 
 void EyeAnimationVisualizer::setExpression(Expression expr) {
     targetExpression = expr;
     isTransitioning = true;
     transitionProgress = 0.0f;
-}
-
-void EyeAnimationVisualizer::setEyeColor(CRGB color) {
-    eyeColor = color;
-}
-
-void EyeAnimationVisualizer::setBlinkInterval(unsigned long interval) {
-    blinkInterval = interval;
 }

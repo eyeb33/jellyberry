@@ -24,6 +24,60 @@ let weatherDataCache: any = null;
 let weatherDataTimestamp = 0;
 const WEATHER_CACHE_DURATION_MS = 30 * 60 * 1000; // 30 minutes
 
+// Radio station cache - persists across tool calls within a session
+interface RadioStation {
+ url: string;
+ name: string;
+ country: string;
+ tags: string;
+ bitrate: number;
+ codec: string;
+}
+const radioStationCache = new Map<string, RadioStation>(); // keyed by stationuuid
+
+async function searchRadioStations(query: string, tag: string, limit: number): Promise<Array<{ id: string; name: string; country: string; genre_tags: string; bitrate_kbps: number; codec: string }>> {
+ const params = new URLSearchParams();
+ if (query) params.set("name", query);
+ if (tag) params.set("tag", tag);
+ params.set("limit", String(limit || 5));
+ params.set("hidebroken", "true");
+ params.set("order", "votes");
+ params.set("reverse", "true");
+
+ const url = `https://all.api.radio-browser.info/json/stations/search?${params}`;
+ console.log(`[Radio] Searching: ${url}`);
+
+ const resp = await fetch(url, { headers: { "User-Agent": "Jellyberry/1.0" } });
+ if (!resp.ok) throw new Error(`Radio Browser API error: ${resp.status}`);
+ const stations = await resp.json() as any[];
+
+ const results = stations
+ .filter((s: any) => s.url_resolved) // must have a resolved stream URL
+ .slice(0, limit || 5)
+ .map((s: any) => {
+ const station: RadioStation = {
+ url: s.url_resolved,
+ name: s.name,
+ country: s.country,
+ tags: s.tags,
+ bitrate: s.bitrate,
+ codec: s.codec,
+ };
+ radioStationCache.set(s.stationuuid, station);
+ return {
+ id: s.stationuuid,
+ name: s.name,
+ country: s.country,
+ genre_tags: s.tags,
+ bitrate_kbps: s.bitrate,
+ codec: s.codec,
+ };
+ });
+
+ console.log(`[Radio] Found ${results.length} stations`);
+ return results;
+}
+
 // Track which devices have received their first boot greeting
 const deviceFirstBoot = new Map<string, boolean>();
 
@@ -71,6 +125,8 @@ interface ClientConnection {
  ambientSequence?: number; // Current ambient stream sequence number
  alarmStreamCancel?: (() => void) | null; // Cancel function for alarm streaming
  zenBellCancel?: (() => void) | null; // Cancel function for zen bell streaming
+ radioStreamCancel?: (() => void) | null; // Cancel function for radio PCM stream
+ radioProcess?: Deno.ChildProcess | null; // ffmpeg process for radio transcoding
  deviceStateResolver?: ((state: any) => void) | undefined; // Promise resolver for get_device_state
  pendingModeMessage?: object | null; // Mode command to send to ESP32 after Gemini finishes speaking
  deviceState?: Record<string, unknown>; // Latest device state snapshot from recordingStart
@@ -1093,12 +1149,165 @@ Deno.serve({ port: 8000 }, (req: Request) => {
  // Handle stop ambient request from ESP32
  if (data.action === "stopAmbient") {
  console.log(`[${deviceId}] Stop ambient sound requested`);
+ // Cancel ambient stream
  if (connection.ambientStreamCancel) {
  connection.ambientStreamCancel();
  connection.ambientStreamCancel = null;
  console.log(`[${deviceId}] Ambient stream cancel called`);
  } else {
- console.log(`[${deviceId}] No active stream to cancel`);
+ console.log(`[${deviceId}] No active ambient stream to cancel`);
+ }
+ // Cancel radio stream + kill ffmpeg process
+ if (connection.radioStreamCancel) {
+ connection.radioStreamCancel();
+ connection.radioStreamCancel = null;
+ }
+ if (connection.radioProcess) {
+ try { connection.radioProcess.kill(); } catch (_) { /* ignore */ }
+ connection.radioProcess = null;
+ console.log(`[${deviceId}] Radio stream cancelled`);
+ }
+ return;
+ }
+
+ // Handle internet radio stream request from ESP32
+ if (data.action === "requestRadio") {
+ const streamUrl = data.streamUrl as string;
+ const stationName = data.stationName as string;
+ const sequence = (data.sequence as number) || 0;
+ const isHLS = (data.isHLS as boolean) || false;
+ console.log(`[${deviceId}] Radio stream requested: ${stationName} (seq ${sequence}, HLS: ${isHLS})`);
+
+ // Cancel any existing streams
+ if (connection.radioStreamCancel) { connection.radioStreamCancel(); connection.radioStreamCancel = null; }
+ if (connection.radioProcess) { try { connection.radioProcess.kill(); } catch (_) { /* ignore */ } connection.radioProcess = null; }
+ if (connection.ambientStreamCancel) { connection.ambientStreamCancel(); connection.ambientStreamCancel = null; }
+ if (connection.zenBellCancel) { connection.zenBellCancel(); connection.zenBellCancel = null; }
+
+ try {
+ let cancelled = false;
+ connection.radioStreamCancel = () => { cancelled = true; };
+
+ // Spawn ffmpeg to transcode internet stream to 24kHz mono 16-bit PCM
+ const cmd = new Deno.Command("ffmpeg", {
+ args: [
+ "-reconnect", "1",
+ "-reconnect_streamed", "1",
+ "-reconnect_delay_max", "5",
+ "-i", streamUrl,
+ "-ar", "24000",
+ "-ac", "1",
+ "-f", "s16le",
+ "pipe:1"
+ ],
+ stdout: "piped",
+ stderr: "null",
+ });
+
+ const process = cmd.spawn();
+ connection.radioProcess = process;
+ console.log(`[${deviceId}] ffmpeg spawned for ${stationName}`);
+
+ const CHUNK_SIZE = 1024;
+ let chunksInBatch = 0;
+ const CHUNKS_PER_BATCH = 5;
+ const BATCH_DELAY_MS = 100;
+ let totalChunks = 0;
+
+ const reader = process.stdout.getReader();
+ let buffer = new Uint8Array(0);
+
+ while (!cancelled && connection.socket.readyState === WebSocket.OPEN) {
+ const { done, value } = await reader.read();
+ if (done || cancelled) break;
+
+ // Accumulate into buffer then emit CHUNK_SIZE chunks
+ const combined = new Uint8Array(buffer.length + value.length);
+ combined.set(buffer, 0);
+ combined.set(value, buffer.length);
+ buffer = combined;
+
+ while (buffer.length >= CHUNK_SIZE && !cancelled) {
+ const chunk = buffer.slice(0, CHUNK_SIZE);
+ buffer = buffer.slice(CHUNK_SIZE);
+
+ const header = new Uint8Array(4);
+ header[0] = 0xA5;
+ header[1] = 0x5A;
+ header[2] = sequence & 0xFF;
+ header[3] = (sequence >> 8) & 0xFF;
+
+ const chunkWithHeader = new Uint8Array(4 + CHUNK_SIZE);
+ chunkWithHeader.set(header, 0);
+ chunkWithHeader.set(chunk, 4);
+
+ try {
+ connection.socket.send(chunkWithHeader);
+ } catch (_err) {
+ cancelled = true;
+ break;
+ }
+
+ totalChunks++;
+ chunksInBatch++;
+ if (chunksInBatch >= CHUNKS_PER_BATCH) {
+ await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
+ chunksInBatch = 0;
+ }
+ }
+ }
+
+ reader.cancel();
+ try { process.kill(); } catch (_) { /* ignore */ }
+
+ if (!cancelled && connection.socket.readyState === WebSocket.OPEN) {
+ // Stream ended naturally (station went offline)
+ console.log(`[${deviceId}] Radio stream ended: ${stationName} (${totalChunks} chunks)`);
+ connection.socket.send(JSON.stringify({ type: "radioEnded", stationName }));
+ } else {
+ console.log(`[${deviceId}] Radio stream cancelled: ${stationName}`);
+ }
+
+ connection.radioStreamCancel = null;
+ connection.radioProcess = null;
+
+ } catch (err) {
+ console.error(`[${deviceId}] Radio stream error:`, err);
+ connection.radioStreamCancel = null;
+ connection.radioProcess = null;
+ if (connection.socket.readyState === WebSocket.OPEN) {
+ connection.socket.send(JSON.stringify({ type: "radioEnded", stationName, error: true }));
+ }
+ }
+
+ return;
+ }
+
+ // Handle radio mode activated notification from ESP32
+ if (data.type === "radioModeActivated") {
+ const source = (data.source as string) || "button";
+ console.log(`[${deviceId}] Radio mode activated (source: ${source})`);
+
+ if (source === "button" && connection.geminiSocket?.readyState === WebSocket.OPEN) {
+ // Inject greeting prompt into Gemini to start discovery conversation
+ const prompt = {
+ clientContent: {
+ turns: [{
+ role: "user",
+ parts: [{ text: "SYSTEM: The user has just entered radio mode using the physical button. Ask them what kind of radio station they'd like to listen to, then use search_radio_stations to find options and present a shortlist. Keep your opening question brief and friendly." }]
+ }],
+ turnComplete: true
+ }
+ };
+
+ if (connection.pendingLazyReconnect) {
+ // Gemini is still reconnecting - store greeting to fire on setupComplete
+ (connection as any).pendingRadioGreeting = true;
+ console.log(`[${deviceId}] Radio greeting queued (Gemini reconnecting)`);
+ } else {
+ connection.geminiSocket.send(JSON.stringify(prompt));
+ console.log(`[${deviceId}] Radio greeting sent to Gemini`);
+ }
  }
  return;
  }
@@ -1230,6 +1439,28 @@ Deno.serve({ port: 8000 }, (req: Request) => {
  const stats = `msgs=${connection.geminiMessageCount || 0}, audio=${connection.audioChunkCount || 0}, duration=${sessionDuration}s`;
  console.log(`[${deviceId}] ESP32 disconnected (${stats})`);
  
+ // Cancel all active streams to prevent orphaned processes
+ if (connection.radioStreamCancel) {
+ connection.radioStreamCancel();
+ connection.radioStreamCancel = null;
+ }
+ if (connection.radioProcess) {
+ try { connection.radioProcess.kill(); } catch (_) { /* ignore */ }
+ connection.radioProcess = null;
+ }
+ if (connection.ambientStreamCancel) {
+ connection.ambientStreamCancel();
+ connection.ambientStreamCancel = null;
+ }
+ if (connection.alarmStreamCancel) {
+ connection.alarmStreamCancel();
+ connection.alarmStreamCancel = null;
+ }
+ if (connection.zenBellCancel) {
+ connection.zenBellCancel();
+ connection.zenBellCancel = null;
+ }
+
  if (connection.geminiSocket) {
  console.log(`[${deviceId}] Closing Gemini socket (state=${connection.geminiSocket.readyState})`);
  connection.geminiSocket.close();
@@ -1510,6 +1741,69 @@ Device self-awareness: before answering any question about what the device is cu
  },
  required: ["action"]
  }
+ },
+ {
+ name: "search_radio_stations",
+ description: "Search for internet radio stations by genre or name. Returns a shortlist for the user to choose from. Call this before play_radio when the user wants to discover stations.",
+ parameters: {
+ type: "OBJECT",
+ properties: {
+ query: {
+ type: "STRING",
+ description: "Station name keyword to search for, e.g. 'BBC Radio 6' or 'Jazz FM'."
+ },
+ genre: {
+ type: "STRING",
+ description: "Music genre or mood tag, e.g. 'jazz', 'ambient', 'classical', 'rock', 'chillout'."
+ },
+ limit: {
+ type: "INTEGER",
+ description: "Maximum number of stations to return (default 5, max 8)."
+ }
+ },
+ required: []
+ }
+ },
+ {
+ name: "play_radio",
+ description: "Start playing a specific internet radio station on the device. Use the station ID returned by search_radio_stations. The device will enter radio mode and start streaming.",
+ parameters: {
+ type: "OBJECT",
+ properties: {
+ station_id: {
+ type: "STRING",
+ description: "The station UUID returned by search_radio_stations."
+ },
+ station_name: {
+ type: "STRING",
+ description: "Human-readable station name for display."
+ }
+ },
+ required: ["station_id", "station_name"]
+ }
+ },
+ {
+ name: "stop_radio",
+ description: "Stop the currently playing radio station and return to idle mode.",
+ parameters: {
+ type: "OBJECT",
+ properties: {},
+ required: []
+ }
+ },
+ {
+ name: "set_volume_level",
+ description: "Set the device volume on a scale of 1 to 10. 1 is very quiet, 5 is moderate, 10 is full volume. Works in all modes.",
+ parameters: {
+ type: "OBJECT",
+ properties: {
+ level: {
+ type: "INTEGER",
+ description: "Volume level from 1 (quietest) to 10 (loudest)."
+ }
+ },
+ required: ["level"]
+ }
  }]
  }]
  }
@@ -1586,6 +1880,24 @@ Device self-awareness: before answering any question about what the device is cu
  connection.pendingLazyReconnect = false;
  connection.socket.send(JSON.stringify({ type: "reconnectComplete" }));
  console.log(`[${connection.deviceId}] Lazy reconnect complete — sent reconnectComplete to ESP32`);
+
+ // Fire queued radio greeting if one was pending during reconnect
+ if ((connection as any).pendingRadioGreeting) {
+ (connection as any).pendingRadioGreeting = false;
+ if (connection.geminiSocket?.readyState === WebSocket.OPEN) {
+ const prompt = {
+ clientContent: {
+ turns: [{
+ role: "user",
+ parts: [{ text: "SYSTEM: The user has just entered radio mode using the physical button. Ask them what kind of radio station they'd like to listen to, then use search_radio_stations to find options and present a shortlist. Keep your opening question brief and friendly." }]
+ }],
+ turnComplete: true
+ }
+ };
+ connection.geminiSocket.send(JSON.stringify(prompt));
+ console.log(`[${connection.deviceId}] Pending radio greeting fired after reconnect`);
+ }
+ }
  }
 
  // Send greeting on first boot after a short settling delay
@@ -1808,6 +2120,39 @@ Device self-awareness: before answering any question about what the device is cu
  connection.pendingModeMessage = { type: "switchToIdle" };
  functionResult = { success: true, message: "Meditation session stopped" };
  }
+ } else if (funcName === "search_radio_stations") {
+ const query = (funcArgs.query || "") as string;
+ const genre = (funcArgs.genre || "") as string;
+ const limit = Math.min((funcArgs.limit as number) || 5, 8);
+ console.log(`[${connection.deviceId}] search_radio_stations: query="${query}" genre="${genre}" limit=${limit}`);
+ try {
+ const stations = await searchRadioStations(query, genre, limit);
+ functionResult = { success: true, stations };
+ } catch (err) {
+ console.error(`[${connection.deviceId}] Radio search failed:`, err);
+ functionResult = { success: false, error: "Radio search failed. Please try again." };
+ }
+ } else if (funcName === "play_radio") {
+ const stationId = (funcArgs.station_id || "") as string;
+ const stationName = (funcArgs.station_name || "Radio") as string;
+ console.log(`[${connection.deviceId}] play_radio: ${stationName} (${stationId})`);
+ const station = radioStationCache.get(stationId);
+ if (!station) {
+ functionResult = { success: false, error: "Station not found. Please search for stations first." };
+ } else {
+ const isHLS = station.url.includes(".m3u8");
+ connection.pendingModeMessage = { type: "radioStart", stationName, streamUrl: station.url, isHLS };
+ functionResult = { success: true, message: `Starting ${stationName}${isHLS ? " (may take a moment to load)" : ""}` };
+ }
+ } else if (funcName === "stop_radio") {
+ console.log(`[${connection.deviceId}] stop_radio`);
+ connection.pendingModeMessage = { type: "switchToIdle" };
+ functionResult = { success: true, message: "Radio stopped" };
+ } else if (funcName === "set_volume_level") {
+ const level = Math.max(1, Math.min(10, (funcArgs.level as number) || 5));
+ console.log(`[${connection.deviceId}] set_volume_level: ${level}`);
+ connection.socket.send(JSON.stringify({ type: "functionCall", name: "set_volume_level", args: { level } }));
+ functionResult = { success: true, message: `Volume set to level ${level}` };
  }
  
  // Send function response back to Gemini

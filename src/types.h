@@ -12,7 +12,7 @@ struct AudioChunk {
     size_t length;
 };
 
-enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU, LED_AMBIENT, LED_POMODORO, LED_MEDITATION, LED_LAMP, LED_SEA_GOOSEBERRY, LED_EYES, LED_ALARM, LED_CONVERSATION_WINDOW };
+enum LEDMode { LED_BOOT, LED_IDLE, LED_RECORDING, LED_PROCESSING, LED_AUDIO_REACTIVE, LED_CONNECTED, LED_ERROR, LED_TIDE, LED_TIMER, LED_MOON, LED_AMBIENT_VU, LED_AMBIENT, LED_RADIO, LED_POMODORO, LED_MEDITATION, LED_LAMP, LED_SEA_GOOSEBERRY, LED_EYES, LED_ALARM, LED_CONVERSATION_WINDOW };
 
 // Conversation state machine (main-loop only — not safe to read from other FreeRTOS tasks).
 // Cross-task coordination still uses the volatile flags: recordingActive, isPlayingResponse,
@@ -96,6 +96,17 @@ struct MeditationState {
     bool active;             // Meditation mode active
     bool streaming;          // Currently streaming meditation audio
     float savedVolume;       // User's volume before meditation
+};
+
+// Internet radio mode state
+struct RadioState {
+    bool active = false;          // Radio mode entered
+    bool streaming = false;       // false = discovery phase, true = station playing
+    bool visualsActive = true;    // VU meter on/off toggle (Button 2 while playing)
+    bool isHLS = false;           // HLS stream — longer initial buffer wait
+    String stationName;           // Current station name
+    String streamUrl;             // Direct stream URL
+    float savedVolume = 1.0f;     // Saved before Button 1 duck, restored after
 };
 
 // Lamp mode state

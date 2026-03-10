@@ -122,6 +122,9 @@ MeditationState meditationState = {MeditationState::ROOT, MeditationState::INHAL
 // Lamp mode state
 LampState lampState = {LampState::WHITE, LampState::WHITE, 0, 0, 0, {0}, false, false, false};
 
+// Radio mode state
+RadioState radioState = {};
+
 // Alarm state
 Alarm alarms[MAX_ALARMS];
 
@@ -607,6 +610,17 @@ void loop() {
                 lampState.fullyLit = false;
             }
             
+            // Clear Radio
+            if (radioState.active) {
+                if (radioState.savedVolume > 0.05f) {
+                    volumeMultiplier = radioState.savedVolume;
+                }
+                radioState.active = false;
+                radioState.streaming = false;
+                radioState.stationName = "";
+                radioState.streamUrl = "";
+            }
+            
             // Return to IDLE and start recording immediately
             currentLEDMode = LED_IDLE;
             
@@ -627,9 +641,18 @@ void loop() {
         }
         
         // STOP button short press: Cycle through modes
-        // IDLE -> VU Mode -> Sea Jelly -> Ambient -> Pomodoro -> Meditation -> Lamp -> Eyes -> IDLE
+        // IDLE -> VU Mode -> Sea Jelly -> Ambient -> Radio -> Pomodoro -> Meditation -> Lamp -> Eyes -> IDLE
         // Allow during ambient modes, block only during Gemini responses (non-ambient)
-        if (stopRisingEdge && !recordingActive && 
+
+        // Radio streaming: short press toggles VU visualizer, doesn't cycle mode
+        bool radioVisualToggled = false;
+        if (stopRisingEdge && !recordingActive && currentLEDMode == LED_RADIO && radioState.active && radioState.streaming) {
+            radioState.visualsActive = !radioState.visualsActive;
+            Serial.printf("Radio VU visuals: %s\n", radioState.visualsActive ? "ON" : "OFF");
+            radioVisualToggled = true;
+        }
+
+        if (!radioVisualToggled && stopRisingEdge && !recordingActive &&
             !(isPlayingResponse && !isPlayingAmbient)) {
             // Stop any current ambient playback
             if (isPlayingAmbient) {
@@ -698,45 +721,107 @@ void loop() {
                     webSocket.sendTXT(ambientMsg);
                 }
             } else if (modeToCheck == LED_AMBIENT) {
-                // Stop ambient sound and switch to Pomodoro mode
-                DEBUG_PRINTLN(" Mode transition: AMBIENT  POMODORO (cleaning up...)");
+                // Stop ambient sound and enter Radio discovery mode
+                DEBUG_PRINTLN(" Mode transition: AMBIENT  RADIO (cleaning up...)");
                 
                 // Clear audio buffer to prevent bleed
                 i2s_zero_dma_buffer(I2S_NUM_1);
                 delay(50);
-                i2s_zero_dma_buffer(I2S_NUM_1);  // Double clear for safety
+                i2s_zero_dma_buffer(I2S_NUM_1);
                 
-                // Clear LED buffer to remove rain/ocean effects (with mutex)
+                // Clear LED buffer (with mutex)
                 if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-                    if (currentLEDMode == LED_MEDITATION) {
-                        DEBUG_PRINT(" INTERRUPTING meditation: mode transition clear\n");
-                    }
                     fill_solid(leds, NUM_LEDS, CRGB::Black);
                     FastLED.show();
                     xSemaphoreGive(ledMutex);
                 }
-                delay(50);  // Let clear propagate
+                delay(50);
                 
-                // Always clear ambient state (not just when isPlayingAmbient)
+                // Stop ambient audio
                 if (isPlayingAmbient) {
-                    // Send stop request to server
                     JsonDocument stopDoc;
                     stopDoc["action"] = "stopAmbient";
                     String stopMsg;
                     serializeJson(stopDoc, stopMsg);
                     webSocket.sendTXT(stopMsg);
                 }
-                
-                // Clear ambient state regardless (prevents reconnection from resuming)
                 isPlayingResponse = false;
                 isPlayingAmbient = false;
                 ambientSound.active = false;
                 ambientSound.name = "";
                 ambientSound.sequence++;
-                
-                // Zero buffer again after state clear
                 i2s_zero_dma_buffer(I2S_NUM_1);
                 
+                // Enter radio discovery mode
+                radioState.active = true;
+                radioState.streaming = false;
+                radioState.visualsActive = true;
+                radioState.stationName = "";
+                radioState.streamUrl = "";
+                radioState.savedVolume = volumeMultiplier;
+
+                // Notify server: source=button triggers Gemini greeting
+                {
+                    JsonDocument radioNotifyDoc;
+                    radioNotifyDoc["type"] = "radioModeActivated";
+                    radioNotifyDoc["source"] = "button";
+                    String radioNotifyMsg;
+                    serializeJson(radioNotifyDoc, radioNotifyMsg);
+                    webSocket.sendTXT(radioNotifyMsg);
+                }
+
+                DEBUG_PRINTLN(" Radio discovery mode activated");
+                currentLEDMode = LED_RADIO;
+
+            } else if (modeToCheck == LED_RADIO) {
+                // Exit Radio mode and enter Pomodoro mode
+                DEBUG_PRINTLN(" Mode transition: RADIO  POMODORO (cleaning up...)");
+
+                // Stop any radio stream
+                if (isPlayingAmbient || radioState.streaming) {
+                    JsonDocument stopDoc;
+                    stopDoc["action"] = "stopAmbient";
+                    String stopMsg;
+                    serializeJson(stopDoc, stopMsg);
+                    webSocket.sendTXT(stopMsg);
+                }
+
+                // Restore volume if ducked
+                if (radioState.savedVolume > 0.05f) {
+                    volumeMultiplier = radioState.savedVolume;
+                }
+
+                // Clear radio state
+                radioState.active = false;
+                radioState.streaming = false;
+                radioState.stationName = "";
+                radioState.streamUrl = "";
+
+                // Clear ambient/audio state
+                isPlayingResponse = false;
+                isPlayingAmbient = false;
+                ambientSound.active = false;
+                ambientSound.name = "";
+                ambientSound.sequence++;
+                ambientSound.drainUntil = millis() + 2000;
+
+                // Clear audio buffers
+                {
+                    AudioChunk dummy;
+                    while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {}
+                }
+                i2s_zero_dma_buffer(I2S_NUM_1);
+                delay(50);
+                i2s_zero_dma_buffer(I2S_NUM_1);
+
+                // Clear LED buffer
+                if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
+                    fill_solid(leds, NUM_LEDS, CRGB::Black);
+                    FastLED.show();
+                    xSemaphoreGive(ledMutex);
+                }
+                delay(50);
+
                 // Initialize Pomodoro state if not already active
                 if (!pomodoroState.active) {
                     pomodoroState.currentSession = PomodoroState::FOCUS;
@@ -747,7 +832,7 @@ void loop() {
                     pomodoroState.active = true;
                     pomodoroState.paused = false;
                 }
-                
+
                 DEBUG_PRINTLN(" Pomodoro mode activated");
                 playZenBell();
                 currentLEDMode = LED_POMODORO;
@@ -1263,6 +1348,27 @@ void loop() {
                          (const char*[]){"WHITE", "RED", "GREEN", "BLUE"}[lampState.previousColor], 
                          (const char*[]){"WHITE", "RED", "GREEN", "BLUE"}[lampState.currentColor]);
         }
+        // Radio streaming mode: Button 1 ducks volume then starts recording
+        else if (!meditationHandled && currentLEDMode == LED_RADIO && radioState.active &&
+                 radioState.streaming && startRisingEdge && !recordingActive && !conversationMode) {
+            // Duck radio volume to 5% so music fades to background
+            radioState.savedVolume = volumeMultiplier;
+            volumeMultiplier = 0.05f;
+            Serial.println("Radio: volume ducked to 5% for voice command");
+            // Start recording
+            responseInterrupted = false;
+            conversationRecording = false;
+            tideState.active = false;
+            moonState.active = false;
+            if (ambientSound.drainUntil > 0) { ambientSound.drainUntil = 0; }
+            recordingActive = true;
+            recordingStartTime = millis();
+            lastVoiceActivityTime = millis();
+            convState = ConvState::RECORDING;
+            waitingEnteredAt = 0;
+            currentLEDMode = LED_RECORDING;
+            DEBUG_PRINT(" Radio recording started...\n");
+        }
         // Start recording on rising edge (normal case - not interrupting)
         // Block if: recording active, playing response, OR in ambient sound mode, OR conversation window is open,
         // OR in any display-only/non-Gemini mode (Meditation, Ambient, Lamp, VU, SeaJelly, Pomodoro, Eyes)
@@ -1421,8 +1527,10 @@ void loop() {
             LEDMode effectiveMode = currentLEDMode;
             bool isPersistentMode = (effectiveMode == LED_MEDITATION ||
                                      effectiveMode == LED_AMBIENT   ||
+                                     effectiveMode == LED_RADIO     ||
                                      effectiveMode == LED_LAMP      ||
                                      effectiveMode == LED_POMODORO  ||
+                                     radioState.active              ||  // Radio discovery mode (LED may be PROCESSING)
                                      meditationState.active         ||  // Voice-triggered meditation may be in AUDIO_REACTIVE during verbal response
                                      lampState.active);                 // Voice-triggered lamp may be in AUDIO_REACTIVE during verbal response
             if (!isPersistentMode) {
@@ -1453,6 +1561,12 @@ void loop() {
             } else {
                 Serial.printf("Skipping conversation window - entering persistent mode %d\n", effectiveMode);
                 convState = ConvState::IDLE;  // Persistent mode: no follow-up window
+
+                // Radio: restore volume after Gemini's verbal response finishes
+                if (radioState.active && radioState.streaming && volumeMultiplier < radioState.savedVolume) {
+                    volumeMultiplier = radioState.savedVolume;
+                    Serial.printf("Radio: volume restored to %.0f%% after Gemini response\n", volumeMultiplier * 100);
+                }
 
                 // Deferred meditation start: if meditationStart arrived while Gemini was still
                 // speaking, phaseStartTime was set to 0 (waiting). Now that audio is done, start it.
@@ -1486,6 +1600,9 @@ void loop() {
                     if (meditationState.active) {
                         currentLEDMode = LED_MEDITATION;
                         Serial.println("Returning to MEDITATION after Gemini response");
+                    } else if (radioState.active) {
+                        currentLEDMode = LED_RADIO;
+                        Serial.println("Returning to RADIO after Gemini response");
                     } else if (pomodoroState.active) {
                         currentLEDMode = LED_POMODORO;
                         Serial.println("Returning to POMODORO after Gemini response");
@@ -2073,6 +2190,14 @@ void audioTask(void * parameter) {
                             lamDoc["color"] = colorName;
                         }
 
+                        // Radio state
+                        JsonObject radDoc = stateDoc["radio"].to<JsonObject>();
+                        radDoc["active"] = radioState.active;
+                        radDoc["streaming"] = radioState.streaming;
+                        if (radioState.active && radioState.streaming) {
+                            radDoc["station"] = radioState.stationName;
+                        }
+
                         // Alarm count (quick summary — full list available via deviceStateRequest)
                         int activeAlarmCount = 0;
                         for (int i = 0; i < MAX_ALARMS; i++) {
@@ -2561,6 +2686,11 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     }
                     Serial.println();
                     firstAudioChunk = false;
+                    // Radio: mark as actively streaming once first chunk arrives
+                    if (radioState.active && !radioState.streaming) {
+                        radioState.streaming = true;
+                        Serial.printf("Radio streaming started: %s\n", radioState.stationName.c_str());
+                    }
                 }
                 
                 // Queue raw PCM chunk for audio task
@@ -3414,6 +3544,56 @@ void updateLEDs() {
             
             break;  // End of LED_AMBIENT case
             
+        case LED_RADIO:
+            // Internet radio mode visualization
+            {
+                if (!radioState.streaming) {
+                    // Discovery mode: slow sine-wave teal pulse (waiting for Gemini to pick a station)
+                    static float radioPulsePhase = 0.0f;
+                    radioPulsePhase += 0.004f;
+                    if (radioPulsePhase > TWO_PI) radioPulsePhase -= TWO_PI;
+                    float brightness = 0.30f + 0.15f * sinf(radioPulsePhase);  // 30-45% brightness
+                    uint8_t b = (uint8_t)(brightness * 255);
+                    CRGB teal = CRGB(0, (uint8_t)(b * 0.7f), b);  // teal: 0, 0.7B, B
+                    fill_solid(leds, NUM_LEDS, teal);
+                } else if (radioState.isHLS && !isPlayingAmbient) {
+                    // HLS buffering: slow orange pulse to show "buffering"
+                    static float hlsPulsePhase = 0.0f;
+                    hlsPulsePhase += 0.003f;
+                    if (hlsPulsePhase > TWO_PI) hlsPulsePhase -= TWO_PI;
+                    float brightness = 0.25f + 0.20f * sinf(hlsPulsePhase);
+                    uint8_t b = (uint8_t)(brightness * 255);
+                    fill_solid(leds, NUM_LEDS, CRGB(b, (uint8_t)(b * 0.5f), 0));
+                } else if (!radioState.visualsActive) {
+                    // VU visuals off: static teal at 40%
+                    fill_solid(leds, NUM_LEDS, CRGB(0, (uint8_t)(0.4f * 180), (uint8_t)(0.4f * 255)));
+                } else {
+                    // VU meter using playback audio level, teal color scheme
+                    // Fade all LEDs for trail effect
+                    for (int i = 0; i < NUM_LEDS; i++) {
+                        leds[i].fadeToBlackBy(80);
+                    }
+                    
+                    // Map playback audio to row count (0-12 rows), same as LED_AUDIO_REACTIVE
+                    int numRows = map(constrain((int)smoothedAudioLevel, 0, 3000), 0, 3000, 0, LEDS_PER_COLUMN);
+                    
+                    for (int col = 0; col < LED_COLUMNS; col++) {
+                        for (int row = 0; row < LEDS_PER_COLUMN; row++) {
+                            int ledIdx = col * LEDS_PER_COLUMN + row;
+                            if (ledIdx >= NUM_LEDS) continue;
+                            if (row < numRows) {
+                                // Teal gradient: low = dark teal, high = bright cyan
+                                float progress = (float)row / (float)LEDS_PER_COLUMN;
+                                uint8_t g = (uint8_t)(progress * 200);
+                                uint8_t b_val = (uint8_t)(100 + progress * 155);
+                                leds[ledIdx] = CRGB(0, g, b_val);
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+
         case LED_POMODORO:
             // Pomodoro timer visualization with hybrid countdown/countup
             // Focus (red): countdown from full

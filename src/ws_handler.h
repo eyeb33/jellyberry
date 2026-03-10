@@ -43,6 +43,7 @@ extern MeditationState meditationState;
 extern PomodoroState   pomodoroState;
 extern LampState          lampState;
 extern AmbientSoundType   currentAmbientSoundType;
+extern RadioState         radioState;
 
 // Chakra names (defined in main.cpp)
 extern const char* CHAKRA_NAMES[];

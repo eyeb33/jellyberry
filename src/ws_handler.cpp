@@ -27,11 +27,22 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
 
  // Handle lazy-reconnect complete: Gemini is ready again.
- // Return to idle so the user can speak normally.
+ // Restore the mode that was active before reconnection.
  if (doc["type"].is<const char*>() && doc["type"] == "reconnectComplete") {
  Serial.println("Gemini reconnect complete — ready for interaction");
- currentLEDMode = LED_IDLE;
  convState = ConvState::IDLE;
+ // Restore active mode rather than unconditionally going to LED_IDLE
+ if (radioState.active) {
+ currentLEDMode = LED_RADIO;
+ } else if (meditationState.active) {
+ currentLEDMode = LED_MEDITATION;
+ } else if (pomodoroState.active) {
+ currentLEDMode = LED_POMODORO;
+ } else if (ambientSound.active) {
+ currentLEDMode = LED_AMBIENT;
+ } else {
+ currentLEDMode = LED_IDLE;
+ }
  return;
  }
 
@@ -94,6 +105,18 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  Serial.printf("Volume set: %d%%\n", percent);
  
  // Play a brief chime at the new volume
+ playVolumeChime();
+ 
+ } else if (funcName == "set_volume_level") {
+ // 1-10 scale from Gemini, maps to 10%-100%
+ int level = doc["args"]["level"].as<int>();
+ level = constrain(level, 1, 10);
+ volumeMultiplier = level * 10 / 100.0f; // 1→0.10, 10→1.00
+ // Save to radioState if radio is active (so duck/restore works correctly)
+ if (radioState.active && radioState.streaming) {
+ radioState.savedVolume = volumeMultiplier;
+ }
+ Serial.printf("Volume level %d: %.0f%%\n", level, volumeMultiplier * 100);
  playVolumeChime();
  }
  
@@ -561,6 +584,16 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  lampDoc["color"] = colorName;
  }
 
+ // Radio state
+ JsonObject radioDoc = stateDoc["radio"].to<JsonObject>();
+ radioDoc["active"] = radioState.active;
+ radioDoc["streaming"] = radioState.streaming;
+ if (radioState.active && radioState.streaming) {
+ radioDoc["station"] = radioState.stationName;
+ radioDoc["isHLS"] = radioState.isHLS;
+ radioDoc["visualsActive"] = radioState.visualsActive;
+ }
+
  // Alarm list
  JsonArray alarmArray = stateDoc["alarms"].to<JsonArray>();
  struct tm timeinfo;
@@ -705,6 +738,95 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  return;
  }
 
+ // Handle radioStart - start internet radio stream
+ if (doc["type"].is<const char*>() && doc["type"] == "radioStart") {
+ const char* stationName = doc["stationName"] | "Radio";
+ const char* streamUrl = doc["streamUrl"] | "";
+ bool isHLS = doc["isHLS"] | false;
+ Serial.printf("radioStart: %s (HLS: %s)\n", stationName, isHLS ? "yes" : "no");
+
+ // Stop any ambient/meditation
+ if (isPlayingAmbient) {
+ JsonDocument stopDoc;
+ stopDoc["action"] = "stopAmbient";
+ String stopMsg;
+ serializeJson(stopDoc, stopMsg);
+ webSocket.sendTXT(stopMsg);
+ isPlayingAmbient = false;
+ ambientSound.active = false;
+ ambientSound.sequence++;
+ }
+ if (meditationState.active) {
+ volumeMultiplier = meditationState.savedVolume;
+ meditationState.active = false;
+ }
+
+ // Flush stale audio
+ {
+ AudioChunk dummy;
+ while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {}
+ i2s_zero_dma_buffer(I2S_NUM_1);
+ }
+
+ // Set radio state
+ radioState.active = true;
+ radioState.streaming = false; // will become true after first chunk arrives
+ radioState.visualsActive = true;
+ radioState.isHLS = isHLS;
+ radioState.stationName = stationName;
+ radioState.streamUrl = streamUrl;
+
+ // Reuse ambient pipeline for radio PCM chunks
+ ambientSound.active = true;
+ ambientSound.name = stationName;
+ ambientSound.sequence++;
+ isPlayingAmbient = true;
+ isPlayingResponse = false;
+ firstAudioChunk = true;
+ lastAudioChunkTime = millis();
+
+ // Tell server to start streaming
+ {
+ JsonDocument radioReqDoc;
+ radioReqDoc["action"] = "requestRadio";
+ radioReqDoc["streamUrl"] = radioState.streamUrl;
+ radioReqDoc["stationName"] = radioState.stationName;
+ radioReqDoc["sequence"] = ambientSound.sequence;
+ radioReqDoc["isHLS"] = isHLS;
+ String radioReqMsg;
+ serializeJson(radioReqDoc, radioReqMsg);
+ Serial.printf("Radio request sent (seq %d)\n", ambientSound.sequence);
+ webSocket.sendTXT(radioReqMsg);
+ }
+ currentLEDMode = LED_RADIO;
+ return;
+ }
+
+ // Handle radioEnded - station went offline or stream stopped
+ if (doc["type"].is<const char*>() && doc["type"] == "radioEnded") {
+ const char* stationName = doc["stationName"] | radioState.stationName.c_str();
+ bool isError = doc["error"] | false;
+ Serial.printf("radioEnded: %s (error: %s)\n", stationName, isError ? "yes" : "no");
+
+ // Restore volume if it was ducked
+ if (radioState.savedVolume > 0.05f) {
+ volumeMultiplier = radioState.savedVolume;
+ }
+
+ // Clear radio + ambient state
+ radioState.active = false;
+ radioState.streaming = false;
+ radioState.stationName = "";
+ radioState.streamUrl = "";
+ isPlayingAmbient = false;
+ ambientSound.active = false;
+ ambientSound.name = "";
+ ambientSound.sequence++;
+
+ currentLEDMode = LED_IDLE;
+ return;
+ }
+
  // Handle lampStart - voice-commanded lamp
  if (doc["type"].is<const char*>() && doc["type"] == "lampStart") {
  const char* color = doc["color"] | "white";
@@ -787,6 +909,17 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  // Clear lamp
  lampState.active = false;
  lampState.fullyLit = false;
+
+ // Clear radio state
+ if (radioState.active) {
+ if (radioState.savedVolume > 0.05f) {
+ volumeMultiplier = radioState.savedVolume;
+ }
+ radioState.active = false;
+ radioState.streaming = false;
+ radioState.stationName = "";
+ radioState.streamUrl = "";
+ }
 
  currentLEDMode = LED_IDLE;
  return;

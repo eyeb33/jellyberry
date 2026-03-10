@@ -814,6 +814,8 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  radioState.isHLS = isHLS;
  strlcpy(radioState.stationName, stationName, sizeof(radioState.stationName));
  strlcpy(radioState.streamUrl, streamUrl, sizeof(radioState.streamUrl));
+ volumeMultiplier = RADIO_DEFAULT_VOLUME;     // Start at comfortable level (volume 3)
+ radioState.savedVolume = RADIO_DEFAULT_VOLUME;  // Duck/restore anchor
 
  // Reuse ambient pipeline for radio PCM chunks
  ambientSound.active = true;

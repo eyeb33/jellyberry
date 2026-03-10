@@ -928,7 +928,8 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 radioState.visualsActive = true;
                 radioState.stationName[0] = '\0';
                 radioState.streamUrl[0] = '\0';
-                radioState.savedVolume = volumeMultiplier;
+                volumeMultiplier = RADIO_DEFAULT_VOLUME;
+                radioState.savedVolume = RADIO_DEFAULT_VOLUME;
 
                 // Notify server: source=button triggers Gemini greeting
                 {
@@ -1524,9 +1525,10 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                          (const char*[]){"WHITE", "RED", "GREEN", "BLUE"}[lampState.previousColor], 
                          (const char*[]){"WHITE", "RED", "GREEN", "BLUE"}[lampState.currentColor]);
         }
-        // Radio streaming mode: Button 1 ducks volume then starts recording
+        // Radio: Button 1 ducks volume then starts recording
+        // Works as soon as radioState.active, even before first stream chunk arrives
         else if (!meditationHandled && currentLEDMode == LED_RADIO && radioState.active &&
-                 radioState.streaming && startRisingEdge && !recordingActive && !conversationMode) {
+                 startRisingEdge && !recordingActive && !conversationMode) {
             // Duck radio volume to 5% so music fades to background
             radioState.savedVolume = volumeMultiplier;
             volumeMultiplier = 0.05f;

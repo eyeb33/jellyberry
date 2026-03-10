@@ -34,10 +34,10 @@ void transitionConvState(ConvState newState) {
 }
 
 // ── Safe WebSocket send with error logging ───────────────────────────────────
-static void wsSendMessage(const String& msg) {
-    if (!webSocket.sendTXT(msg.c_str(), msg.length())) {
-        Serial.printf("[WS] sendTXT failed (%u bytes)\n", msg.length());
-    }
+bool wsSendMessage(const String& msg) {
+    bool ok = webSocket.sendTXT(msg.c_str(), msg.length());
+    if (!ok) Serial.printf("[WS] sendTXT failed (%u bytes)\n", msg.length());
+    return ok;
 }
 
 void handleWebSocketMessage(uint8_t* payload, size_t length) {

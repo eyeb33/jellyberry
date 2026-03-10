@@ -354,7 +354,7 @@ void setup() {
         if (retryCount > 0) {
             Serial.printf("\nRetry attempt %d/%d\n", retryCount + 1, maxRetries);
             WiFi.disconnect();
-            delay(1000 * retryCount);  // Exponential backoff: 1s, 2s, 3s
+            delay(1000 * retryCount);  // Linear backoff: 0s, 1s, 2s before each retry
         }
         
         WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -410,9 +410,9 @@ void setup() {
 
     // Start FreeRTOS tasks
     // WebSocket needs high priority (3) and larger stack for heavy audio streaming
-    xTaskCreatePinnedToCore(websocketTask, "WebSocket", 16384, NULL, 3, &websocketTaskHandle, CORE_1);  // Increased from 8KB to 16KB
-    xTaskCreatePinnedToCore(ledTask, "LEDs", 4096, NULL, 0, &ledTaskHandle, CORE_0);
-    xTaskCreatePinnedToCore(audioTask, "Audio", 32768, NULL, 2, &audioTaskHandle, CORE_1);  // 32KB for audio buffers + processing
+    xTaskCreatePinnedToCore(websocketTask, "WebSocket", TASK_STACK_WEBSOCKET, NULL, 3, &websocketTaskHandle, CORE_1);
+    xTaskCreatePinnedToCore(ledTask,         "LEDs",      TASK_STACK_LED,       NULL, 0, &ledTaskHandle,       CORE_0);
+    xTaskCreatePinnedToCore(audioTask,       "Audio",     TASK_STACK_AUDIO,     NULL, 2, &audioTaskHandle,     CORE_1);
     Serial.println("Tasks created on dual cores");
     
     Serial.printf("=== Initialization Complete ===  [LEDMode: IDLE]\n");
@@ -424,34 +424,64 @@ void setup() {
 // ============================================================
 
 static void checkAlarms() {
-static uint32_t lastAlarmCheck = 0;
-// Check alarms every 10 seconds
-if (alarmState.active && !alarmState.ringing && millis() - lastAlarmCheck > 10000) {
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo)) {
-        time_t now = mktime(&timeinfo);
-        
-        // Check each alarm
-        for (int i = 0; i < MAX_ALARMS; i++) {
-            if (alarms[i].enabled && !alarms[i].triggered) {
-                // Check if snoozed
-                if (alarms[i].snoozed) {
-                    if (now >= alarms[i].snoozeUntil) {
-                        // Snooze period ended - ring again
-                        alarms[i].snoozed = false;
+    static uint32_t lastAlarmCheck = 0;
+    // Check alarms every 10 seconds
+    if (alarmState.active && !alarmState.ringing && millis() - lastAlarmCheck > ALARM_CHECK_INTERVAL_MS) {
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo)) {
+            time_t now = mktime(&timeinfo);
+            
+            // Check each alarm
+            for (int i = 0; i < MAX_ALARMS; i++) {
+                if (alarms[i].enabled && !alarms[i].triggered) {
+                    // Check if snoozed
+                    if (alarms[i].snoozed) {
+                        if (now >= alarms[i].snoozeUntil) {
+                            // Snooze period ended - ring again
+                            alarms[i].snoozed = false;
+                            
+                            // Save current state before switching to alarm
+                            alarmState.previousMode = currentLEDMode;
+                            alarmState.wasRecording = recordingActive;
+                            alarmState.wasPlayingResponse = isPlayingResponse;
+                            
+                            alarms[i].triggered = true;  // Prevent re-triggering every scan cycle
+                            alarmState.ringing = true;
+                            alarmState.ringStartTime = millis();
+                            alarmState.pulseStartTime = millis();
+                            alarmState.pulseRadius = 0.0f;
+                            currentLEDMode = LED_ALARM;
+                            DEBUG_PRINT(" Alarm %u ringing after snooze! (interrupted mode: %d)\n", alarms[i].alarmID, alarmState.previousMode);
+                            
+                            // Play alarm sound
+                            isPlayingAlarm = true;
+                            isPlayingResponse = true;
+                            firstAudioChunk = true;
+                            lastAudioChunkTime = millis();
+                            JsonDocument alarmDoc;
+                            alarmDoc["action"] = "requestAlarm";
+                            String alarmMsg;
+                            serializeJson(alarmDoc, alarmMsg);
+                            DEBUG_PRINTLN(" Requesting alarm sound from server");
+                            wsSendMessage(alarmMsg);
+                            
+                            break;
+                        }
+                    } else if (now >= alarms[i].triggerTime) {
+                        // Alarm time reached!
                         
                         // Save current state before switching to alarm
                         alarmState.previousMode = currentLEDMode;
                         alarmState.wasRecording = recordingActive;
                         alarmState.wasPlayingResponse = isPlayingResponse;
                         
-                        alarms[i].triggered = true;  // Prevent re-triggering every scan cycle
+                        alarms[i].triggered = true;  // Prevent re-triggering every 10-second scan cycle
                         alarmState.ringing = true;
                         alarmState.ringStartTime = millis();
                         alarmState.pulseStartTime = millis();
                         alarmState.pulseRadius = 0.0f;
                         currentLEDMode = LED_ALARM;
-                        DEBUG_PRINT(" Alarm %u ringing after snooze! (interrupted mode: %d)\n", alarms[i].alarmID, alarmState.previousMode);
+                        DEBUG_PRINT(" Alarm %u triggered at %s (interrupted mode: %d)\n", alarms[i].alarmID, asctime(&timeinfo), alarmState.previousMode);
                         
                         // Play alarm sound
                         isPlayingAlarm = true;
@@ -463,177 +493,147 @@ if (alarmState.active && !alarmState.ringing && millis() - lastAlarmCheck > 1000
                         String alarmMsg;
                         serializeJson(alarmDoc, alarmMsg);
                         DEBUG_PRINTLN(" Requesting alarm sound from server");
-                        webSocket.sendTXT(alarmMsg);
+                        wsSendMessage(alarmMsg);
                         
                         break;
                     }
-                } else if (now >= alarms[i].triggerTime) {
-                    // Alarm time reached!
-                    
-                    // Save current state before switching to alarm
-                    alarmState.previousMode = currentLEDMode;
-                    alarmState.wasRecording = recordingActive;
-                    alarmState.wasPlayingResponse = isPlayingResponse;
-                    
-                    alarms[i].triggered = true;  // Prevent re-triggering every 10-second scan cycle
-                    alarmState.ringing = true;
-                    alarmState.ringStartTime = millis();
-                    alarmState.pulseStartTime = millis();
-                    alarmState.pulseRadius = 0.0f;
-                    currentLEDMode = LED_ALARM;
-                    DEBUG_PRINT(" Alarm %u triggered at %s (interrupted mode: %d)\n", alarms[i].alarmID, asctime(&timeinfo), alarmState.previousMode);
-                    
-                    // Play alarm sound
-                    isPlayingAlarm = true;
-                    isPlayingResponse = true;
-                    firstAudioChunk = true;
-                    lastAudioChunkTime = millis();
-                    JsonDocument alarmDoc;
-                    alarmDoc["action"] = "requestAlarm";
-                    String alarmMsg;
-                    serializeJson(alarmDoc, alarmMsg);
-                    DEBUG_PRINTLN(" Requesting alarm sound from server");
-                    webSocket.sendTXT(alarmMsg);
-                    
-                    break;
                 }
             }
         }
+        lastAlarmCheck = millis();
     }
-    lastAlarmCheck = millis();
-}
 }
 
 static void handleFlashAnimations() {
-// Handle non-blocking Pomodoro flash animation
-if (pomodoroState.flashing && (millis() - pomodoroState.flashStartTime) >= 200) {
-    pomodoroState.flashCount++;
-    pomodoroState.flashStartTime = millis();
+    // Handle non-blocking Pomodoro flash animation
+    if (pomodoroState.flashing && (millis() - pomodoroState.flashStartTime) >= 200) {
+        pomodoroState.flashCount++;
+        pomodoroState.flashStartTime = millis();
+        
+        if (pomodoroState.flashCount >= 6) {
+            // Animation complete (3 on/off cycles = 6 state changes)
+            pomodoroState.flashing = false;
+        } else {
+            // Toggle LED state
+            if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
+                if (pomodoroState.flashCount % 2 == 0) {
+                    fill_solid(leds, NUM_LEDS, CRGB::White);
+                } else {
+                    fill_solid(leds, NUM_LEDS, CRGB::Black);
+                }
+                FastLED.show();
+                xSemaphoreGive(ledMutex);
+            }
+        }
+    }
     
-    if (pomodoroState.flashCount >= 6) {
-        // Animation complete (3 on/off cycles = 6 state changes)
-        pomodoroState.flashing = false;
-    } else {
-        // Toggle LED state
-        if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-            if (pomodoroState.flashCount % 2 == 0) {
-                fill_solid(leds, NUM_LEDS, CRGB::White);
-            } else {
-                fill_solid(leds, NUM_LEDS, CRGB::Black);
+    // Handle non-blocking timer flash animation (triggered by timerExpired WebSocket message).
+    // Runs at 200ms intervals in loop() — WebSocket task is never blocked.
+    if (timerState.flashing && (millis() - timerState.flashStartTime) >= 200) {
+        timerState.flashCount++;
+        timerState.flashStartTime = millis();
+    
+        if (timerState.flashCount >= 6) {
+            // Animation complete (3 on/off cycles = 6 state changes)
+            timerState.flashing = false;
+        } else {
+            // Toggle LEDs green/black
+            if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
+                if (timerState.flashCount % 2 == 0) {
+                    fill_solid(leds, NUM_LEDS, CRGB::Green);
+                } else {
+                    fill_solid(leds, NUM_LEDS, CRGB::Black);
+                }
+                FastLED.show();
+                xSemaphoreGive(ledMutex);
             }
-            FastLED.show();
-            xSemaphoreGive(ledMutex);
         }
     }
-}
-
-// Handle non-blocking timer flash animation (triggered by timerExpired WebSocket message).
-// Runs at 200ms intervals in loop() — WebSocket task is never blocked.
-if (timerState.flashing && (millis() - timerState.flashStartTime) >= 200) {
-    timerState.flashCount++;
-    timerState.flashStartTime = millis();
-
-    if (timerState.flashCount >= 6) {
-        // Animation complete (3 on/off cycles = 6 state changes)
-        timerState.flashing = false;
-    } else {
-        // Toggle LEDs green/black
-        if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-            if (timerState.flashCount % 2 == 0) {
-                fill_solid(leds, NUM_LEDS, CRGB::Green);
-            } else {
-                fill_solid(leds, NUM_LEDS, CRGB::Black);
-            }
-            FastLED.show();
-            xSemaphoreGive(ledMutex);
-        }
-    }
-}
 }
 
 static void handlePomodoroTick() {
-// Check for Pomodoro session completion and auto-advance
-if (currentLEDMode == LED_POMODORO && pomodoroState.active && !pomodoroState.paused && pomodoroState.startTime > 0) {
-    uint32_t elapsed = (millis() - pomodoroState.startTime) / 1000;
-    int secondsRemaining = pomodoroState.totalSeconds - (int)elapsed;
-    
-    if (secondsRemaining <= 0) {
-        DEBUG_PRINTLN(" Pomodoro session complete!");
+    // Check for Pomodoro session completion and auto-advance
+    if (currentLEDMode == LED_POMODORO && pomodoroState.active && !pomodoroState.paused && pomodoroState.startTime > 0) {
+        uint32_t elapsed = (millis() - pomodoroState.startTime) / 1000;
+        int secondsRemaining = pomodoroState.totalSeconds - (int)elapsed;
         
-        // Start non-blocking flash animation
-        pomodoroState.flashing = true;
-        pomodoroState.flashCount = 0;
-        pomodoroState.flashStartTime = millis();
-        
-        // Play completion chime
-        playZenBell();
-        
-        // Advance to next session
-        if (pomodoroState.currentSession == PomodoroState::FOCUS) {
-            pomodoroState.sessionCount++;
+        if (secondsRemaining <= 0) {
+            DEBUG_PRINTLN(" Pomodoro session complete!");
             
-            if (pomodoroState.sessionCount >= 4) {
-                // After 4 focus sessions, take a long break
-                DEBUG_PRINT("   Focus complete! Starting long break (%d min)\n", pomodoroState.longBreakDuration);
-                pomodoroState.currentSession = PomodoroState::LONG_BREAK;
-                pomodoroState.totalSeconds = pomodoroState.longBreakDuration * 60;
+            // Start non-blocking flash animation
+            pomodoroState.flashing = true;
+            pomodoroState.flashCount = 0;
+            pomodoroState.flashStartTime = millis();
+            
+            // Play completion chime
+            playZenBell();
+            
+            // Advance to next session
+            if (pomodoroState.currentSession == PomodoroState::FOCUS) {
+                pomodoroState.sessionCount++;
                 
-                // Start immediately (don't pause)
-                pomodoroState.startTime = millis();
+                if (pomodoroState.sessionCount >= 4) {
+                    // After 4 focus sessions, take a long break
+                    DEBUG_PRINT("   Focus complete! Starting long break (%d min)\n", pomodoroState.longBreakDuration);
+                    pomodoroState.currentSession = PomodoroState::LONG_BREAK;
+                    pomodoroState.totalSeconds = pomodoroState.longBreakDuration * 60;
+                    
+                    // Start immediately (don't pause)
+                    pomodoroState.startTime = millis();
+                    pomodoroState.pausedTime = 0;
+                    pomodoroState.paused = false;
+                } else {
+                    // Normal short break after focus
+                    DEBUG_PRINT("   Focus complete! Starting short break (%d min) [%d/4]\n", pomodoroState.shortBreakDuration, pomodoroState.sessionCount);
+                    pomodoroState.currentSession = PomodoroState::SHORT_BREAK;
+                    pomodoroState.totalSeconds = pomodoroState.shortBreakDuration * 60;
+                    
+                    // Start immediately (don't pause)
+                    pomodoroState.startTime = millis();
+                    pomodoroState.pausedTime = 0;
+                    pomodoroState.paused = false;
+                }
+            } else if (pomodoroState.currentSession == PomodoroState::LONG_BREAK) {
+                // Long break complete - END OF CYCLE, return to IDLE
+                DEBUG_PRINTLN("   Long break complete! Pomodoro cycle finished - returning to IDLE");
+                pomodoroState.active = false;
+                pomodoroState.currentSession = PomodoroState::FOCUS;
+                pomodoroState.totalSeconds = pomodoroState.focusDuration * 60;
+                pomodoroState.sessionCount = 0;  // Reset counter for next cycle
+                pomodoroState.startTime = 0;
                 pomodoroState.pausedTime = 0;
                 pomodoroState.paused = false;
+                currentLEDMode = LED_IDLE;  // Return to IDLE - cycle complete
             } else {
-                // Normal short break after focus
-                DEBUG_PRINT("   Focus complete! Starting short break (%d min) [%d/4]\n", pomodoroState.shortBreakDuration, pomodoroState.sessionCount);
-                pomodoroState.currentSession = PomodoroState::SHORT_BREAK;
-                pomodoroState.totalSeconds = pomodoroState.shortBreakDuration * 60;
+                // Short break complete, return to focus
+                DEBUG_PRINT("   Break complete! Starting focus session (%d min)\n", pomodoroState.focusDuration);
+                pomodoroState.currentSession = PomodoroState::FOCUS;
+                pomodoroState.totalSeconds = pomodoroState.focusDuration * 60;
                 
                 // Start immediately (don't pause)
                 pomodoroState.startTime = millis();
                 pomodoroState.pausedTime = 0;
                 pomodoroState.paused = false;
             }
-        } else if (pomodoroState.currentSession == PomodoroState::LONG_BREAK) {
-            // Long break complete - END OF CYCLE, return to IDLE
-            DEBUG_PRINTLN("   Long break complete! Pomodoro cycle finished - returning to IDLE");
-            pomodoroState.active = false;
-            pomodoroState.currentSession = PomodoroState::FOCUS;
-            pomodoroState.totalSeconds = pomodoroState.focusDuration * 60;
-            pomodoroState.sessionCount = 0;  // Reset counter for next cycle
-            pomodoroState.startTime = 0;
-            pomodoroState.pausedTime = 0;
-            pomodoroState.paused = false;
-            currentLEDMode = LED_IDLE;  // Return to IDLE - cycle complete
-        } else {
-            // Short break complete, return to focus
-            DEBUG_PRINT("   Break complete! Starting focus session (%d min)\n", pomodoroState.focusDuration);
-            pomodoroState.currentSession = PomodoroState::FOCUS;
-            pomodoroState.totalSeconds = pomodoroState.focusDuration * 60;
-            
-            // Start immediately (don't pause)
-            pomodoroState.startTime = millis();
-            pomodoroState.pausedTime = 0;
-            pomodoroState.paused = false;
         }
     }
 }
-}
 
 static void handleAmbientCompletion() {
-// Check for ambient sound streaming completion
-// When stream ends, return to IDLE mode (no looping)
-// Skip this check for meditation mode (has its own completion handler)
-if (isPlayingAmbient && ambientSound.active && !firstAudioChunk && 
-    (millis() - lastAudioChunkTime) > AMBIENT_COMPLETION_TIMEOUT_MS && currentLEDMode != LED_MEDITATION) {
-    Serial.printf("Ambient sound completed: %s - returning to IDLE\n", ambientSound.name);
-    
-    // Return to IDLE mode
-    currentLEDMode = LED_IDLE;
-    isPlayingAmbient = false;
-    isPlayingResponse = false;
-    ambientSound.active = false;
-    ambientSound.name[0] = '\0';
-}
+    // Check for ambient sound streaming completion
+    // When stream ends, return to IDLE mode (no looping)
+    // Skip this check for meditation mode (has its own completion handler)
+    if (isPlayingAmbient && ambientSound.active && !firstAudioChunk && 
+        (millis() - lastAudioChunkTime) > AMBIENT_COMPLETION_TIMEOUT_MS && currentLEDMode != LED_MEDITATION) {
+        Serial.printf("Ambient sound completed: %s - returning to IDLE\n", ambientSound.name);
+        
+        // Return to IDLE mode
+        currentLEDMode = LED_IDLE;
+        isPlayingAmbient = false;
+        isPlayingResponse = false;
+        ambientSound.active = false;
+        ambientSound.name[0] = '\0';
+    }
 }
 
 // ============== MAIN LOOP ==============
@@ -665,16 +665,16 @@ void loop() {
         lastPrint = millis();
     }
     
-    // Update day/night brightness every 60 seconds
-    if (millis() - lastBrightnessCheck > 60000) {
+    // Update day/night brightness periodically
+    if (millis() - lastBrightnessCheck > BRIGHTNESS_CHECK_INTERVAL_MS) {
         updateDayNightBrightness();
         lastBrightnessCheck = millis();
     }
-    
-    // Monitor WiFi signal strength every 30 seconds
-    if (millis() - lastWiFiCheck > 30000) {
+
+    // Monitor WiFi signal strength periodically
+    if (millis() - lastWiFiCheck > WIFI_RSSI_CHECK_INTERVAL_MS) {
         int32_t rssi = WiFi.RSSI();
-        if (rssi < -80) {
+        if (rssi < WIFI_WEAK_RSSI_DBM) {
             Serial.printf("[WiFi] WEAK SIGNAL: %d dBm (may cause disconnects)\n", rssi);
         }
         lastWiFiCheck = millis();
@@ -728,7 +728,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 stopDoc["action"] = "stopAmbient";
                 String stopMsg;
                 serializeJson(stopDoc, stopMsg);
-                webSocket.sendTXT(stopMsg);
+                wsSendMessage(stopMsg);
                 isPlayingResponse = false;
                 isPlayingAmbient = false;
                 ambientSound.active = false;
@@ -844,7 +844,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                     stopDoc["action"] = "stopAmbient";
                     String stopMsg;
                     serializeJson(stopDoc, stopMsg);
-                    webSocket.sendTXT(stopMsg);
+                    wsSendMessage(stopMsg);
                     isPlayingAmbient = false;
                     ambientSound.active = false;
                 }
@@ -888,7 +888,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                     String ambientMsg;
                     serializeJson(ambientDoc, ambientMsg);
                     Serial.printf("Ambient audio request: %s (seq %d)\n", ambientMsg.c_str(), ambientSound.sequence);
-                    webSocket.sendTXT(ambientMsg);
+                    wsSendMessage(ambientMsg);
                 }
             } else if (modeToCheck == LED_AMBIENT) {
                 // Stop ambient sound and enter Radio discovery mode
@@ -913,7 +913,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                     stopDoc["action"] = "stopAmbient";
                     String stopMsg;
                     serializeJson(stopDoc, stopMsg);
-                    webSocket.sendTXT(stopMsg);
+                    wsSendMessage(stopMsg);
                 }
                 isPlayingResponse = false;
                 isPlayingAmbient = false;
@@ -937,7 +937,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                     radioNotifyDoc["source"] = "button";
                     String radioNotifyMsg;
                     serializeJson(radioNotifyDoc, radioNotifyMsg);
-                    webSocket.sendTXT(radioNotifyMsg);
+                    wsSendMessage(radioNotifyMsg);
                 }
 
                 DEBUG_PRINTLN(" Radio discovery mode activated");
@@ -953,7 +953,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                     stopDoc["action"] = "stopAmbient";
                     String stopMsg;
                     serializeJson(stopDoc, stopMsg);
-                    webSocket.sendTXT(stopMsg);
+                    wsSendMessage(stopMsg);
                 }
 
                 // Restore volume if ducked
@@ -1021,7 +1021,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 stopDoc["action"] = "stopAmbient";
                 String stopMsg;
                 serializeJson(stopDoc, stopMsg);
-                webSocket.sendTXT(stopMsg);
+                wsSendMessage(stopMsg);
                 
                 // Set 2-second drain period
                 ambientSound.drainUntil = millis() + 2000;
@@ -1082,7 +1082,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                     String meditationReqMsg;
                     serializeJson(meditationReqDoc, meditationReqMsg);
                     Serial.printf("Meditation starting: %s (seq %d)\n", meditationReqMsg.c_str(), ambientSound.sequence);
-                    webSocket.sendTXT(meditationReqMsg);
+                    wsSendMessage(meditationReqMsg);
                 }
                 meditationState.streaming = true;
                 Serial.println("Meditation breathing and audio started (ROOT chakra)");
@@ -1103,7 +1103,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 stopDoc["action"] = "stopAmbient";
                 String stopMsg;
                 serializeJson(stopDoc, stopMsg);
-                webSocket.sendTXT(stopMsg);
+                wsSendMessage(stopMsg);
                 
                 // Clear audio and LEDs
                 clearAudioAndLEDs();
@@ -1160,7 +1160,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 stopDoc["action"] = "stopAmbient";
                 String stopMsg;
                 serializeJson(stopDoc, stopMsg);
-                webSocket.sendTXT(stopMsg);
+                wsSendMessage(stopMsg);
                 
                 // Set 2-second drain period
                 ambientSound.drainUntil = millis() + 2000;
@@ -1187,7 +1187,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             stopDoc["action"] = "stopAmbient";
             String stopMsg;
             serializeJson(stopDoc, stopMsg);
-            webSocket.sendTXT(stopMsg);
+            wsSendMessage(stopMsg);
             i2s_zero_dma_buffer(I2S_NUM_1);
             
             // If coming from Sea Gooseberry, go to Rain
@@ -1232,7 +1232,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 String ambientCycleMsg;
                 serializeJson(ambientCycleDoc, ambientCycleMsg);
                 Serial.printf("Ambient audio request: %s (seq %d)\n", ambientCycleMsg.c_str(), ambientSound.sequence);
-                webSocket.sendTXT(ambientCycleMsg);
+                wsSendMessage(ambientCycleMsg);
             }
             }
         }
@@ -1320,7 +1320,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             stopDoc["action"] = "stopAmbient";
             String stopMsg;
             serializeJson(stopDoc, stopMsg);
-            webSocket.sendTXT(stopMsg);
+            wsSendMessage(stopMsg);
             
             // Clear I2S hardware buffer
             i2s_zero_dma_buffer(I2S_NUM_1);
@@ -1354,7 +1354,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 reqDoc["sequence"] = ++ambientSound.sequence;
                 String reqMsg;
                 serializeJson(reqDoc, reqMsg);
-                webSocket.sendTXT(reqMsg);
+                wsSendMessage(reqMsg);
                 
                 strlcpy(ambientSound.name, soundName, sizeof(ambientSound.name));
                 ambientSound.active = true;
@@ -1460,7 +1460,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             stopDoc["action"] = "stopAlarm";
             String stopMsg;
             serializeJson(stopDoc, stopMsg);
-            webSocket.sendTXT(stopMsg);
+            wsSendMessage(stopMsg);
             DEBUG_PRINTLN(" Sent stop alarm request to server");
             
             // Stop I2S output - let buffered audio drain naturally
@@ -1593,7 +1593,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         // Stop recording only on timeout (manual stop removed - rely on VAD)
         if (recordingActive && (millis() - recordingStartTime) > MAX_RECORDING_DURATION_MS) {
             recordingActive = false;
-            webSocket.sendTXT("{\"type\":\"recordingStop\"}");
+            wsSendMessage("{\"type\":\"recordingStop\"}");
             Serial.println("[WS] recordingStop sent");
             if (!ambientSound.active) {
                 currentLEDMode = LED_PROCESSING;
@@ -1608,7 +1608,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
     // Auto-stop on silence (VAD)
     if (recordingActive && (millis() - lastVoiceActivityTime) > VAD_SILENCE_MS) {
         recordingActive = false;
-        webSocket.sendTXT("{\"type\":\"recordingStop\"}");
+        wsSendMessage("{\"type\":\"recordingStop\"}");
         Serial.println("[WS] recordingStop sent");
         conversationRecording = false;  // Reset flag for next recording
         // Don't change LED mode if ambient sound is already active
@@ -1757,7 +1757,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                     String meditationReqMsg;
                     serializeJson(meditationReqDoc, meditationReqMsg);
                     Serial.printf("Meditation deferred start: %s (seq %d)\n", meditationReqMsg.c_str(), ambientSound.sequence);
-                    webSocket.sendTXT(meditationReqMsg);
+                    wsSendMessage(meditationReqMsg);
                     meditationState.streaming = true;
                     Serial.println("Meditation breathing and audio started (ROOT chakra, deferred)");
                 }
@@ -2258,7 +2258,7 @@ void audioTask(void * parameter) {
 
                         String stateMsg;
                         serializeJson(stateDoc, stateMsg);
-                        webSocket.sendTXT(stateMsg);
+                        wsSendMessage(stateMsg);
                         Serial.printf("[STATE] recordingStart: %s\n", stateMsg.c_str());
                     }
 
@@ -2352,7 +2352,7 @@ void playZenBell() {
     bellDoc["action"] = "requestZenBell";
     String bellMsg;
     serializeJson(bellDoc, bellMsg);
-    webSocket.sendTXT(bellMsg);
+    wsSendMessage(bellMsg);
     Serial.println("Requesting zen bell from server");
 }
 
@@ -2481,13 +2481,10 @@ void sendAudioChunk(uint8_t* data, size_t length) {
     serializeJson(doc, output);
     
     // Send to WebSocket
-    bool sendResult = webSocket.sendTXT(output);
-    
-    if (sendResult) {
+    if (wsSendMessage(output)) {
         lastWebSocketSendTime = millis();
     } else {
-        webSocketSendFailures++;
-        Serial.printf("[WS ERROR] Send failed! Total failures: %u\n", webSocketSendFailures);
+        webSocketSendFailures++;  // wsSendMessage already logged the failure
     }
 }// Track WebSocket stats
 static uint32_t disconnectCount = 0;
@@ -2539,7 +2536,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     ambientDoc["sequence"] = ambientSound.sequence;
                     String ambientMsg;
                     serializeJson(ambientDoc, ambientMsg);
-                    webSocket.sendTXT(ambientMsg);
+                    wsSendMessage(ambientMsg);
                     
                     isPlayingAmbient = true;
                     firstAudioChunk = true;

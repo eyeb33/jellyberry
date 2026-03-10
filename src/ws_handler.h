@@ -64,3 +64,6 @@ void drainAudioAndSilence(uint32_t windowMs = 500);
 // Central ConvState transition function — sets universally-required entry actions.
 // Callers still set LEDs and other context-specific flags after calling this.
 void transitionConvState(ConvState newState);
+
+// Safe WebSocket send wrapper — logs on failure, returns sendTXT result.
+bool wsSendMessage(const String& msg);

@@ -51,7 +51,8 @@ bool responseInterrupted = false; // Flag to ignore audio after interrupt
 bool shutdownSoundPlayed = false; // Flag to prevent repeated shutdown sounds during reconnection
 uint32_t recordingStartTime = 0;
 uint32_t lastVoiceActivityTime = 0;
-volatile uint32_t lastAudioChunkTime = 0; // Track when we last received audio (volatile: written by audioTask + onWebSocketEvent, read by loop)
+volatile uint32_t lastAudioChunkTime = 0;      // Track when we last received ANY audio chunk
+volatile uint32_t lastGeminiAudioTime = 0;     // Track when we last received a Gemini (non-ambient) chunk — used for drain detection during radio overlap
 ConvState convState = ConvState::IDLE;   // Main-loop UX state machine (not cross-task)
 uint32_t waitingEnteredAt = 0;           // When we entered WAITING; drives thinking-animation and 60s timeout
 uint32_t lastWebSocketSendTime = 0; // Track last successful send
@@ -1653,6 +1654,12 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             currentLEDMode = LED_TIDE;
             tideState.displayStartTime = millis();
             DEBUG_PRINTLN("  Timeout - returning to TIDE display");
+        } else if (radioState.active) {
+            if (radioState.streaming && volumeMultiplier < radioState.savedVolume) {
+                volumeMultiplier = radioState.savedVolume;  // Restore ducked volume on timeout
+            }
+            currentLEDMode = LED_RADIO;
+            DEBUG_PRINTLN("  Timeout - returning to RADIO");
         } else {
             currentLEDMode = LED_IDLE;
             DEBUG_PRINTLN("  Timeout - returning to IDLE");
@@ -1671,6 +1678,11 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             currentLEDMode = LED_POMODORO;
         } else if (timerState.active) {
             currentLEDMode = LED_TIMER;
+        } else if (radioState.active) {
+            if (radioState.streaming && volumeMultiplier < radioState.savedVolume) {
+                volumeMultiplier = radioState.savedVolume;  // Restore ducked volume on timeout
+            }
+            currentLEDMode = LED_RADIO;
         } else {
             currentLEDMode = LED_IDLE;
         }
@@ -1679,16 +1691,20 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
     // Check for audio playback completion
     // Timeout only if BOTH: (1) no new packets for 2s AND (2) queue nearly drained
     // This prevents cutting off audio that's still queued but TCP-delayed
-    if (isPlayingResponse && !isPlayingAmbient) {
+    if (isPlayingResponse) {
         // Transition to PLAYING as soon as audio is confirmed active (cancels thinking animation)
         if (convState == ConvState::WAITING) {
             transitionConvState(ConvState::PLAYING);
         }
         uint32_t queueDepth = uxQueueMessagesWaiting(audioOutputQueue);
-        bool noNewPackets = (millis() - lastAudioChunkTime) > 2000;
-        bool queueDrained = queueDepth < 3;  // < 120ms of audio remaining
+        // Mixed mode (radio + Gemini): radio keeps lastAudioChunkTime and queue populated,
+        // so use Gemini-specific timer and skip queue-depth check.
+        bool noNewPackets = isPlayingAmbient
+            ? (millis() - lastGeminiAudioTime) > 3000   // mixed: Gemini-only timer
+            : (millis() - lastAudioChunkTime)  > 2000;  // solo: original timer
+        bool queueDrained = !isPlayingAmbient && queueDepth < 3;  // skip in mixed mode
         
-        if (noNewPackets && queueDrained) {
+        if (noNewPackets && (queueDrained || isPlayingAmbient)) {
             isPlayingResponse = false;
             Serial.printf("[DRAIN] Audio done: queueDepth=%u, turnComplete=%d, convState=%d, waitAge=%dms\n",
                          queueDepth, turnComplete, (int)convState,
@@ -1810,6 +1826,9 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 tideState.displayStartTime = millis();
                 DEBUG_PRINT(" Audio playback complete - switching to TIDE display (state=%s, level=%.2f)\n", 
                              tideState.state, tideState.waterLevel);
+            } else if (radioState.active) {
+                currentLEDMode = LED_RADIO;
+                DEBUG_PRINTLN(" Audio playback complete - returning to RADIO (waiting for turnComplete)");
             } else if (isAmbientVUMode) {
                 currentLEDMode = LED_AMBIENT_VU;
                 DEBUG_PRINTLN(" Audio playback complete - returning to AMBIENT VU mode");
@@ -1871,10 +1890,36 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                     shouldOpenConversation = true;
                 }
             } else {
-                Serial.printf("turnComplete in WAITING state (LED=%d, waitAge=%dms) - opening conversation window\n",
-                             currentLEDMode,
-                             waitingEnteredAt > 0 ? (int)(millis() - waitingEnteredAt) : -1);
-                shouldOpenConversation = true;
+                // Same persistent-mode guard as the PLAYING path — prevents spurious
+                // conversation windows popping up over radio/meditation/lamp.
+                bool isPersistentMode = (currentLEDMode == LED_MEDITATION ||
+                                         currentLEDMode == LED_AMBIENT   ||
+                                         currentLEDMode == LED_RADIO     ||
+                                         currentLEDMode == LED_LAMP      ||
+                                         currentLEDMode == LED_POMODORO  ||
+                                         radioState.active              ||
+                                         meditationState.active         ||
+                                         lampState.active);
+                if (isPersistentMode) {
+                    Serial.printf("turnComplete in WAITING state - persistent mode %d, skipping window\n", currentLEDMode);
+                    transitionConvState(ConvState::IDLE);
+                    if (radioState.active && radioState.streaming && volumeMultiplier < radioState.savedVolume) {
+                        volumeMultiplier = radioState.savedVolume;
+                        Serial.printf("Radio: volume restored to %.0f%% after Gemini response\n", volumeMultiplier * 100);
+                    }
+                    if (currentLEDMode == LED_AUDIO_REACTIVE || currentLEDMode == LED_RECORDING || currentLEDMode == LED_PROCESSING) {
+                        if (radioState.active)           { currentLEDMode = LED_RADIO; }
+                        else if (meditationState.active) { currentLEDMode = LED_MEDITATION; }
+                        else if (pomodoroState.active)   { currentLEDMode = LED_POMODORO; }
+                        else if (ambientSound.active)    { currentLEDMode = LED_AMBIENT; }
+                        else if (lampState.active)       { currentLEDMode = LED_LAMP; }
+                    }
+                } else {
+                    Serial.printf("turnComplete in WAITING state (LED=%d, waitAge=%dms) - opening conversation window\n",
+                                 currentLEDMode,
+                                 waitingEnteredAt > 0 ? (int)(millis() - waitingEnteredAt) : -1);
+                    shouldOpenConversation = true;
+                }
             }
         } else if (convState == ConvState::PLAYING) {
             // turnComplete arrived after audio already drained (device stayed in PLAYING).
@@ -1882,8 +1927,10 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             LEDMode effectiveMode = currentLEDMode;
             bool isPersistentMode = (effectiveMode == LED_MEDITATION ||
                                      effectiveMode == LED_AMBIENT   ||
+                                     effectiveMode == LED_RADIO     ||
                                      effectiveMode == LED_LAMP      ||
                                      effectiveMode == LED_POMODORO  ||
+                                     radioState.active              ||  // Radio discovery mode (LED may be PROCESSING)
                                      meditationState.active         ||
                                      lampState.active);
             if (!isPersistentMode) {
@@ -1892,11 +1939,17 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             } else {
                 Serial.printf("turnComplete in PLAYING state - persistent mode %d, skipping window\n", effectiveMode);
                 transitionConvState(ConvState::IDLE);
+                // Radio: restore volume after Gemini verbal response finishes
+                if (radioState.active && radioState.streaming && volumeMultiplier < radioState.savedVolume) {
+                    volumeMultiplier = radioState.savedVolume;
+                    Serial.printf("Radio: volume restored to %.0f%% after Gemini response\n", volumeMultiplier * 100);
+                }
                 if (currentLEDMode == LED_AUDIO_REACTIVE || currentLEDMode == LED_RECORDING || currentLEDMode == LED_PROCESSING) {
-                    if (meditationState.active)    { currentLEDMode = LED_MEDITATION; }
-                    else if (pomodoroState.active) { currentLEDMode = LED_POMODORO; }
-                    else if (ambientSound.active)  { currentLEDMode = LED_AMBIENT; }
-                    else if (lampState.active)     { currentLEDMode = LED_LAMP; }
+                    if (radioState.active)         { currentLEDMode = LED_RADIO; }
+                    else if (meditationState.active) { currentLEDMode = LED_MEDITATION; }
+                    else if (pomodoroState.active)  { currentLEDMode = LED_POMODORO; }
+                    else if (ambientSound.active)   { currentLEDMode = LED_AMBIENT; }
+                    else if (lampState.active)      { currentLEDMode = LED_LAMP; }
                 }
             }
         }
@@ -1988,6 +2041,9 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 moonState.active = false;
                 currentLEDMode = LED_IDLE;
                 Serial.println("Returning to IDLE (moon already shown)");
+            } else if (radioState.active) {
+                currentLEDMode = LED_RADIO;
+                Serial.println("Returning to RADIO");
             } else {
                 currentLEDMode = LED_IDLE;
                 Serial.println("Returning to IDLE");
@@ -2733,6 +2789,9 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 
                 // Update last audio chunk time
                 lastAudioChunkTime = millis();
+                if (!isAmbientPacket) {
+                    lastGeminiAudioTime = millis();  // Gemini-specific timer for drain detection during radio overlap
+                }
                 
                 // Debug first chunk
                 if (firstAudioChunk) {

@@ -53,5 +53,14 @@ void playVolumeChime();
 void updateDayNightBrightness();
 void playShutdownSound();
 
-// ── Function declaration ──
+// ── Function declarations ──
 void handleWebSocketMessage(uint8_t* payload, size_t length);
+
+// Drain audioOutputQueue, zero I2S DMA, and set a drain window.
+// Call after sending stopAmbient to prevent audio tail on voice-commanded stops.
+// windowMs: how long to suppress incoming audio (default 500ms, use 2000ms after radio).
+void drainAudioAndSilence(uint32_t windowMs = 500);
+
+// Central ConvState transition function — sets universally-required entry actions.
+// Callers still set LEDs and other context-specific flags after calling this.
+void transitionConvState(ConvState newState);

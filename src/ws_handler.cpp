@@ -1,5 +1,38 @@
 #include "ws_handler.h"
 
+// ── Shared audio-drain helper ────────────────────────────────────────────────
+// Drain buffered audio, zero I2S DMA, and set a suppression window.
+// Prevents the ~1.2s audio tail that occurs when voice commands stop a stream
+// without touching the local audio queue or DMA buffer.
+void drainAudioAndSilence(uint32_t windowMs) {
+    AudioChunk dummy;
+    while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {}
+    i2s_zero_dma_buffer(I2S_NUM_1);
+    i2s_zero_dma_buffer(I2S_NUM_1);
+    ambientSound.drainUntil = millis() + windowMs;
+}
+
+// ── Central ConvState transitions ────────────────────────────────────────────
+// Owns entry actions that must fire on EVERY transition to each state.
+// Callers set LEDs and other context-specific flags after calling this.
+void transitionConvState(ConvState newState) {
+    convState = newState;
+    switch (newState) {
+        case ConvState::RECORDING:
+            waitingEnteredAt = 0;
+            turnComplete = false;  // prevent stale-flag window open before first mic DMA chunk
+            break;
+        case ConvState::WAITING:
+            waitingEnteredAt = millis();
+            break;
+        case ConvState::IDLE:
+            waitingEnteredAt = 0;  // prevent stale value causing spurious timeout guards
+            break;
+        default:
+            break;  // PLAYING, WINDOW: no universally-required entry actions
+    }
+}
+
 void handleWebSocketMessage(uint8_t* payload, size_t length) {
  JsonDocument doc;
  DeserializationError error = deserializeJson(doc, payload, length);
@@ -22,7 +55,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  if (doc["type"].is<const char*>() && doc["type"] == "reconnecting") {
  Serial.println("Gemini reconnecting after idle — showing connecting animation");
  currentLEDMode = LED_PROCESSING;
- convState = ConvState::IDLE;
+ transitionConvState(ConvState::IDLE);
  return;
  }
 
@@ -30,7 +63,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  // Restore the mode that was active before reconnection.
  if (doc["type"].is<const char*>() && doc["type"] == "reconnectComplete") {
  Serial.println("Gemini reconnect complete — ready for interaction");
- convState = ConvState::IDLE;
+ transitionConvState(ConvState::IDLE);
  // Restore active mode rather than unconditionally going to LED_IDLE
  if (radioState.active) {
  currentLEDMode = LED_RADIO;
@@ -52,8 +85,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  // Prime state machine for the incoming boot greeting: treat it like a pending Gemini response.
  // Without this, convState stays IDLE and the auto-transition block (which guards on WAITING)
  // never opens the conversation window after the greeting finishes.
- convState = ConvState::WAITING;
- waitingEnteredAt = millis();
+ transitionConvState(ConvState::WAITING);
  return;
  }
  
@@ -238,8 +270,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  // Forcing it here caused the LED to switch before audio arrived (visual glitch)
  // and the 300ms delay was blocking the WebSocket task.
  // Clear waiting guard so the thinking animation doesn't fire for the timer-expiry response
- convState = ConvState::IDLE;
- waitingEnteredAt = 0;
+ transitionConvState(ConvState::IDLE);
  Serial.println("Timer expired - waiting for Gemini audio notification...");
  return;
  }
@@ -823,6 +854,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  ambientSound.name = "";
  ambientSound.sequence++;
 
+ drainAudioAndSilence(2000); // radio stream may have queued chunks; 2s window to flush tail
  currentLEDMode = LED_IDLE;
  return;
  }
@@ -921,6 +953,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  radioState.streamUrl = "";
  }
 
+ drainAudioAndSilence(500);
  currentLEDMode = LED_IDLE;
  return;
  }

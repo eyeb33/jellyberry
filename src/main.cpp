@@ -679,6 +679,19 @@ void loop() {
             } else if (modeToCheck == LED_AMBIENT_VU) {
                 ambientVUMode = false;
                 
+                // Stop any in-flight ambient stream before entering a no-audio mode.
+                // Defensive: AMBIENT_VU normally has no audio, but a stale stream could
+                // still be pumping if VU was entered without explicitly stopping it.
+                if (isPlayingAmbient) {
+                    JsonDocument stopDoc;
+                    stopDoc["action"] = "stopAmbient";
+                    String stopMsg;
+                    serializeJson(stopDoc, stopMsg);
+                    webSocket.sendTXT(stopMsg);
+                    isPlayingAmbient = false;
+                    ambientSound.active = false;
+                }
+                
                 // Switch to Sea Gooseberry jellyfish mode (no audio needed)
                 DEBUG_PRINTLN(" VU  Sea Gooseberry mode");
                 seaGooseberry.begin();  // Initialize visualizer
@@ -965,6 +978,13 @@ void loop() {
                 lampState.active = false;
                 lampState.fullyLit = false;
                 
+                // Clear lamp LEDs immediately to prevent a one-frame colour flash
+                if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
+                    fill_solid(leds, NUM_LEDS, CRGB::Black);
+                    FastLED.show();
+                    xSemaphoreGive(ledMutex);
+                }
+                
                 // Initialize Eye Animation visualizer
                 eyeAnimation.begin();
                 
@@ -1248,8 +1268,7 @@ void loop() {
             recordingActive = true;
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
-            convState = ConvState::RECORDING;
-            waitingEnteredAt = 0;
+            transitionConvState(ConvState::RECORDING);
             currentLEDMode = LED_RECORDING;
             DEBUG_PRINT(" Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
         }
@@ -1364,8 +1383,7 @@ void loop() {
             recordingActive = true;
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
-            convState = ConvState::RECORDING;
-            waitingEnteredAt = 0;
+            transitionConvState(ConvState::RECORDING);
             currentLEDMode = LED_RECORDING;
             DEBUG_PRINT(" Radio recording started...\n");
         }
@@ -1409,8 +1427,7 @@ void loop() {
             recordingActive = true;
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
-            convState = ConvState::RECORDING;
-            waitingEnteredAt = 0;
+            transitionConvState(ConvState::RECORDING);
             currentLEDMode = LED_RECORDING;
             DEBUG_PRINT(" Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
             }  // End of shouldStartRecording block
@@ -1423,8 +1440,7 @@ void loop() {
             Serial.println("[WS] recordingStop sent");
             if (!ambientSound.active) {
                 currentLEDMode = LED_PROCESSING;
-                convState = ConvState::WAITING;
-                waitingEnteredAt = millis();
+                transitionConvState(ConvState::WAITING);
             }
             DEBUG_PRINT("  Recording stopped - Duration: %dms (max duration reached)\n", millis() - recordingStartTime);
         }
@@ -1441,8 +1457,7 @@ void loop() {
         // Don't change LED mode if ambient sound is already active
         if (!ambientSound.active) {
             currentLEDMode = LED_PROCESSING;
-            convState = ConvState::WAITING;
-            waitingEnteredAt = millis();
+            transitionConvState(ConvState::WAITING);
         }
         DEBUG_PRINTLN("  Recording stopped - Silence detected");
     }
@@ -1462,8 +1477,7 @@ void loop() {
     if (convState == ConvState::WAITING &&
         (millis() - waitingEnteredAt) > 60000) {
         Serial.printf("  Gemini response timeout after 60s (LED=%d)\n", currentLEDMode);
-        convState = ConvState::IDLE;
-        waitingEnteredAt = 0;
+        transitionConvState(ConvState::IDLE);
         
         // Return to visualizations if active, otherwise IDLE
         if (pomodoroState.active) {
@@ -1493,8 +1507,7 @@ void loop() {
         waitingEnteredAt > 0 &&
         (millis() - waitingEnteredAt) > 60000) {
         Serial.printf("  PLAYING timeout - turnComplete never arrived after 60s\n");
-        convState = ConvState::IDLE;
-        waitingEnteredAt = 0;
+        transitionConvState(ConvState::IDLE);
         if (pomodoroState.active) {
             currentLEDMode = LED_POMODORO;
         } else if (timerState.active) {
@@ -1510,7 +1523,7 @@ void loop() {
     if (isPlayingResponse && !isPlayingAmbient) {
         // Transition to PLAYING as soon as audio is confirmed active (cancels thinking animation)
         if (convState == ConvState::WAITING) {
-            convState = ConvState::PLAYING;
+            transitionConvState(ConvState::PLAYING);
         }
         uint32_t queueDepth = uxQueueMessagesWaiting(audioOutputQueue);
         bool noNewPackets = (millis() - lastAudioChunkTime) > 2000;
@@ -1538,20 +1551,18 @@ void loop() {
                 // The auto-transition block (convState==WAITING + tideState.active + 10s timer)
                 // handles the tide→window transition correctly.
                 if (tideState.active) {
-                    convState = ConvState::WAITING;
-                    waitingEnteredAt = millis();
+                    transitionConvState(ConvState::WAITING);
                     currentLEDMode = LED_TIDE;
                     tideState.displayStartTime = millis();
                     Serial.println("Tide active - displaying 10s then opening conversation window");
                 } else if (moonState.active) {
-                    convState = ConvState::WAITING;
-                    waitingEnteredAt = millis();
+                    transitionConvState(ConvState::WAITING);
                     currentLEDMode = LED_MOON;
                     moonState.displayStartTime = millis();
                     Serial.println("Moon active - displaying 10s then opening conversation window");
                 } else {
                 // Open 10-second conversation window
-                convState = ConvState::WINDOW;
+                transitionConvState(ConvState::WINDOW);
                 conversationMode = true;
                 conversationWindowStart = millis();
                 conversationVADDetected = false;  // Flush any residual VAD from speaker resonance
@@ -1560,7 +1571,7 @@ void loop() {
                 }
             } else {
                 Serial.printf("Skipping conversation window - entering persistent mode %d\n", effectiveMode);
-                convState = ConvState::IDLE;  // Persistent mode: no follow-up window
+                transitionConvState(ConvState::IDLE);  // Persistent mode: no follow-up window
 
                 // Radio: restore volume after Gemini's verbal response finishes
                 if (radioState.active && radioState.streaming && volumeMultiplier < radioState.savedVolume) {
@@ -1841,7 +1852,7 @@ void loop() {
                 shouldOpenConversation = true;
             } else {
                 Serial.printf("turnComplete in PLAYING state - persistent mode %d, skipping window\n", effectiveMode);
-                convState = ConvState::IDLE;
+                transitionConvState(ConvState::IDLE);
                 if (currentLEDMode == LED_AUDIO_REACTIVE || currentLEDMode == LED_RECORDING || currentLEDMode == LED_PROCESSING) {
                     if (meditationState.active)    { currentLEDMode = LED_MEDITATION; }
                     else if (pomodoroState.active) { currentLEDMode = LED_POMODORO; }
@@ -1856,7 +1867,7 @@ void loop() {
             Serial.printf("Opening conversation window: LED=%d, waitAge=%dms\n",
                          currentLEDMode,
                          waitingEnteredAt > 0 ? (int)(millis() - waitingEnteredAt) : -1);
-            convState = ConvState::WINDOW;
+            transitionConvState(ConvState::WINDOW);
             conversationMode = true;
             conversationWindowStart = millis();
             conversationVADDetected = false;  // Flush any residual VAD from speaker resonance
@@ -1905,8 +1916,7 @@ void loop() {
                 recordingActive = true;
                 recordingStartTime = millis();
                 lastVoiceActivityTime = millis();
-                convState = ConvState::RECORDING;
-                waitingEnteredAt = 0;
+                transitionConvState(ConvState::RECORDING);
                 currentLEDMode = LED_RECORDING;
                 lastDebounceTime = millis();
                 
@@ -1916,7 +1926,7 @@ void loop() {
             // Window expired with no voice - return to visualizations or idle
             Serial.println("Conversation window expired");
             conversationMode = false;
-            convState = ConvState::IDLE;
+            transitionConvState(ConvState::IDLE);
             
             // Priority: Pomodoro > Meditation > Timer > Moon > Tide > Idle
             if (pomodoroState.active) {

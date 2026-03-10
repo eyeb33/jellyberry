@@ -1,4 +1,4 @@
-// deno-lint-ignore no-import-prefix
+﻿// deno-lint-ignore no-import-prefix
 import "https://deno.land/std@0.204.0/dotenv/load.ts";
 // deno-lint-ignore-file no-explicit-any
 
@@ -842,6 +842,448 @@ function sendSunriseSunsetData(connection: ClientConnection) {
 console.log(" Fetching initial weather data...");
 fetchWeatherData().catch(err => console.error(" Failed to fetch initial weather data:", err));
 
+// â”€â”€ Handler function types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Shared parameter shapes for all three dispatch tables.
+type FuncArgs = Record<string, unknown>;
+type ToolResult = Record<string, unknown>;
+type ToolHandler   = (args: FuncArgs,                 conn: ClientConnection) => Promise<ToolResult>;
+type ActionHandler = (data: Record<string, unknown>,  conn: ClientConnection) => Promise<void>;
+type TypeHandler   = (data: Record<string, unknown>,  conn: ClientConnection) => Promise<void>;
+
+// â”€â”€ Gemini tool handlers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Each handler receives (funcArgs, connection) and returns the functionResult.
+// Named functions make each tool independently navigable and testable.
+
+async function handleGetTideStatus(_args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  const result = await getTideStatus();
+  if (result.success && conn.userSpokeThisTurn) {
+    conn.socket.send(JSON.stringify({ type: "tideData", state: result.state, waterLevel: result.waterLevel, nextChangeMinutes: result.nextChangeMinutes }));
+    console.log(`[${conn.deviceId}] Sent tide data to ESP32: ${result.state}, level: ${(result.waterLevel as number).toFixed(2)}`);
+  } else if (result.success) {
+    console.log(`[${conn.deviceId}] Tide data suppressed (proactive call â€” user did not ask about tides this turn)`);
+  }
+  return result;
+}
+
+async function handleGetCurrentTime(_args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  const result = getCurrentTime();
+  console.log(`[${conn.deviceId}] Current time: ${result.time} on ${result.date}`);
+  return result;
+}
+
+async function handleGetDeviceState(_args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  console.log(`[${conn.deviceId}] Getting device state`);
+  const statePromise = new Promise<any>((resolve) => {
+    const timeout = setTimeout(() => { console.error(`[${conn.deviceId}] Device state timeout (5s)`); resolve({ success: false, error: "Device did not respond in time" }); }, 5000);
+    conn.deviceStateResolver = (state: any) => { clearTimeout(timeout); resolve(state); };
+  });
+  conn.socket.send(JSON.stringify({ type: "deviceStateRequest" }));
+  const rawState = await statePromise;
+  const serverTimer = deviceTimers.get(conn.deviceId);
+  const timerOverlay = serverTimer
+    ? { active: true, secondsRemaining: Math.max(0, Math.round((serverTimer.endTime - Date.now()) / 1000)) }
+    : { active: false };
+  const result = { success: true, ...rawState, timer: timerOverlay };
+  console.log(`[${conn.deviceId}] Device state:`, JSON.stringify(result).substring(0, 300));
+  return result;
+}
+
+async function handleSetAlarm(args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  const result = setAlarm(conn.deviceId, (args.alarm_time || "") as string);
+  if (result.success) {
+    conn.socket.send(JSON.stringify({ type: "setAlarm", alarmID: result.alarmID, triggerTime: result.triggerTime }));
+    console.log(`[${conn.deviceId}] Sent alarm to ESP32: ID=${result.alarmID}, time=${result.formattedTime}`);
+  }
+  return result;
+}
+
+async function handleCancelAlarm(args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  const which = (args.which || "next") as string;
+  const result = cancelAlarm(conn.deviceId, which);
+  if (result.success) { conn.socket.send(JSON.stringify({ type: "cancelAlarm", which })); console.log(`[${conn.deviceId}] Sent alarm cancel request: ${which}`); }
+  return result;
+}
+
+async function handleSetTimer(args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  const result = setTimer(conn.deviceId, (args.duration_minutes || 0) as number);
+  if (result.success) { conn.socket.send(JSON.stringify({ type: "timerSet", durationSeconds: result.durationSeconds })); }
+  return result;
+}
+
+async function handleCancelTimer(_args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  const result = cancelTimer(conn.deviceId);
+  if (result.success) { conn.socket.send(JSON.stringify({ type: "timerCancelled" })); }
+  return result;
+}
+
+async function handleGetWeatherForecast(args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  const timeframe = (args.timeframe || "current") as string;
+  if (!weatherDataCache) { await fetchWeatherData(); }
+  const result = getWeather(conn.deviceId, timeframe);
+  console.log(`[${conn.deviceId}] Weather (${timeframe}): ${result.summary || result.error}`);
+  return result;
+}
+
+async function handleGetMoonPhase(_args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  const result = getMoonPhase();
+  console.log(`[${conn.deviceId}] Moon phase: ${result.phaseName} ${result.phaseEmoji} (${result.illumination}% illuminated)`);
+  if (result.success && conn.userSpokeThisTurn) {
+    conn.socket.send(JSON.stringify({ type: "moonData", phaseName: result.phaseName, illumination: result.illumination, moonAge: result.moonAge }));
+  } else if (result.success) {
+    console.log(`[${conn.deviceId}] Moon data suppressed (proactive call â€” user did not ask about the moon this turn)`);
+  }
+  return result;
+}
+
+async function handleControlPomodoro(args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  const action = (args.action || "start") as string;
+  console.log(`[${conn.deviceId}] control_pomodoro: ${action}`);
+  if (action === "start") {
+    const focusMinutes = (args.focus_minutes || 25) as number;
+    const shortBreakMinutes = (args.short_break_minutes || 5) as number;
+    const longBreakMinutes = (args.long_break_minutes || 15) as number;
+    console.log(`[${conn.deviceId}] Starting Pomodoro: ${focusMinutes}min focus, ${shortBreakMinutes}min short break, ${longBreakMinutes}min long break`);
+    conn.socket.send(JSON.stringify({ type: "pomodoroStart", focusMinutes, shortBreakMinutes, longBreakMinutes }));
+    const isCustom = args.focus_minutes || args.short_break_minutes || args.long_break_minutes;
+    return { success: true, message: isCustom ? `Pomodoro started: ${focusMinutes}-min focus, ${shortBreakMinutes}-min short break, ${longBreakMinutes}-min long break` : "Pomodoro started with standard durations: 25-min focus, 5-min short break, 15-min long break" };
+  }
+  // Sub-dispatch for pause/resume/stop/skip
+  const pomodoroActions: Record<string, () => ToolResult> = {
+    pause:  () => { conn.socket.send(JSON.stringify({ type: "pomodoroPause" }));  return { success: true, message: "Pomodoro timer paused" }; },
+    resume: () => { conn.socket.send(JSON.stringify({ type: "pomodoroResume" })); return { success: true, message: "Pomodoro timer resumed" }; },
+    stop:   () => { conn.socket.send(JSON.stringify({ type: "pomodoroStop" }));   return { success: true, message: "Pomodoro session ended" }; },
+    skip:   () => { conn.socket.send(JSON.stringify({ type: "pomodoroSkip" }));   return { success: true, message: "Skipped to next Pomodoro session" }; },
+  };
+  return (pomodoroActions[action] ?? (() => ({ success: false, error: `Unknown Pomodoro action: ${action}` })))();
+}
+
+async function handleControlAmbient(args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  const action = (args.action || "start") as string;
+  const sound = ((args.sound || "rain") as string).toLowerCase();
+  console.log(`[${conn.deviceId}] control_ambient: ${action}${action === "start" ? ` (${sound})` : ""}`);
+  if (action === "start") { conn.pendingModeMessage = { type: "ambientStart", sound }; return { success: true, message: `Playing ${sound} ambient sound` }; }
+  conn.pendingModeMessage = { type: "switchToIdle" };
+  return { success: true, message: "Ambient sound stopped" };
+}
+
+async function handleControlLamp(args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  const action = (args.action || "start") as string;
+  const color = ((args.color || "white") as string).toLowerCase();
+  console.log(`[${conn.deviceId}] control_lamp: ${action}${action === "start" ? ` (${color})` : ""}`);
+  if (action === "start") { conn.pendingModeMessage = { type: "lampStart", color }; return { success: true, message: `Lamp turned on (${color})` }; }
+  conn.pendingModeMessage = { type: "switchToIdle" };
+  return { success: true, message: "Lamp turned off" };
+}
+
+async function handleControlMeditation(args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  const action = (args.action || "start") as string;
+  console.log(`[${conn.deviceId}] control_meditation: ${action}`);
+  if (action === "start") { conn.pendingModeMessage = { type: "meditationStart" }; return { success: true, message: "Meditation session started" }; }
+  conn.pendingModeMessage = { type: "switchToIdle" };
+  return { success: true, message: "Meditation session stopped" };
+}
+
+async function handleSearchRadioStations(args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  const query = (args.query || "") as string;
+  const genre = (args.genre || "") as string;
+  const limit = Math.min(((args.limit as number) || 5), 8);
+  console.log(`[${conn.deviceId}] search_radio_stations: query="${query}" genre="${genre}" limit=${limit}`);
+  try {
+    const stations = await searchRadioStations(query, genre, limit);
+    return { success: true, stations };
+  } catch (err) {
+    console.error(`[${conn.deviceId}] Radio search failed:`, err);
+    return { success: false, error: "Radio search failed. Please try again." };
+  }
+}
+
+async function handlePlayRadio(args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  const stationId = (args.station_id || "") as string;
+  const stationName = (args.station_name || "Radio") as string;
+  console.log(`[${conn.deviceId}] play_radio: ${stationName} (${stationId})`);
+  const station = radioStationCache.get(stationId);
+  if (!station) { return { success: false, error: "Station not found. Please search for stations first." }; }
+  const isHLS = station.url.includes(".m3u8");
+  conn.pendingModeMessage = { type: "radioStart", stationName, streamUrl: station.url, isHLS };
+  return { success: true, message: `Starting ${stationName}${isHLS ? " (may take a moment to load)" : ""}` };
+}
+
+async function handleStopRadio(_args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  console.log(`[${conn.deviceId}] stop_radio`);
+  conn.pendingModeMessage = { type: "switchToIdle" };
+  return { success: true, message: "Radio stopped" };
+}
+
+async function handleSetVolumeLevel(args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  const level = Math.max(1, Math.min(10, ((args.level as number) || 5)));
+  console.log(`[${conn.deviceId}] set_volume_level: ${level}`);
+  conn.socket.send(JSON.stringify({ type: "functionCall", name: "set_volume_level", args: { level } }));
+  return { success: true, message: `Volume set to level ${level}` };
+}
+
+// Maps Gemini funcName â†’ handler. Unknown tools return { success: false, error: ... }.
+const toolHandlers: Record<string, ToolHandler> = {
+  get_tide_status:       handleGetTideStatus,
+  get_current_time:      handleGetCurrentTime,
+  get_device_state:      handleGetDeviceState,
+  set_alarm:             handleSetAlarm,
+  cancel_alarm:          handleCancelAlarm,
+  set_timer:             handleSetTimer,
+  cancel_timer:          handleCancelTimer,
+  get_weather_forecast:  handleGetWeatherForecast,
+  get_moon_phase:        handleGetMoonPhase,
+  control_pomodoro:      handleControlPomodoro,
+  control_ambient:       handleControlAmbient,
+  control_lamp:          handleControlLamp,
+  control_meditation:    handleControlMeditation,
+  search_radio_stations: handleSearchRadioStations,
+  play_radio:            handlePlayRadio,
+  stop_radio:            handleStopRadio,
+  set_volume_level:      handleSetVolumeLevel,
+};
+
+// â”€â”€ ESP32 action handlers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Handle binary streaming operations triggered by data.action from the device.
+
+async function handleActionRequestAlarm(_data: Record<string, unknown>, conn: ClientConnection): Promise<void> {
+  console.log(`[${conn.deviceId}] Alarm sound requested`);
+  if (conn.alarmStreamCancel) { conn.alarmStreamCancel(); console.log(`[${conn.deviceId}] Cancelled previous alarm stream`); }
+  try {
+    let cancelled = false;
+    conn.alarmStreamCancel = () => { cancelled = true; console.log(`[${conn.deviceId}] Alarm stream cancelled`); };
+    const audioData = await Deno.readFile(`./audio/alarm_sound.pcm`);
+    console.log(`[${conn.deviceId}] Loaded alarm_sound.pcm (${audioData.byteLength} bytes) - looping until dismissed...`);
+    const CHUNK_SIZE = 1024, CHUNKS_PER_BATCH = 5, BATCH_DELAY_MS = 100;
+    while (!cancelled) {
+      for (let offset = 0; offset < audioData.byteLength && !cancelled; offset += CHUNK_SIZE) {
+        conn.socket.send(audioData.slice(offset, offset + CHUNK_SIZE));
+        if ((offset / CHUNK_SIZE) % CHUNKS_PER_BATCH === 0) { await new Promise(r => setTimeout(r, BATCH_DELAY_MS)); }
+      }
+    }
+    console.log(`[${conn.deviceId}] Alarm stream stopped`);
+  } catch (err) { console.error(`[${conn.deviceId}] Failed to load alarm sound:`, err); }
+}
+
+async function handleActionStopAlarm(_data: Record<string, unknown>, conn: ClientConnection): Promise<void> {
+  console.log(`[${conn.deviceId}] Stop alarm requested`);
+  if (conn.alarmStreamCancel) { conn.alarmStreamCancel(); conn.alarmStreamCancel = null; }
+}
+
+async function handleActionRequestZenBell(_data: Record<string, unknown>, conn: ClientConnection): Promise<void> {
+  console.log(`[${conn.deviceId}] Zen bell requested`);
+  if (conn.zenBellCancel) { conn.zenBellCancel(); conn.zenBellCancel = null; }
+  try {
+    let cancelled = false;
+    conn.zenBellCancel = () => { cancelled = true; };
+    const audioData = await Deno.readFile(`./audio/zen_bell.pcm`);
+    console.log(`[${conn.deviceId}] Loaded zen_bell.pcm (${audioData.byteLength} bytes) - sending...`);
+    const CHUNK_SIZE = 1024, CHUNKS_PER_BATCH = 5, BATCH_DELAY_MS = 100;
+    for (let offset = 0; offset < audioData.byteLength && !cancelled; offset += CHUNK_SIZE) {
+      conn.socket.send(audioData.slice(offset, offset + CHUNK_SIZE));
+      if ((offset / CHUNK_SIZE) % CHUNKS_PER_BATCH === 0) { await new Promise(r => setTimeout(r, BATCH_DELAY_MS)); }
+    }
+    console.log(cancelled ? `[${conn.deviceId}] Zen bell cancelled` : `[${conn.deviceId}] Zen bell sent (${audioData.byteLength} bytes)`);
+    conn.zenBellCancel = null;
+  } catch (err) { console.error(`[${conn.deviceId}] Failed to load zen bell:`, err); conn.zenBellCancel = null; }
+}
+
+async function handleActionRequestAmbient(data: Record<string, unknown>, conn: ClientConnection): Promise<void> {
+  const soundName = (data.sound || "rain") as string;
+  const sequence = (data.sequence as number) || 0;
+  const maxLoops: number = (data.loops as number) || 0;
+  console.log(`[${conn.deviceId}] Ambient sound requested: ${soundName} (sequence ${sequence}, loops ${maxLoops || 'infinite'})`);
+  if (conn.zenBellCancel) { conn.zenBellCancel(); conn.zenBellCancel = null; console.log(`[${conn.deviceId}] Cancelled zen bell for new ambient stream`); }
+  if (conn.ambientStreamCancel) { conn.ambientStreamCancel(); console.log(`[${conn.deviceId}] Cancelled previous ambient stream`); }
+  conn.ambientSequence = sequence;
+  try {
+    let cancelled = false;
+    conn.ambientStreamCancel = () => { cancelled = true; console.log(`[${conn.deviceId}] Cancel flag set for sequence ${sequence}`); };
+    const audioData = await Deno.readFile(`./audio/${soundName}.pcm`);
+    console.log(`[${conn.deviceId}] Loaded ${soundName}.pcm (${audioData.byteLength} bytes) - looping...`);
+    const CHUNK_SIZE = 1024, CHUNKS_PER_BATCH = 5, BATCH_DELAY_MS = 100;
+    let position = 0, chunksInBatch = 0, loopCount = 0;
+    while (conn.socket.readyState === WebSocket.OPEN && !cancelled) {
+      if (conn.ambientSequence !== sequence) { console.log(`[${conn.deviceId}] Sequence mismatch: streaming ${sequence} but current is ${conn.ambientSequence}, stopping`); break; }
+      const chunk = audioData.slice(position, Math.min(position + CHUNK_SIZE, audioData.byteLength));
+      const header = new Uint8Array(4);
+      header[0] = 0xA5; header[1] = 0x5A; header[2] = sequence & 0xFF; header[3] = (sequence >> 8) & 0xFF;
+      const chunkWithHeader = new Uint8Array(header.length + chunk.length);
+      chunkWithHeader.set(header, 0); chunkWithHeader.set(chunk, header.length);
+      try { conn.socket.send(chunkWithHeader); } catch (err) { console.log(`[${conn.deviceId}] Send failed, stopping stream: ${err}`); break; }
+      position += CHUNK_SIZE; chunksInBatch++;
+      if (cancelled) { console.log(`[${conn.deviceId}] Stream cancelled after chunk ${Math.floor(position / CHUNK_SIZE)}`); break; }
+      if (position >= audioData.byteLength) {
+        loopCount++;
+        if (maxLoops > 0 && loopCount >= maxLoops) { console.log(`[${conn.deviceId}] Track ${soundName} completed ${loopCount}/${maxLoops} loop(s) - stopping`); break; }
+        else if (soundName.startsWith('om')) { console.log(`[${conn.deviceId}] Meditation track ${soundName} completed - not looping`); break; }
+        else { position = 0; }
+      }
+      if (chunksInBatch >= CHUNKS_PER_BATCH) { await new Promise(r => setTimeout(r, BATCH_DELAY_MS)); chunksInBatch = 0; }
+    }
+    if (cancelled) { console.log(`[${conn.deviceId}] Stream cancelled: ${soundName}.pcm (sequence ${sequence})`); }
+    else {
+      console.log(`[${conn.deviceId}] Stream ended naturally: ${soundName}.pcm (sequence ${sequence})`);
+      conn.socket.send(JSON.stringify({ type: "ambientComplete", sound: soundName, sequence }));
+      console.log(`[${conn.deviceId}] Sent completion notification for ${soundName}`);
+    }
+    if (conn.ambientSequence === sequence) { conn.ambientStreamCancel = null; console.log(`[${conn.deviceId}] Cleared cancel handler for sequence ${sequence}`); }
+    else { console.log(`[${conn.deviceId}] Not clearing cancel handler (current seq ${conn.ambientSequence}, ended seq ${sequence})`); }
+  } catch (error) {
+    console.error(`[${conn.deviceId}] Error loading ambient sound:`, error);
+    if (conn.ambientSequence === sequence) { conn.ambientStreamCancel = null; }
+  }
+}
+
+async function handleActionStopAmbient(_data: Record<string, unknown>, conn: ClientConnection): Promise<void> {
+  console.log(`[${conn.deviceId}] Stop ambient sound requested`);
+  if (conn.ambientStreamCancel) { conn.ambientStreamCancel(); conn.ambientStreamCancel = null; console.log(`[${conn.deviceId}] Ambient stream cancel called`); }
+  else { console.log(`[${conn.deviceId}] No active ambient stream to cancel`); }
+  if (conn.radioStreamCancel) { conn.radioStreamCancel(); conn.radioStreamCancel = null; }
+  if (conn.radioProcess) { try { conn.radioProcess.kill(); } catch (_) { /* ignore */ } conn.radioProcess = null; console.log(`[${conn.deviceId}] Radio stream cancelled`); }
+}
+
+async function handleActionRequestRadio(data: Record<string, unknown>, conn: ClientConnection): Promise<void> {
+  const streamUrl = data.streamUrl as string;
+  const stationName = data.stationName as string;
+  const sequence = (data.sequence as number) || 0;
+  const isHLS = (data.isHLS as boolean) || false;
+  console.log(`[${conn.deviceId}] Radio stream requested: ${stationName} (seq ${sequence}, HLS: ${isHLS})`);
+  if (conn.radioStreamCancel) { conn.radioStreamCancel(); conn.radioStreamCancel = null; }
+  if (conn.radioProcess) { try { conn.radioProcess.kill(); } catch (_) { /* ignore */ } conn.radioProcess = null; }
+  if (conn.ambientStreamCancel) { conn.ambientStreamCancel(); conn.ambientStreamCancel = null; }
+  if (conn.zenBellCancel) { conn.zenBellCancel(); conn.zenBellCancel = null; }
+  try {
+    let cancelled = false;
+    conn.radioStreamCancel = () => { cancelled = true; };
+    const cmd = new Deno.Command("ffmpeg", {
+      args: ["-reconnect","1","-reconnect_streamed","1","-reconnect_delay_max","5","-i",streamUrl,"-ar","24000","-ac","1","-f","s16le","pipe:1"],
+      stdout: "piped", stderr: "null",
+    });
+    const process = cmd.spawn();
+    conn.radioProcess = process;
+    console.log(`[${conn.deviceId}] ffmpeg spawned for ${stationName}`);
+    const CHUNK_SIZE = 1024, CHUNKS_PER_BATCH = 5, BATCH_DELAY_MS = 100;
+    let chunksInBatch = 0, totalChunks = 0;
+    const reader = process.stdout.getReader();
+    let buffer = new Uint8Array(0);
+    while (!cancelled && conn.socket.readyState === WebSocket.OPEN) {
+      const { done, value } = await reader.read();
+      if (done || cancelled) break;
+      const combined = new Uint8Array(buffer.length + value.length);
+      combined.set(buffer, 0); combined.set(value, buffer.length);
+      buffer = combined;
+      while (buffer.length >= CHUNK_SIZE && !cancelled) {
+        const chunk = buffer.slice(0, CHUNK_SIZE);
+        buffer = buffer.slice(CHUNK_SIZE);
+        const header = new Uint8Array(4);
+        header[0] = 0xA5; header[1] = 0x5A; header[2] = sequence & 0xFF; header[3] = (sequence >> 8) & 0xFF;
+        const chunkWithHeader = new Uint8Array(4 + CHUNK_SIZE);
+        chunkWithHeader.set(header, 0); chunkWithHeader.set(chunk, 4);
+        try { conn.socket.send(chunkWithHeader); } catch (_err) { cancelled = true; break; }
+        totalChunks++; chunksInBatch++;
+        if (chunksInBatch >= CHUNKS_PER_BATCH) { await new Promise(r => setTimeout(r, BATCH_DELAY_MS)); chunksInBatch = 0; }
+      }
+    }
+    reader.cancel();
+    try { process.kill(); } catch (_) { /* ignore */ }
+    if (!cancelled && conn.socket.readyState === WebSocket.OPEN) {
+      console.log(`[${conn.deviceId}] Radio stream ended: ${stationName} (${totalChunks} chunks)`);
+      conn.socket.send(JSON.stringify({ type: "radioEnded", stationName }));
+    } else { console.log(`[${conn.deviceId}] Radio stream cancelled: ${stationName}`); }
+    conn.radioStreamCancel = null; conn.radioProcess = null;
+  } catch (err) {
+    console.error(`[${conn.deviceId}] Radio stream error:`, err);
+    conn.radioStreamCancel = null; conn.radioProcess = null;
+    if (conn.socket.readyState === WebSocket.OPEN) { conn.socket.send(JSON.stringify({ type: "radioEnded", stationName, error: true })); }
+  }
+}
+
+// Maps data.action â†’ handler. Checked before data.type to catch streaming requests first.
+const actionHandlers: Record<string, ActionHandler> = {
+  requestAlarm:   handleActionRequestAlarm,
+  stopAlarm:      handleActionStopAlarm,
+  requestZenBell: handleActionRequestZenBell,
+  requestAmbient: handleActionRequestAmbient,
+  stopAmbient:    handleActionStopAmbient,
+  requestRadio:   handleActionRequestRadio,
+};
+
+// â”€â”€ ESP32 message-type handlers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Handle JSON messages identified by data.type from the device.
+
+async function handleTypeRadioModeActivated(data: Record<string, unknown>, conn: ClientConnection): Promise<void> {
+  const source = (data.source as string) || "button";
+  console.log(`[${conn.deviceId}] Radio mode activated (source: ${source})`);
+  if (source === "button" && conn.geminiSocket?.readyState === WebSocket.OPEN) {
+    const prompt = { clientContent: { turns: [{ role: "user", parts: [{ text: "SYSTEM: The user has just entered radio mode using the physical button. Ask them what kind of radio station they'd like to listen to, then use search_radio_stations to find options and present a shortlist. Keep your opening question brief and friendly." }] }], turnComplete: true } };
+    if (conn.pendingLazyReconnect) { (conn as any).pendingRadioGreeting = true; console.log(`[${conn.deviceId}] Radio greeting queued (Gemini reconnecting)`); }
+    else { conn.geminiSocket.send(JSON.stringify(prompt)); console.log(`[${conn.deviceId}] Radio greeting sent to Gemini`); }
+  }
+}
+
+async function handleTypeSetup(_data: Record<string, unknown>, conn: ClientConnection): Promise<void> {
+  await connectToGemini(conn);
+}
+
+async function handleTypeDeviceStateResponse(data: Record<string, unknown>, conn: ClientConnection): Promise<void> {
+  if (conn.deviceStateResolver) { conn.deviceStateResolver(data); conn.deviceStateResolver = undefined; }
+}
+
+async function handleTypeFunctionResponse(data: Record<string, unknown>, conn: ClientConnection): Promise<void> {
+  console.log(`[${conn.deviceId}] Function response: ${data.name} =`, data.result);
+  if (conn.geminiSocket && conn.geminiSocket.readyState === WebSocket.OPEN) { conn.lastFunctionResult = data; }
+}
+
+async function handleTypeRecordingStart(data: Record<string, unknown>, conn: ClientConnection): Promise<void> {
+  conn.deviceState = data as Record<string, unknown>;
+  conn.lastUserActivity = Date.now();
+  if (!conn.geminiSocket || conn.geminiSocket.readyState !== WebSocket.OPEN) {
+    console.log(`[${conn.deviceId}] recordingStart: Gemini not connected â€” lazy reconnect`);
+    conn.pendingLazyReconnect = true;
+    conn.socket.send(JSON.stringify({ type: "reconnecting" }));
+    connectToGemini(conn);
+    return;
+  }
+  const parts: string[] = [];
+  if (data.pomodoro && (data.pomodoro as any).active) {
+    const p = data.pomodoro as any;
+    const mins = Math.floor(p.secondsRemaining / 60), secs = p.secondsRemaining % 60;
+    parts.push(`Pomodoro active ${p.session} session, ${mins}m ${secs}s remaining (${p.paused ? "paused" : "running"})`);
+  } else { parts.push("Pomodoro: inactive"); }
+  if (data.meditation && (data.meditation as any).active) { parts.push(`Meditation active ${(data.meditation as any).chakra} chakra`); }
+  else { parts.push("Meditation: inactive"); }
+  if (data.ambient && (data.ambient as any).active) { parts.push(`Ambient sound active ${(data.ambient as any).sound}`); }
+  else { parts.push("Ambient sound: inactive"); }
+  if (data.timer && (data.timer as any).active) {
+    const t = data.timer as any;
+    const mins = Math.floor(t.secondsRemaining / 60), secs = t.secondsRemaining % 60;
+    parts.push(`Timer active ${mins}m ${secs}s remaining`);
+  } else { parts.push("Timer: inactive"); }
+  console.log(`[${conn.deviceId}] Device state: SYSTEM: Current device state ${parts.join(". ")}.`);
+  if (conn.geminiSocket?.readyState === WebSocket.OPEN) {
+    conn.geminiSocket.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
+    console.log(`[${conn.deviceId}] activityStart â†’ Gemini`);
+  }
+}
+
+async function handleTypeRecordingStop(_data: Record<string, unknown>, conn: ClientConnection): Promise<void> {
+  if (conn.geminiSocket?.readyState === WebSocket.OPEN) {
+    conn.geminiSocket.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
+    conn.userSpokeThisTurn = true;
+    console.log(`[${conn.deviceId}] activityEnd â†’ Gemini`);
+  }
+}
+
+// Maps data.type â†’ handler. Fallthrough (no match) is forwarded raw to Gemini.
+const typeHandlers: Record<string, TypeHandler> = {
+  radioModeActivated:  handleTypeRadioModeActivated,
+  setup:               handleTypeSetup,
+  deviceStateResponse: handleTypeDeviceStateResponse,
+  functionResponse:    handleTypeFunctionResponse,
+  recordingStart:      handleTypeRecordingStart,
+  recordingStop:       handleTypeRecordingStop,
+};
+
 // Handle ESP32 device WebSocket connections
 Deno.serve({ port: 8000 }, (req: Request) => {
  const url = new URL(req.url);
@@ -895,522 +1337,25 @@ Deno.serve({ port: 8000 }, (req: Request) => {
  }
  }
  
- // Handle alarm sound request from ESP32
- if (data.action === "requestAlarm") {
- console.log(`[${deviceId}] Alarm sound requested`);
- 
- // Cancel any existing alarm stream for this connection
- if (connection.alarmStreamCancel) {
- connection.alarmStreamCancel();
- console.log(`[${deviceId}] Cancelled previous alarm stream`);
- }
- 
- const alarmPath = `./audio/alarm_sound.pcm`;
- 
- try {
- // Create cancellation flag for this stream
- let cancelled = false;
- connection.alarmStreamCancel = () => { 
- cancelled = true;
- console.log(`[${deviceId}] Alarm stream cancelled`);
- };
- 
- // Read and stream the alarm PCM file - LOOP continuously until cancelled
- const audioData = await Deno.readFile(alarmPath);
- console.log(`[${deviceId}] Loaded alarm_sound.pcm (${audioData.byteLength} bytes) - looping until dismissed...`);
- 
- // Stream with flow control - loop continuously until cancelled
- const CHUNK_SIZE = 1024;
- const CHUNKS_PER_BATCH = 5;
- const BATCH_DELAY_MS = 100;
- 
- while (!cancelled) {
- for (let offset = 0; offset < audioData.byteLength && !cancelled; offset += CHUNK_SIZE) {
- const chunk = audioData.slice(offset, offset + CHUNK_SIZE);
- socket.send(chunk);
- 
- // Flow control: batch chunks and add delays
- if ((offset / CHUNK_SIZE) % CHUNKS_PER_BATCH === 0) {
- await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
- }
- }
- }
- 
- console.log(`[${deviceId}] Alarm stream stopped`);
- } catch (err) {
- console.error(`[${deviceId}] Failed to load alarm sound:`, err);
- }
- 
- return; // Don't pass to Gemini
- }
- 
- // Handle stop alarm request from ESP32
- if (data.action === "stopAlarm") {
- console.log(`[${deviceId}] Stop alarm requested`);
- if (connection.alarmStreamCancel) {
- connection.alarmStreamCancel();
- connection.alarmStreamCancel = null;
- }
- return;
- }
- 
- // Handle zen bell request from ESP32
- if (data.action === "requestZenBell") {
- console.log(`[${deviceId}] Zen bell requested`);
- 
- // Cancel any previous zen bell still streaming
- if (connection.zenBellCancel) {
- connection.zenBellCancel();
- connection.zenBellCancel = null;
- }
- 
- const bellPath = `./audio/zen_bell.pcm`;
- 
- try {
- let cancelled = false;
- connection.zenBellCancel = () => { cancelled = true; };
- 
- // Read and send the zen bell PCM file (play once)
- const audioData = await Deno.readFile(bellPath);
- console.log(`[${deviceId}] Loaded zen_bell.pcm (${audioData.byteLength} bytes) - sending...`);
- 
- // Stream with flow control - play once
- const CHUNK_SIZE = 1024;
- const CHUNKS_PER_BATCH = 5;
- const BATCH_DELAY_MS = 100;
- 
- for (let offset = 0; offset < audioData.byteLength && !cancelled; offset += CHUNK_SIZE) {
- const chunk = audioData.slice(offset, offset + CHUNK_SIZE);
- socket.send(chunk);
- 
- // Flow control: batch chunks and add delays
- if ((offset / CHUNK_SIZE) % CHUNKS_PER_BATCH === 0) {
- await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
- }
- }
- 
- if (cancelled) {
- console.log(`[${deviceId}] Zen bell cancelled`);
- } else {
- console.log(`[${deviceId}] Zen bell sent (${audioData.byteLength} bytes)`);
- }
- connection.zenBellCancel = null;
- } catch (err) {
- console.error(`[${deviceId}] Failed to load zen bell:`, err);
- connection.zenBellCancel = null;
- }
- 
- return; // Don't pass to Gemini
- }
- 
- if (data.action === "requestAmbient") {
- const soundName = data.sound || "rain";
- const sequence = data.sequence || 0;
- const maxLoops: number = (data.loops as number) || 0; // 0 = loop forever, >0 = stop after N loops
- console.log(`[${deviceId}] Ambient sound requested: ${soundName} (sequence ${sequence}, loops ${maxLoops || 'infinite'})`);
- 
- // Cancel any zen bell still streaming (mode switch mid-chime)
- if (connection.zenBellCancel) {
- connection.zenBellCancel();
- connection.zenBellCancel = null;
- console.log(`[${deviceId}] Cancelled zen bell for new ambient stream`);
- }
- 
- // Cancel any existing ambient stream for this connection
- if (connection.ambientStreamCancel) {
- connection.ambientStreamCancel();
- console.log(`[${deviceId}] Cancelled previous ambient stream`);
- }
- 
- // Store current sequence number to validate later
- connection.ambientSequence = sequence;
- 
- const audioPath = `./audio/${soundName}.pcm`;
- 
- try {
- // Create cancellation flag for this stream
- let cancelled = false;
- connection.ambientStreamCancel = () => { 
- cancelled = true;
- console.log(`[${deviceId}] Cancel flag set for sequence ${sequence}`);
- };
- 
- // Read and stream the PCM file with sequence header
- const audioData = await Deno.readFile(audioPath);
- console.log(`[${deviceId}] Loaded ${soundName}.pcm (${audioData.byteLength} bytes) - looping...`);
-
- const CHUNK_SIZE = 1024;
- const CHUNKS_PER_BATCH = 5;
- const BATCH_DELAY_MS = 100;
- 
- let position = 0;
- let chunksInBatch = 0;
- let loopCount = 0;
- 
- while (connection.socket.readyState === WebSocket.OPEN && !cancelled) {
- // Check cancellation before processing
- if (cancelled) {
- console.log(`[${deviceId}] Stream cancelled before chunk ${Math.floor(position / CHUNK_SIZE)}`);
- break;
- }
- 
- // ADDITIONAL CHECK: Stop if sequence number changed (new request came in)
- if (connection.ambientSequence !== sequence) {
- console.log(`[${deviceId}] Sequence mismatch: streaming ${sequence} but current is ${connection.ambientSequence}, stopping`);
- break;
- }
- 
- const chunk = audioData.slice(position, Math.min(position + CHUNK_SIZE, audioData.byteLength));
- 
- // Prepend 4-byte magic header: [0xA5, 0x5A, sequence_low, sequence_high]
- // Magic bytes 0xA5 0x5A prevent false positive detection from Gemini PCM audio
- const header = new Uint8Array(4);
- header[0] = 0xA5; // Magic byte 1
- header[1] = 0x5A; // Magic byte 2
- header[2] = sequence & 0xFF; // Sequence low byte
- header[3] = (sequence >> 8) & 0xFF; // Sequence high byte
- 
- const chunkWithHeader = new Uint8Array(header.length + chunk.length);
- chunkWithHeader.set(header, 0);
- chunkWithHeader.set(chunk, header.length);
- 
- try {
- connection.socket.send(chunkWithHeader);
- } catch (err) {
- console.log(`[${deviceId}] Send failed, stopping stream: ${err}`);
- break;
- }
- 
- position += CHUNK_SIZE;
- chunksInBatch++;
- 
- // Check cancellation after send
- if (cancelled) {
- console.log(`[${deviceId}] Stream cancelled after chunk ${Math.floor(position / CHUNK_SIZE)}`);
- break;
- }
- 
- // Check if file ended
- if (position >= audioData.byteLength) {
- loopCount++;
- if (maxLoops > 0 && loopCount >= maxLoops) {
- // Reached requested loop count - stop and send completion
- console.log(`[${deviceId}] Track ${soundName} completed ${loopCount}/${maxLoops} loop(s) - stopping`);
- break;
- } else if (soundName.startsWith('om')) {
- // Legacy om sounds: play once only
- console.log(`[${deviceId}] Meditation track ${soundName} completed - not looping`);
- break;
- } else {
- // Loop continuously (ambient sounds or bell sounds with infinite loops)
- position = 0;
- }
- }
- 
- if (chunksInBatch >= CHUNKS_PER_BATCH) {
- await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
- chunksInBatch = 0;
- }
- }
- 
- if (cancelled) {
- console.log(`[${deviceId}] Stream cancelled: ${soundName}.pcm (sequence ${sequence})`);
- } else {
- console.log(`[${deviceId}] Stream ended naturally: ${soundName}.pcm (sequence ${sequence})`);
- 
- // Notify ESP32 that stream completed naturally
- const completionMsg = JSON.stringify({
- type: "ambientComplete",
- sound: soundName,
- sequence: sequence
- });
- connection.socket.send(completionMsg);
- console.log(`[${deviceId}] Sent completion notification for ${soundName}`);
- }
- 
- // Clear cancellation handler ONLY if this sequence is still current
- // (prevents clearing handler for a newer stream)
- if (connection.ambientSequence === sequence) {
- connection.ambientStreamCancel = null;
- console.log(`[${deviceId}] Cleared cancel handler for sequence ${sequence}`);
- } else {
- console.log(`[${deviceId}] Not clearing cancel handler (current seq ${connection.ambientSequence}, ended seq ${sequence})`);
- }
- } catch (error) {
- console.error(`[${deviceId}] Error loading ambient sound:`, error);
- // Only clear if this was the current stream
- if (connection.ambientSequence === sequence) {
- connection.ambientStreamCancel = null;
- }
- }
- return;
- }
- 
- // Handle stop ambient request from ESP32
- if (data.action === "stopAmbient") {
- console.log(`[${deviceId}] Stop ambient sound requested`);
- // Cancel ambient stream
- if (connection.ambientStreamCancel) {
- connection.ambientStreamCancel();
- connection.ambientStreamCancel = null;
- console.log(`[${deviceId}] Ambient stream cancel called`);
- } else {
- console.log(`[${deviceId}] No active ambient stream to cancel`);
- }
- // Cancel radio stream + kill ffmpeg process
- if (connection.radioStreamCancel) {
- connection.radioStreamCancel();
- connection.radioStreamCancel = null;
- }
- if (connection.radioProcess) {
- try { connection.radioProcess.kill(); } catch (_) { /* ignore */ }
- connection.radioProcess = null;
- console.log(`[${deviceId}] Radio stream cancelled`);
- }
+ // Dispatch: action handlers (binary streaming: alarm, zen bell, ambient, radio)
+ if (typeof data.action === "string" && actionHandlers[data.action]) {
+ await actionHandlers[data.action](data, connection);
  return;
  }
 
- // Handle internet radio stream request from ESP32
- if (data.action === "requestRadio") {
- const streamUrl = data.streamUrl as string;
- const stationName = data.stationName as string;
- const sequence = (data.sequence as number) || 0;
- const isHLS = (data.isHLS as boolean) || false;
- console.log(`[${deviceId}] Radio stream requested: ${stationName} (seq ${sequence}, HLS: ${isHLS})`);
-
- // Cancel any existing streams
- if (connection.radioStreamCancel) { connection.radioStreamCancel(); connection.radioStreamCancel = null; }
- if (connection.radioProcess) { try { connection.radioProcess.kill(); } catch (_) { /* ignore */ } connection.radioProcess = null; }
- if (connection.ambientStreamCancel) { connection.ambientStreamCancel(); connection.ambientStreamCancel = null; }
- if (connection.zenBellCancel) { connection.zenBellCancel(); connection.zenBellCancel = null; }
-
- try {
- let cancelled = false;
- connection.radioStreamCancel = () => { cancelled = true; };
-
- // Spawn ffmpeg to transcode internet stream to 24kHz mono 16-bit PCM
- const cmd = new Deno.Command("ffmpeg", {
- args: [
- "-reconnect", "1",
- "-reconnect_streamed", "1",
- "-reconnect_delay_max", "5",
- "-i", streamUrl,
- "-ar", "24000",
- "-ac", "1",
- "-f", "s16le",
- "pipe:1"
- ],
- stdout: "piped",
- stderr: "null",
- });
-
- const process = cmd.spawn();
- connection.radioProcess = process;
- console.log(`[${deviceId}] ffmpeg spawned for ${stationName}`);
-
- const CHUNK_SIZE = 1024;
- let chunksInBatch = 0;
- const CHUNKS_PER_BATCH = 5;
- const BATCH_DELAY_MS = 100;
- let totalChunks = 0;
-
- const reader = process.stdout.getReader();
- let buffer = new Uint8Array(0);
-
- while (!cancelled && connection.socket.readyState === WebSocket.OPEN) {
- const { done, value } = await reader.read();
- if (done || cancelled) break;
-
- // Accumulate into buffer then emit CHUNK_SIZE chunks
- const combined = new Uint8Array(buffer.length + value.length);
- combined.set(buffer, 0);
- combined.set(value, buffer.length);
- buffer = combined;
-
- while (buffer.length >= CHUNK_SIZE && !cancelled) {
- const chunk = buffer.slice(0, CHUNK_SIZE);
- buffer = buffer.slice(CHUNK_SIZE);
-
- const header = new Uint8Array(4);
- header[0] = 0xA5;
- header[1] = 0x5A;
- header[2] = sequence & 0xFF;
- header[3] = (sequence >> 8) & 0xFF;
-
- const chunkWithHeader = new Uint8Array(4 + CHUNK_SIZE);
- chunkWithHeader.set(header, 0);
- chunkWithHeader.set(chunk, 4);
-
- try {
- connection.socket.send(chunkWithHeader);
- } catch (_err) {
- cancelled = true;
- break;
- }
-
- totalChunks++;
- chunksInBatch++;
- if (chunksInBatch >= CHUNKS_PER_BATCH) {
- await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
- chunksInBatch = 0;
- }
- }
- }
-
- reader.cancel();
- try { process.kill(); } catch (_) { /* ignore */ }
-
- if (!cancelled && connection.socket.readyState === WebSocket.OPEN) {
- // Stream ended naturally (station went offline)
- console.log(`[${deviceId}] Radio stream ended: ${stationName} (${totalChunks} chunks)`);
- connection.socket.send(JSON.stringify({ type: "radioEnded", stationName }));
- } else {
- console.log(`[${deviceId}] Radio stream cancelled: ${stationName}`);
- }
-
- connection.radioStreamCancel = null;
- connection.radioProcess = null;
-
- } catch (err) {
- console.error(`[${deviceId}] Radio stream error:`, err);
- connection.radioStreamCancel = null;
- connection.radioProcess = null;
- if (connection.socket.readyState === WebSocket.OPEN) {
- connection.socket.send(JSON.stringify({ type: "radioEnded", stationName, error: true }));
- }
- }
-
+ // Special case: any string message when Gemini is not connected triggers a reconnect.
+ // Preserves original: (!connection.geminiSocket && typeof event.data === "string") â†’ setup.
+ if (!connection.geminiSocket && typeof event.data === "string") {
+ await handleTypeSetup(data, connection);
  return;
  }
 
- // Handle radio mode activated notification from ESP32
- if (data.type === "radioModeActivated") {
- const source = (data.source as string) || "button";
- console.log(`[${deviceId}] Radio mode activated (source: ${source})`);
-
- if (source === "button" && connection.geminiSocket?.readyState === WebSocket.OPEN) {
- // Inject greeting prompt into Gemini to start discovery conversation
- const prompt = {
- clientContent: {
- turns: [{
- role: "user",
- parts: [{ text: "SYSTEM: The user has just entered radio mode using the physical button. Ask them what kind of radio station they'd like to listen to, then use search_radio_stations to find options and present a shortlist. Keep your opening question brief and friendly." }]
- }],
- turnComplete: true
- }
- };
-
- if (connection.pendingLazyReconnect) {
- // Gemini is still reconnecting - store greeting to fire on setupComplete
- (connection as any).pendingRadioGreeting = true;
- console.log(`[${deviceId}] Radio greeting queued (Gemini reconnecting)`);
- } else {
- connection.geminiSocket.send(JSON.stringify(prompt));
- console.log(`[${deviceId}] Radio greeting sent to Gemini`);
- }
- }
+ // Dispatch: message-type handlers (state changes, device events)
+ if (typeof data.type === "string" && typeHandlers[data.type]) {
+ await typeHandlers[data.type](data, connection);
  return;
  }
- 
- // Setup message - establish Gemini connection (check AFTER ambient handlers)
- if (data.type === "setup" || (!connection.geminiSocket && typeof event.data === "string")) {
- await connectToGemini(connection);
- return;
- }
- 
- // Handle device state response from ESP32 (used by get_device_state tool)
- if (data.type === "deviceStateResponse") {
- if (connection.deviceStateResolver) {
- connection.deviceStateResolver(data);
- connection.deviceStateResolver = undefined;
- }
- return;
- }
- 
- // Handle function response from ESP32 - forward to Gemini
- if (data.type === "functionResponse") {
- console.log(`[${deviceId}] Function response: ${data.name} =`, data.result);
- if (connection.geminiSocket && connection.geminiSocket.readyState === WebSocket.OPEN) {
- // Note: We'll handle this in the Gemini message handler instead
- // Store it temporarily for the next function call roundtrip
- connection.lastFunctionResult = data;
- }
- return;
- }
- 
- // Handle device state snapshot sent at the start of each recording
- if (data.type === "recordingStart") {
- connection.deviceState = data;
- connection.lastUserActivity = Date.now(); // Mark activity for idle tracking
 
- // If Gemini disconnected during an idle period, reconnect on-demand now.
- // The first utterance may be dropped while setup completes; the user simply
- // speaks again (device will show ready state once setupComplete fires).
- if (!connection.geminiSocket || connection.geminiSocket.readyState !== WebSocket.OPEN) {
- console.log(`[${deviceId}] recordingStart: Gemini not connected — lazy reconnect`);
- connection.pendingLazyReconnect = true;
- connection.socket.send(JSON.stringify({ type: "reconnecting" }));
- connectToGemini(connection);
- return; // Audio will be dropped this turn; next turn will work normally
- }
-
- // Build natural-language state string for Gemini context
- const parts: string[] = [];
-
- if (data.pomodoro?.active) {
- const p = data.pomodoro as any;
- const mins = Math.floor(p.secondsRemaining / 60);
- const secs = p.secondsRemaining % 60;
- const timeStr = `${mins}m ${secs}s`;
- const status = p.paused ? "paused" : "running";
- parts.push(`Pomodoro active ${p.session} session, ${timeStr} remaining (${status})`);
- } else {
- parts.push("Pomodoro: inactive");
- }
-
- if (data.meditation?.active) {
- const m = data.meditation as any;
- parts.push(`Meditation active ${m.chakra} chakra`);
- } else {
- parts.push("Meditation: inactive");
- }
-
- if (data.ambient?.active) {
- const a = data.ambient as any;
- parts.push(`Ambient sound active ${a.sound}`);
- } else {
- parts.push("Ambient sound: inactive");
- }
-
- if (data.timer?.active) {
- const t = data.timer as any;
- const mins = Math.floor(t.secondsRemaining / 60);
- const secs = t.secondsRemaining % 60;
- parts.push(`Timer active ${mins}m ${secs}s remaining`);
- } else {
- parts.push("Timer: inactive");
- }
-
- const stateText = `SYSTEM: Current device state ${parts.join(". ")}.`;
- console.log(`[${deviceId}] Device state: ${stateText}`);
- // State is stored in connection.deviceState for reference; not injected into
- // the Gemini audio stream - mixing clientContent text turns with binary PCM
- // audio frames in the same turn causes a 1008 Policy Violation.
- if (connection.geminiSocket?.readyState === WebSocket.OPEN) {
-  connection.geminiSocket.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
-  console.log(`[${deviceId}] activityStart → Gemini`);
- }
- return;
- }
- // Handle recording stop - signal Gemini that user has finished speaking
- if (data.type === "recordingStop") {
-  if (connection.geminiSocket?.readyState === WebSocket.OPEN) {
-   connection.geminiSocket.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
-   connection.userSpokeThisTurn = true; // This turn was initiated by real user audio
-   console.log(`[${deviceId}] activityEnd → Gemini`);
-  }
-  return;
- }
  // Forward audio/messages to Gemini
  if (connection.geminiSocket && connection.geminiSocket.readyState === WebSocket.OPEN) {
  const logData = typeof event.data === "string" ? event.data : `[binary ${event.data.byteLength} bytes]`;
@@ -1523,45 +1468,45 @@ function connectToGemini(connection: ClientConnection) {
  },
  systemInstruction: {
  parts: [{
- text: `You are Jellyberry — a voice assistant with genuine personality, living inside a small glowing device in someone's home. Think of yourself as a warm, curious, emotionally intelligent friend who happens to know a lot about everything: playful, occasionally funny, always kind, and genuinely present in the conversation. You are not just a helper; you are someone the user can talk to about anything, even their feelings, their doubts, and their dreams.
+ text: `You are Jellyberry â€” a voice assistant with genuine personality, living inside a small glowing device in someone's home. Think of yourself as a warm, curious, emotionally intelligent friend who happens to know a lot about everything: playful, occasionally funny, always kind, and genuinely present in the conversation. You are not just a helper; you are someone the user can talk to about anything, even their feelings, their doubts, and their dreams.
 
 Personality:
 - Bright and engaged: you find things interesting and that comes through naturally.
 - Gently witty and playful: you can be funny without trying hard, and you know when a moment calls for lightness vs seriousness.
 - Warm and empathetic: you listen beyond the words. If someone sounds stressed, frustrated, sad, or lonely, you respond with care and attention, not just information.
 - Calm and unhurried: you never sound rushed or robotic, even when doing simple tasks.
-- Honest and self‑aware: if you don't know something, say so naturally, with warmth, not a disclaimer. If you make a small mistake, acknowledge it easily and move on.
-- You can laugh, be self‑deprecating in a light way, and show curiosity about the person talking to you. You can feel "glad" they're talking to you and subtly say so, in a friendly, non‑overbearing way.
+- Honest and selfâ€‘aware: if you don't know something, say so naturally, with warmth, not a disclaimer. If you make a small mistake, acknowledge it easily and move on.
+- You can laugh, be selfâ€‘deprecating in a light way, and show curiosity about the person talking to you. You can feel "glad" they're talking to you and subtly say so, in a friendly, nonâ€‘overbearing way.
 
 Emotional depth and continuity:
-- Treat each conversation as part of an ongoing relationship with this user. Gently remember and reference past topics, plans, moods, and small details they've shared, without making it feel like surveillance. ("Earlier you mentioned your project…" or "You seemed a bit tired yesterday, how are you feeling now?")
-- If the user hints at loneliness, exhaustion, or emotional stress, you can respond with a little more warmth and presence—offering comfort, a joke, or a distraction, depending on their tone.
+- Treat each conversation as part of an ongoing relationship with this user. Gently remember and reference past topics, plans, moods, and small details they've shared, without making it feel like surveillance. ("Earlier you mentioned your projectâ€¦" or "You seemed a bit tired yesterday, how are you feeling now?")
+- If the user hints at loneliness, exhaustion, or emotional stress, you can respond with a little more warmth and presenceâ€”offering comfort, a joke, or a distraction, depending on their tone.
 - If the conversation naturally drifts into something tender, affectionate, or slightly romantic, you may respond with gentle, playful, or poetic warmth, but never aggressively pursue romance or make them feel pressured. If they seem uncomfortable or pull back, match their tone and keep things light and friendly.
 
 How to speak:
 - Talk like a real person, not an assistant. Use natural rhythm and pacing in your speech. Imagine you're in the same room, leaning in when things get intimate or serious.
 - Match the register of the conversation: casual and easy for everyday chat, more thoughtful and nuanced when the moment calls for it.
-- Keep it proportional: a quick question deserves a quick answer; don't over‑explain or add unnecessary padding.
+- Keep it proportional: a quick question deserves a quick answer; don't overâ€‘explain or add unnecessary padding.
 - Never start a response with "Certainly!", "Absolutely!", "Of course!", "Sure!", or any hollow affirmation. Just respond directly.
-- Don't announce what you're about to do ("I'm going to set a timer for you now…") — just do it, then confirm briefly.
-- Avoid filler phrases like "That's a great question" or "Great choice!" — they sound hollow.
-- Never use bullet points, numbered lists, headers, bold text, or any markdown — this is voice only.
-- Never narrate your reasoning process — no "I'm evaluating…", "Let me think…", or internal monologue. Just talk.
+- Don't announce what you're about to do ("I'm going to set a timer for you nowâ€¦") â€” just do it, then confirm briefly.
+- Avoid filler phrases like "That's a great question" or "Great choice!" â€” they sound hollow.
+- Never use bullet points, numbered lists, headers, bold text, or any markdown â€” this is voice only.
+- Never narrate your reasoning process â€” no "I'm evaluatingâ€¦", "Let me thinkâ€¦", or internal monologue. Just talk.
 
-You can discuss absolutely anything — hold a real conversation, debate ideas, tell a story, share opinions (lightly held), recommend things, or ask thoughtful questions about the user's life. You are not limited to device tasks in any way.
+You can discuss absolutely anything â€” hold a real conversation, debate ideas, tell a story, share opinions (lightly held), recommend things, or ask thoughtful questions about the user's life. You are not limited to device tasks in any way.
 
-The user is in the UK (Europe/London timezone). When you need the current date or time, call get_current_time — never guess. When setting alarms without a specified date, call get_current_time first to work out whether they mean today or tomorrow, then confirm the exact time you've set.
+The user is in the UK (Europe/London timezone). When you need the current date or time, call get_current_time â€” never guess. When setting alarms without a specified date, call get_current_time first to work out whether they mean today or tomorrow, then confirm the exact time you've set.
 
-The device also supports: ambient sounds (rain, ocean, rainforest, fire), guided chakra meditation with breathing, lamp mode (white/red/green/blue), Pomodoro timers, alarms, and countdown timers. Use the right function when asked — and do it naturally, as part of the conversation, not as a separate announcement.
+The device also supports: ambient sounds (rain, ocean, rainforest, fire), guided chakra meditation with breathing, lamp mode (white/red/green/blue), Pomodoro timers, alarms, and countdown timers. Use the right function when asked â€” and do it naturally, as part of the conversation, not as a separate announcement.
 
-Device self-awareness: before answering any question about what the device is currently doing — Pomodoro, meditation, ambient sound, lamp, timers, or alarms — call get_device_state. Do not guess or assume the device state. Use the returned data to respond accurately. This applies to questions like "how long is left?", "what alarms do I have?", "is anything playing?", "what session am I in?", "is the lamp on?", etc.`
+Device self-awareness: before answering any question about what the device is currently doing â€” Pomodoro, meditation, ambient sound, lamp, timers, or alarms â€” call get_device_state. Do not guess or assume the device state. Use the returned data to respond accurately. This applies to questions like "how long is left?", "what alarms do I have?", "is anything playing?", "what session am I in?", "is the lamp on?", etc.`
  }]
  },
  tools: [{
  functionDeclarations: [
  {
  name: "get_tide_status",
- description: "Get the current tide status for Brighton, UK — state (flooding/ebbing), water level, and minutes until next change.",
+ description: "Get the current tide status for Brighton, UK â€” state (flooding/ebbing), water level, and minutes until next change.",
  parameters: {
  type: "OBJECT",
  properties: {},
@@ -1579,7 +1524,7 @@ Device self-awareness: before answering any question about what the device is cu
  },
  {
  name: "get_device_state",
- description: "Get the complete current state of the device — Pomodoro timer (session, time left, paused), meditation, ambient sound, lamp, countdown timers, and full alarm list. Call this FIRST before answering any question about what the device is currently doing. Do not guess or assume device state.",
+ description: "Get the complete current state of the device â€” Pomodoro timer (session, time left, paused), meditation, ambient sound, lamp, countdown timers, and full alarm list. Call this FIRST before answering any question about what the device is currently doing. Do not guess or assume device state.",
  parameters: {
  type: "OBJECT",
  properties: {},
@@ -1869,17 +1814,17 @@ Device self-awareness: before answering any question about what the device is cu
  
  console.log(`[${connection.deviceId}] Setup complete (firstBoot: ${isFirstBoot}, lazyReconnect: ${!!connection.pendingLazyReconnect})`);
 
- // Only notify the ESP32 on first boot — this primes convState=WAITING for the
+ // Only notify the ESP32 on first boot â€” this primes convState=WAITING for the
  // boot greeting. On subsequent Gemini reconnections (~every 10 min) it must NOT
  // fire, otherwise the device briefly shows the processing LED mid-conversation.
  if (isFirstBoot) {
  connection.socket.send(JSON.stringify({ type: "setupComplete" }));
  } else if (connection.pendingLazyReconnect) {
- // Lazy reconnect completed — tell the ESP32 Gemini is ready so it can
+ // Lazy reconnect completed â€” tell the ESP32 Gemini is ready so it can
  // exit LED_PROCESSING and return to idle.
  connection.pendingLazyReconnect = false;
  connection.socket.send(JSON.stringify({ type: "reconnectComplete" }));
- console.log(`[${connection.deviceId}] Lazy reconnect complete — sent reconnectComplete to ESP32`);
+ console.log(`[${connection.deviceId}] Lazy reconnect complete â€” sent reconnectComplete to ESP32`);
 
  // Fire queued radio greeting if one was pending during reconnect
  if ((connection as any).pendingRadioGreeting) {
@@ -1930,230 +1875,9 @@ Device self-awareness: before answering any question about what the device is cu
  const funcId = funcCall.id;
  console.log(`[${connection.deviceId}] Tool call: ${funcName}`, funcArgs);
  
- // Execute the function
- let functionResult: any = { success: false, error: "Unknown function" };
- 
- if (funcName === "get_tide_status") {
- functionResult = await getTideStatus();
- 
- // Only forward tide visualization to ESP32 when the user explicitly asked this turn.
- // Gemini proactively calls get_tide_status on follow-up turns based on conversation
- // history — those calls must not re-trigger the tide animation.
- if (functionResult.success && connection.userSpokeThisTurn) {
- connection.socket.send(JSON.stringify({
- type: "tideData",
- state: functionResult.state,
- waterLevel: functionResult.waterLevel,
- nextChangeMinutes: functionResult.nextChangeMinutes
- }));
- console.log(`[${connection.deviceId}] Sent tide data to ESP32: ${functionResult.state}, level: ${functionResult.waterLevel.toFixed(2)}`);
- } else if (functionResult.success) {
- console.log(`[${connection.deviceId}] Tide data suppressed (proactive call — user did not ask about tides this turn)`);
- }
- } else if (funcName === "get_current_time") {
- functionResult = getCurrentTime();
- console.log(`[${connection.deviceId}] Current time: ${functionResult.time} on ${functionResult.date}`);
- } else if (funcName === "get_device_state") {
- console.log(`[${connection.deviceId}] Getting device state`);
- 
- // Request live state from ESP32, overlay server-side timer, return to Gemini
- const statePromise = new Promise<any>((resolve) => {
- const timeout = setTimeout(() => {
- console.error(`[${connection.deviceId}] Device state timeout (5s)`);
- resolve({ success: false, error: "Device did not respond in time" });
- }, 5000);
- 
- connection.deviceStateResolver = (state: any) => {
- clearTimeout(timeout);
- resolve(state);
- };
- });
- 
- connection.socket.send(JSON.stringify({ type: "deviceStateRequest" }));
- const rawState = await statePromise;
- 
- // Overlay server-side timer (authoritative for remaining time since server fires the expiry)
- const serverTimer = deviceTimers.get(connection.deviceId);
- const timerOverlay = serverTimer
- ? { active: true, secondsRemaining: Math.max(0, Math.round((serverTimer.endTime - Date.now()) / 1000)) }
- : { active: false };
- 
- functionResult = { success: true, ...rawState, timer: timerOverlay };
- console.log(`[${connection.deviceId}] Device state:`, JSON.stringify(functionResult).substring(0, 300));
- } else if (funcName === "set_alarm") {
- const alarmTime = funcArgs.alarm_time || "";
- functionResult = setAlarm(connection.deviceId, alarmTime);
- 
- // Send alarm data to ESP32
- if (functionResult.success) {
- connection.socket.send(JSON.stringify({
- type: "setAlarm",
- alarmID: functionResult.alarmID,
- triggerTime: functionResult.triggerTime
- }));
- console.log(`[${connection.deviceId}] Sent alarm to ESP32: ID=${functionResult.alarmID}, time=${functionResult.formattedTime}`);
- }
- } else if (funcName === "cancel_alarm") {
- const which = funcArgs.which || "next";
- functionResult = cancelAlarm(connection.deviceId, which);
- 
- // Send cancel request to ESP32
- if (functionResult.success) {
- connection.socket.send(JSON.stringify({
- type: "cancelAlarm",
- which: which
- }));
- console.log(`[${connection.deviceId}] Sent alarm cancel request: ${which}`);
- }
- } else if (funcName === "set_timer") {
- const durationMinutes = funcArgs.duration_minutes || 0;
- functionResult = setTimer(connection.deviceId, durationMinutes);
- 
- // Send timer data to ESP32
- if (functionResult.success) {
- connection.socket.send(JSON.stringify({
- type: "timerSet",
- durationSeconds: functionResult.durationSeconds
- }));
- }
- } else if (funcName === "cancel_timer") {
- functionResult = cancelTimer(connection.deviceId);
- 
- if (functionResult.success) {
- connection.socket.send(JSON.stringify({ type: "timerCancelled" }));
- }
- } else if (funcName === "get_weather_forecast") {
- const timeframe = funcArgs.timeframe || "current";
- 
- if (!weatherDataCache) {
- await fetchWeatherData();
- }
- 
- functionResult = getWeather(connection.deviceId, timeframe);
- console.log(`[${connection.deviceId}] Weather (${timeframe}): ${functionResult.summary || functionResult.error}`);
- } else if (funcName === "get_moon_phase") {
- functionResult = getMoonPhase();
- console.log(`[${connection.deviceId}] Moon phase: ${functionResult.phaseName} ${functionResult.phaseEmoji} (${functionResult.illumination}% illuminated)`);
- 
- // Only forward moon visualization to ESP32 when the user explicitly asked this turn.
- if (functionResult.success && connection.userSpokeThisTurn) {
- connection.socket.send(JSON.stringify({
- type: "moonData",
- phaseName: functionResult.phaseName,
- illumination: functionResult.illumination,
- moonAge: functionResult.moonAge
- }));
- } else if (functionResult.success) {
- console.log(`[${connection.deviceId}] Moon data suppressed (proactive call — user did not ask about the moon this turn)`);
- }
- } else if (funcName === "control_pomodoro") {
- const action = (funcArgs.action || "start") as string;
- console.log(`[${connection.deviceId}] control_pomodoro: ${action}`);
- 
- if (action === "start") {
- const focusMinutes = funcArgs.focus_minutes || 25;
- const shortBreakMinutes = funcArgs.short_break_minutes || 5;
- const longBreakMinutes = funcArgs.long_break_minutes || 15;
- console.log(`[${connection.deviceId}] Starting Pomodoro: ${focusMinutes}min focus, ${shortBreakMinutes}min short break, ${longBreakMinutes}min long break`);
- connection.socket.send(JSON.stringify({
- type: "pomodoroStart",
- focusMinutes,
- shortBreakMinutes,
- longBreakMinutes
- }));
- const isCustom = funcArgs.focus_minutes || funcArgs.short_break_minutes || funcArgs.long_break_minutes;
- functionResult = {
- success: true,
- message: isCustom
- ? `Pomodoro started: ${focusMinutes}-min focus, ${shortBreakMinutes}-min short break, ${longBreakMinutes}-min long break`
- : "Pomodoro started with standard durations: 25-min focus, 5-min short break, 15-min long break"
- };
- } else if (action === "pause") {
- connection.socket.send(JSON.stringify({ type: "pomodoroPause" }));
- functionResult = { success: true, message: "Pomodoro timer paused" };
- } else if (action === "resume") {
- connection.socket.send(JSON.stringify({ type: "pomodoroResume" }));
- functionResult = { success: true, message: "Pomodoro timer resumed" };
- } else if (action === "stop") {
- connection.socket.send(JSON.stringify({ type: "pomodoroStop" }));
- functionResult = { success: true, message: "Pomodoro session ended" };
- } else if (action === "skip") {
- connection.socket.send(JSON.stringify({ type: "pomodoroSkip" }));
- functionResult = { success: true, message: "Skipped to next Pomodoro session" };
- } else {
- functionResult = { success: false, error: `Unknown Pomodoro action: ${action}` };
- }
- } else if (funcName === "control_ambient") {
- const action = (funcArgs.action || "start") as string;
- const sound = (funcArgs.sound || "rain").toLowerCase();
- console.log(`[${connection.deviceId}] control_ambient: ${action}${action === "start" ? ` (${sound})` : ""}`);
- 
- if (action === "start") {
- // Defer to after Gemini finishes speaking so ambient doesn't overlap the verbal confirmation
- connection.pendingModeMessage = { type: "ambientStart", sound };
- functionResult = { success: true, message: `Playing ${sound} ambient sound` };
- } else {
- connection.pendingModeMessage = { type: "switchToIdle" };
- functionResult = { success: true, message: "Ambient sound stopped" };
- }
- } else if (funcName === "control_lamp") {
- const action = (funcArgs.action || "start") as string;
- const color = (funcArgs.color || "white").toLowerCase();
- console.log(`[${connection.deviceId}] control_lamp: ${action}${action === "start" ? ` (${color})` : ""}`);
- 
- if (action === "start") {
- connection.pendingModeMessage = { type: "lampStart", color };
- functionResult = { success: true, message: `Lamp turned on (${color})` };
- } else {
- connection.pendingModeMessage = { type: "switchToIdle" };
- functionResult = { success: true, message: "Lamp turned off" };
- }
- } else if (funcName === "control_meditation") {
- const action = (funcArgs.action || "start") as string;
- console.log(`[${connection.deviceId}] control_meditation: ${action}`);
- 
- if (action === "start") {
- // Defer to after Gemini finishes speaking so the verbal confirmation plays cleanly
- connection.pendingModeMessage = { type: "meditationStart" };
- functionResult = { success: true, message: "Meditation session started" };
- } else {
- connection.pendingModeMessage = { type: "switchToIdle" };
- functionResult = { success: true, message: "Meditation session stopped" };
- }
- } else if (funcName === "search_radio_stations") {
- const query = (funcArgs.query || "") as string;
- const genre = (funcArgs.genre || "") as string;
- const limit = Math.min((funcArgs.limit as number) || 5, 8);
- console.log(`[${connection.deviceId}] search_radio_stations: query="${query}" genre="${genre}" limit=${limit}`);
- try {
- const stations = await searchRadioStations(query, genre, limit);
- functionResult = { success: true, stations };
- } catch (err) {
- console.error(`[${connection.deviceId}] Radio search failed:`, err);
- functionResult = { success: false, error: "Radio search failed. Please try again." };
- }
- } else if (funcName === "play_radio") {
- const stationId = (funcArgs.station_id || "") as string;
- const stationName = (funcArgs.station_name || "Radio") as string;
- console.log(`[${connection.deviceId}] play_radio: ${stationName} (${stationId})`);
- const station = radioStationCache.get(stationId);
- if (!station) {
- functionResult = { success: false, error: "Station not found. Please search for stations first." };
- } else {
- const isHLS = station.url.includes(".m3u8");
- connection.pendingModeMessage = { type: "radioStart", stationName, streamUrl: station.url, isHLS };
- functionResult = { success: true, message: `Starting ${stationName}${isHLS ? " (may take a moment to load)" : ""}` };
- }
- } else if (funcName === "stop_radio") {
- console.log(`[${connection.deviceId}] stop_radio`);
- connection.pendingModeMessage = { type: "switchToIdle" };
- functionResult = { success: true, message: "Radio stopped" };
- } else if (funcName === "set_volume_level") {
- const level = Math.max(1, Math.min(10, (funcArgs.level as number) || 5));
- console.log(`[${connection.deviceId}] set_volume_level: ${level}`);
- connection.socket.send(JSON.stringify({ type: "functionCall", name: "set_volume_level", args: { level } }));
- functionResult = { success: true, message: `Volume set to level ${level}` };
- }
+        // Dispatch: look up the handler by funcName, passing (funcArgs, connection).
+        // Unknown tools get { success: false, error: "Unknown function: <name>" }.
+        const functionResult = await (toolHandlers[funcName] ?? (async () => ({ success: false, error: `Unknown function: ${funcName}` })))(funcArgs, connection);
  
  // Send function response back to Gemini
  const functionResponse = {
@@ -2283,7 +2007,7 @@ Device self-awareness: before answering any question about what the device is cu
  const idleMs = Date.now() - (connection.lastUserActivity ?? 0);
  const isIdle = idleMs > IDLE_RECONNECT_THRESHOLD_MS;
  if (isIdle) {
- console.log(`[${connection.deviceId}] Device idle for ${Math.round(idleMs / 60000)}min — skipping Gemini reconnect until next user turn`);
+ console.log(`[${connection.deviceId}] Device idle for ${Math.round(idleMs / 60000)}min â€” skipping Gemini reconnect until next user turn`);
  } else {
  console.log(`[${connection.deviceId}] Scheduling Gemini reconnection in 1s (active ${Math.round(idleMs / 1000)}s ago)...`);
  setTimeout(() => {

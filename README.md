@@ -34,9 +34,9 @@ Microphone (INMP441):
   VCC           → 3.3V
 
 Speaker (MAX98357A):
-  LRC (Sync)    → GPIO 5
-  BCLK (Clock)  → GPIO 6
-  DIN (Data)    → GPIO 7
+  LRC (Sync)    → GPIO 4
+  BCLK (Clock)  → GPIO 5
+  DIN (Data)    → GPIO 6
   GND           → ESP32 GND
   VIN           → 5V
 
@@ -46,8 +46,8 @@ LED Strip (WS2812B):
   VCC/5V        → 5V power supply
 
 Touch Pads (TTP223):
-  PAD1 (Start)  → GPIO 3
-  PAD2 (Stop)   → GPIO 4
+  PAD1 (Start)  → GPIO 2
+  PAD2 (Stop)   → GPIO 3
   GND           → ESP32 GND
   VCC           → 3.3V
 

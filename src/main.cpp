@@ -1,4 +1,4 @@
-#include <Arduino.h>
+﻿#include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WebSocketsClient.h>
@@ -12,6 +12,8 @@
 #include "types.h"
 #include "SeaGooseberryVisualizer.h"
 #include "EyeAnimationVisualizer.h"
+#include "ws_handler.h"
+#include "LedModes.h"
 
 // Debug logging macro - controlled by Config.h DEBUG_LOGS flag
 #ifdef DEBUG_LOGS
@@ -90,10 +92,10 @@ QueueHandle_t audioOutputQueue; // Queue for playback audio
 // Audio queue size: 30 packets = ~1.2s buffer
 // Provides good jitter tolerance with paced delivery
 // Tuning: Increase for more buffer (higher latency), decrease for lower latency (more underruns)
-#define AUDIO_QUEUE_SIZE 30
+// AUDIO_QUEUE_SIZE is defined in Config.h
 
 LEDMode currentLEDMode = LED_IDLE;  // Start directly in idle mode
-bool ambientVUMode = false;  // Toggle for ambient sound VU meter mode
+bool isAmbientVUMode = false;  // Toggle for ambient sound VU meter mode
 
 // Ambient sound type (for cycling within AMBIENT mode)
 AmbientSoundType currentAmbientSoundType = SOUND_RAIN;
@@ -109,6 +111,9 @@ MoonState moonState = {"", 0, 0.0, 0, false};
 
 // LED mutex for thread-safe access
 SemaphoreHandle_t ledMutex = NULL;
+
+// I2S speaker mutex - prevents audioTask and tone functions writing I2S_NUM_1 simultaneously
+SemaphoreHandle_t i2sSpeakerMutex = NULL;
 
 // Ambient sound state
 AmbientSound ambientSound = {"", false, 0, 0, 0};
@@ -141,13 +146,17 @@ void audioTask(void * parameter);
 void updateLEDs();
 bool initI2SMic();
 bool initI2SSpeaker();
-#include "ws_handler.h"
 bool detectVoiceActivity(int16_t* samples, size_t count);
 void sendAudioChunk(uint8_t* data, size_t length);
 void playZenBell();
 void playShutdownSound();
 void playVolumeChime();
 void clearAudioAndLEDs();  // Helper to clear audio buffers and LEDs
+// Loop sub-tasks (defined just before loop())
+static void checkAlarms();
+static void handleFlashAnimations();
+static void handlePomodoroTick();
+static void handleAmbientCompletion();
 
 // ============== HELPER FUNCTIONS ==============
 
@@ -248,6 +257,14 @@ void setup() {
  Serial.println("FATAL: Failed to create LED mutex - halting!");
  while (true) { delay(1000); } // Hard halt - nothing is safe without the mutex
  }
+
+ // Create I2S speaker mutex to prevent audioTask and tone functions writing I2S_NUM_1 simultaneously
+ i2sSpeakerMutex = xSemaphoreCreateMutex();
+ if (i2sSpeakerMutex == NULL) {
+ Serial.println("FATAL: Failed to create I2S speaker mutex - halting!");
+ while (true) { delay(1000); }
+ }
+
  Serial.println("\n\n========================================");
  Serial.println("=== JELLYBERRY BOOT STARTING ===");
  Serial.println("========================================");
@@ -385,7 +402,7 @@ void setup() {
     
     webSocket.onEvent(onWebSocketEvent);
     webSocket.setReconnectInterval(WS_RECONNECT_INTERVAL);
-    webSocket.enableHeartbeat(60000, 30000, 5);  // Ping every 60s, timeout 30s, 5 retries = ~210s tolerance
+    webSocket.enableHeartbeat(WS_HEARTBEAT_PING_MS, WS_HEARTBEAT_TIMEOUT_MS, WS_HEARTBEAT_RETRIES);
     Serial.println("WebSocket initialized with relaxed keepalive");
     
     // Note: TCP buffer sizes are controlled by lwIP configuration, not runtime changeable
@@ -402,11 +419,227 @@ void setup() {
     Serial.println("Touch START pad to begin recording");
 }
 
+// ============================================================
+// Loop helpers — extracted from loop() for readability
+// ============================================================
+
+static void checkAlarms() {
+static uint32_t lastAlarmCheck = 0;
+// Check alarms every 10 seconds
+if (alarmState.active && !alarmState.ringing && millis() - lastAlarmCheck > 10000) {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+        time_t now = mktime(&timeinfo);
+        
+        // Check each alarm
+        for (int i = 0; i < MAX_ALARMS; i++) {
+            if (alarms[i].enabled && !alarms[i].triggered) {
+                // Check if snoozed
+                if (alarms[i].snoozed) {
+                    if (now >= alarms[i].snoozeUntil) {
+                        // Snooze period ended - ring again
+                        alarms[i].snoozed = false;
+                        
+                        // Save current state before switching to alarm
+                        alarmState.previousMode = currentLEDMode;
+                        alarmState.wasRecording = recordingActive;
+                        alarmState.wasPlayingResponse = isPlayingResponse;
+                        
+                        alarms[i].triggered = true;  // Prevent re-triggering every scan cycle
+                        alarmState.ringing = true;
+                        alarmState.ringStartTime = millis();
+                        alarmState.pulseStartTime = millis();
+                        alarmState.pulseRadius = 0.0f;
+                        currentLEDMode = LED_ALARM;
+                        DEBUG_PRINT(" Alarm %u ringing after snooze! (interrupted mode: %d)\n", alarms[i].alarmID, alarmState.previousMode);
+                        
+                        // Play alarm sound
+                        isPlayingAlarm = true;
+                        isPlayingResponse = true;
+                        firstAudioChunk = true;
+                        lastAudioChunkTime = millis();
+                        JsonDocument alarmDoc;
+                        alarmDoc["action"] = "requestAlarm";
+                        String alarmMsg;
+                        serializeJson(alarmDoc, alarmMsg);
+                        DEBUG_PRINTLN(" Requesting alarm sound from server");
+                        webSocket.sendTXT(alarmMsg);
+                        
+                        break;
+                    }
+                } else if (now >= alarms[i].triggerTime) {
+                    // Alarm time reached!
+                    
+                    // Save current state before switching to alarm
+                    alarmState.previousMode = currentLEDMode;
+                    alarmState.wasRecording = recordingActive;
+                    alarmState.wasPlayingResponse = isPlayingResponse;
+                    
+                    alarms[i].triggered = true;  // Prevent re-triggering every 10-second scan cycle
+                    alarmState.ringing = true;
+                    alarmState.ringStartTime = millis();
+                    alarmState.pulseStartTime = millis();
+                    alarmState.pulseRadius = 0.0f;
+                    currentLEDMode = LED_ALARM;
+                    DEBUG_PRINT(" Alarm %u triggered at %s (interrupted mode: %d)\n", alarms[i].alarmID, asctime(&timeinfo), alarmState.previousMode);
+                    
+                    // Play alarm sound
+                    isPlayingAlarm = true;
+                    isPlayingResponse = true;
+                    firstAudioChunk = true;
+                    lastAudioChunkTime = millis();
+                    JsonDocument alarmDoc;
+                    alarmDoc["action"] = "requestAlarm";
+                    String alarmMsg;
+                    serializeJson(alarmDoc, alarmMsg);
+                    DEBUG_PRINTLN(" Requesting alarm sound from server");
+                    webSocket.sendTXT(alarmMsg);
+                    
+                    break;
+                }
+            }
+        }
+    }
+    lastAlarmCheck = millis();
+}
+}
+
+static void handleFlashAnimations() {
+// Handle non-blocking Pomodoro flash animation
+if (pomodoroState.flashing && (millis() - pomodoroState.flashStartTime) >= 200) {
+    pomodoroState.flashCount++;
+    pomodoroState.flashStartTime = millis();
+    
+    if (pomodoroState.flashCount >= 6) {
+        // Animation complete (3 on/off cycles = 6 state changes)
+        pomodoroState.flashing = false;
+    } else {
+        // Toggle LED state
+        if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
+            if (pomodoroState.flashCount % 2 == 0) {
+                fill_solid(leds, NUM_LEDS, CRGB::White);
+            } else {
+                fill_solid(leds, NUM_LEDS, CRGB::Black);
+            }
+            FastLED.show();
+            xSemaphoreGive(ledMutex);
+        }
+    }
+}
+
+// Handle non-blocking timer flash animation (triggered by timerExpired WebSocket message).
+// Runs at 200ms intervals in loop() — WebSocket task is never blocked.
+if (timerState.flashing && (millis() - timerState.flashStartTime) >= 200) {
+    timerState.flashCount++;
+    timerState.flashStartTime = millis();
+
+    if (timerState.flashCount >= 6) {
+        // Animation complete (3 on/off cycles = 6 state changes)
+        timerState.flashing = false;
+    } else {
+        // Toggle LEDs green/black
+        if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
+            if (timerState.flashCount % 2 == 0) {
+                fill_solid(leds, NUM_LEDS, CRGB::Green);
+            } else {
+                fill_solid(leds, NUM_LEDS, CRGB::Black);
+            }
+            FastLED.show();
+            xSemaphoreGive(ledMutex);
+        }
+    }
+}
+}
+
+static void handlePomodoroTick() {
+// Check for Pomodoro session completion and auto-advance
+if (currentLEDMode == LED_POMODORO && pomodoroState.active && !pomodoroState.paused && pomodoroState.startTime > 0) {
+    uint32_t elapsed = (millis() - pomodoroState.startTime) / 1000;
+    int secondsRemaining = pomodoroState.totalSeconds - (int)elapsed;
+    
+    if (secondsRemaining <= 0) {
+        DEBUG_PRINTLN(" Pomodoro session complete!");
+        
+        // Start non-blocking flash animation
+        pomodoroState.flashing = true;
+        pomodoroState.flashCount = 0;
+        pomodoroState.flashStartTime = millis();
+        
+        // Play completion chime
+        playZenBell();
+        
+        // Advance to next session
+        if (pomodoroState.currentSession == PomodoroState::FOCUS) {
+            pomodoroState.sessionCount++;
+            
+            if (pomodoroState.sessionCount >= 4) {
+                // After 4 focus sessions, take a long break
+                DEBUG_PRINT("   Focus complete! Starting long break (%d min)\n", pomodoroState.longBreakDuration);
+                pomodoroState.currentSession = PomodoroState::LONG_BREAK;
+                pomodoroState.totalSeconds = pomodoroState.longBreakDuration * 60;
+                
+                // Start immediately (don't pause)
+                pomodoroState.startTime = millis();
+                pomodoroState.pausedTime = 0;
+                pomodoroState.paused = false;
+            } else {
+                // Normal short break after focus
+                DEBUG_PRINT("   Focus complete! Starting short break (%d min) [%d/4]\n", pomodoroState.shortBreakDuration, pomodoroState.sessionCount);
+                pomodoroState.currentSession = PomodoroState::SHORT_BREAK;
+                pomodoroState.totalSeconds = pomodoroState.shortBreakDuration * 60;
+                
+                // Start immediately (don't pause)
+                pomodoroState.startTime = millis();
+                pomodoroState.pausedTime = 0;
+                pomodoroState.paused = false;
+            }
+        } else if (pomodoroState.currentSession == PomodoroState::LONG_BREAK) {
+            // Long break complete - END OF CYCLE, return to IDLE
+            DEBUG_PRINTLN("   Long break complete! Pomodoro cycle finished - returning to IDLE");
+            pomodoroState.active = false;
+            pomodoroState.currentSession = PomodoroState::FOCUS;
+            pomodoroState.totalSeconds = pomodoroState.focusDuration * 60;
+            pomodoroState.sessionCount = 0;  // Reset counter for next cycle
+            pomodoroState.startTime = 0;
+            pomodoroState.pausedTime = 0;
+            pomodoroState.paused = false;
+            currentLEDMode = LED_IDLE;  // Return to IDLE - cycle complete
+        } else {
+            // Short break complete, return to focus
+            DEBUG_PRINT("   Break complete! Starting focus session (%d min)\n", pomodoroState.focusDuration);
+            pomodoroState.currentSession = PomodoroState::FOCUS;
+            pomodoroState.totalSeconds = pomodoroState.focusDuration * 60;
+            
+            // Start immediately (don't pause)
+            pomodoroState.startTime = millis();
+            pomodoroState.pausedTime = 0;
+            pomodoroState.paused = false;
+        }
+    }
+}
+}
+
+static void handleAmbientCompletion() {
+// Check for ambient sound streaming completion
+// When stream ends, return to IDLE mode (no looping)
+// Skip this check for meditation mode (has its own completion handler)
+if (isPlayingAmbient && ambientSound.active && !firstAudioChunk && 
+    (millis() - lastAudioChunkTime) > AMBIENT_COMPLETION_TIMEOUT_MS && currentLEDMode != LED_MEDITATION) {
+    Serial.printf("Ambient sound completed: %s - returning to IDLE\n", ambientSound.name);
+    
+    // Return to IDLE mode
+    currentLEDMode = LED_IDLE;
+    isPlayingAmbient = false;
+    isPlayingResponse = false;
+    ambientSound.active = false;
+    ambientSound.name[0] = '\0';
+}
+}
+
 // ============== MAIN LOOP ==============
 void loop() {
     static uint32_t lastPrint = 0;
     static uint32_t lastWiFiCheck = 0;
-    static uint32_t lastAlarmCheck = 0;
     static uint32_t lastBrightnessCheck = 0;
 
     // Log mode changes
@@ -416,7 +649,7 @@ void loop() {
             const char* modeNames[] = {
                 "BOOT", "IDLE", "RECORDING", "PROCESSING", "AUDIO_REACTIVE",
                 "CONNECTED", "ERROR", "TIDE", "TIMER", "MOON",
-                "AMBIENT_VU", "AMBIENT", "POMODORO", "MEDITATION",
+                "AMBIENT_VU", "AMBIENT", "RADIO", "POMODORO", "MEDITATION",
                 "LAMP", "SEA_GOOSEBERRY", "EYES", "ALARM", "CONVERSATION"
             };
             int idx = (int)currentLEDMode;
@@ -447,83 +680,7 @@ void loop() {
         lastWiFiCheck = millis();
     }
     
-    // Check alarms every 10 seconds
-    if (alarmState.active && !alarmState.ringing && millis() - lastAlarmCheck > 10000) {
-        struct tm timeinfo;
-        if (getLocalTime(&timeinfo)) {
-            time_t now = mktime(&timeinfo);
-            
-            // Check each alarm
-            for (int i = 0; i < MAX_ALARMS; i++) {
-                if (alarms[i].enabled && !alarms[i].triggered) {
-                    // Check if snoozed
-                    if (alarms[i].snoozed) {
-                        if (now >= alarms[i].snoozeUntil) {
-                            // Snooze period ended - ring again
-                            alarms[i].snoozed = false;
-                            
-                            // Save current state before switching to alarm
-                            alarmState.previousMode = currentLEDMode;
-                            alarmState.wasRecording = recordingActive;
-                            alarmState.wasPlayingResponse = isPlayingResponse;
-                            
-                            alarms[i].triggered = true;  // Prevent re-triggering every scan cycle
-                            alarmState.ringing = true;
-                            alarmState.ringStartTime = millis();
-                            alarmState.pulseStartTime = millis();
-                            alarmState.pulseRadius = 0.0f;
-                            currentLEDMode = LED_ALARM;
-                            DEBUG_PRINT(" Alarm %u ringing after snooze! (interrupted mode: %d)\n", alarms[i].alarmID, alarmState.previousMode);
-                            
-                            // Play alarm sound
-                            isPlayingAlarm = true;
-                            isPlayingResponse = true;
-                            firstAudioChunk = true;
-                            lastAudioChunkTime = millis();
-                            JsonDocument alarmDoc;
-                            alarmDoc["action"] = "requestAlarm";
-                            String alarmMsg;
-                            serializeJson(alarmDoc, alarmMsg);
-                            DEBUG_PRINTLN(" Requesting alarm sound from server");
-                            webSocket.sendTXT(alarmMsg);
-                            
-                            break;
-                        }
-                    } else if (now >= alarms[i].triggerTime) {
-                        // Alarm time reached!
-                        
-                        // Save current state before switching to alarm
-                        alarmState.previousMode = currentLEDMode;
-                        alarmState.wasRecording = recordingActive;
-                        alarmState.wasPlayingResponse = isPlayingResponse;
-                        
-                        alarms[i].triggered = true;  // Prevent re-triggering every 10-second scan cycle
-                        alarmState.ringing = true;
-                        alarmState.ringStartTime = millis();
-                        alarmState.pulseStartTime = millis();
-                        alarmState.pulseRadius = 0.0f;
-                        currentLEDMode = LED_ALARM;
-                        DEBUG_PRINT(" Alarm %u triggered at %s (interrupted mode: %d)\n", alarms[i].alarmID, asctime(&timeinfo), alarmState.previousMode);
-                        
-                        // Play alarm sound
-                        isPlayingAlarm = true;
-                        isPlayingResponse = true;
-                        firstAudioChunk = true;
-                        lastAudioChunkTime = millis();
-                        JsonDocument alarmDoc;
-                        alarmDoc["action"] = "requestAlarm";
-                        String alarmMsg;
-                        serializeJson(alarmDoc, alarmMsg);
-                        DEBUG_PRINTLN(" Requesting alarm sound from server");
-                        webSocket.sendTXT(alarmMsg);
-                        
-                        break;
-                    }
-                }
-            }
-        }
-        lastAlarmCheck = millis();
-    }
+    checkAlarms();
     
     // Ignore touch pads for first 5 seconds after boot to avoid false triggers
     static const uint32_t bootIgnoreTime = 5000;
@@ -532,11 +689,11 @@ void loop() {
     static bool startPressed = false;
     static bool stopPressed = false;
     static uint32_t lastDebounceTime = 0;
-    const uint32_t debounceDelay = 10;  // 10ms - TTP223 has hardware debounce
+const uint32_t debounceDelay = DEBOUNCE_DELAY_MS;  // TTP223 has hardware debounce
     
     // Button 2 long-press detection
     static uint32_t button2PressStart = 0;
-    const uint32_t BUTTON2_LONG_PRESS = 2000;  // 2 seconds
+const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
     
     if (millis() > bootIgnoreTime && (millis() - lastDebounceTime) > debounceDelay) {
         bool startTouch = digitalRead(TOUCH_PAD_START_PIN) == HIGH;
@@ -575,7 +732,7 @@ void loop() {
                 isPlayingResponse = false;
                 isPlayingAmbient = false;
                 ambientSound.active = false;
-                ambientSound.name = "";
+                ambientSound.name[0] = '\0';
                 ambientSound.sequence++;
                 i2s_zero_dma_buffer(I2S_NUM_1);
             }
@@ -584,7 +741,7 @@ void loop() {
             moonState.active = false;
             tideState.active = false;
             timerState.active = false;
-            ambientVUMode = false;
+            isAmbientVUMode = false;
             
             // Clear Pomodoro
             if (pomodoroState.active) {
@@ -617,8 +774,8 @@ void loop() {
                 }
                 radioState.active = false;
                 radioState.streaming = false;
-                radioState.stationName = "";
-                radioState.streamUrl = "";
+                radioState.stationName[0] = '\0';
+                radioState.streamUrl[0] = '\0';
             }
             
             // Return to IDLE and start recording immediately
@@ -672,12 +829,12 @@ void loop() {
             if (modeToCheck == LED_IDLE || modeToCheck == LED_MOON || 
                 modeToCheck == LED_TIDE || modeToCheck == LED_TIMER) {
                 // Show marquee before switching
-                ambientVUMode = true;
+                isAmbientVUMode = true;
                 ambientSound.sequence++;  // Increment for mode change
                 currentLEDMode = LED_AMBIENT_VU;
                 DEBUG_PRINTLN(" Ambient VU meter mode enabled");
             } else if (modeToCheck == LED_AMBIENT_VU) {
-                ambientVUMode = false;
+                isAmbientVUMode = false;
                 
                 // Stop any in-flight ambient stream before entering a no-audio mode.
                 // Defensive: AMBIENT_VU normally has no audio, but a stale stream could
@@ -712,7 +869,7 @@ void loop() {
                 Serial.println("Flushed audio queue for clean Jelly->Rain transition");
                 
                 currentAmbientSoundType = SOUND_RAIN;  // Start with rain
-                ambientSound.name = "rain";
+                strlcpy(ambientSound.name, "rain", sizeof(ambientSound.name));
                 ambientSound.active = true;
                 ambientSound.sequence++;
                 isPlayingAmbient = true;
@@ -761,7 +918,7 @@ void loop() {
                 isPlayingResponse = false;
                 isPlayingAmbient = false;
                 ambientSound.active = false;
-                ambientSound.name = "";
+                ambientSound.name[0] = '\0';
                 ambientSound.sequence++;
                 i2s_zero_dma_buffer(I2S_NUM_1);
                 
@@ -769,8 +926,8 @@ void loop() {
                 radioState.active = true;
                 radioState.streaming = false;
                 radioState.visualsActive = true;
-                radioState.stationName = "";
-                radioState.streamUrl = "";
+                radioState.stationName[0] = '\0';
+                radioState.streamUrl[0] = '\0';
                 radioState.savedVolume = volumeMultiplier;
 
                 // Notify server: source=button triggers Gemini greeting
@@ -807,14 +964,14 @@ void loop() {
                 // Clear radio state
                 radioState.active = false;
                 radioState.streaming = false;
-                radioState.stationName = "";
-                radioState.streamUrl = "";
+                radioState.stationName[0] = '\0';
+                radioState.streamUrl[0] = '\0';
 
                 // Clear ambient/audio state
                 isPlayingResponse = false;
                 isPlayingAmbient = false;
                 ambientSound.active = false;
-                ambientSound.name = "";
+                ambientSound.name[0] = '\0';
                 ambientSound.sequence++;
                 ambientSound.drainUntil = millis() + 2000;
 
@@ -910,7 +1067,7 @@ void loop() {
                 i2s_zero_dma_buffer(I2S_NUM_1);
 
                 // Request ROOT chakra audio immediately
-                ambientSound.name = "bell001";
+                strlcpy(ambientSound.name, "bell001", sizeof(ambientSound.name));
                 ambientSound.active = true;
                 isPlayingAmbient = true;
                 isPlayingResponse = false;
@@ -955,7 +1112,7 @@ void loop() {
                 isPlayingResponse = false;
                 isPlayingAmbient = false;
                 ambientSound.active = false;
-                ambientSound.name = "";
+                ambientSound.name[0] = '\0';
                 ambientSound.sequence++;
                 
                 // Initialize lamp state
@@ -1036,25 +1193,25 @@ void loop() {
             // If coming from Sea Gooseberry, go to Rain
             if (currentLEDMode == LED_SEA_GOOSEBERRY) {
                 currentAmbientSoundType = SOUND_RAIN;
-                ambientSound.name = "rain";
+                strlcpy(ambientSound.name, "rain", sizeof(ambientSound.name));
                 Serial.printf("MODE: Rain (seq %d)\n", ambientSound.sequence + 1);
             }
             // Cycle to next sound in Ambient mode
             else if (currentAmbientSoundType == SOUND_RAIN) {
                 currentAmbientSoundType = SOUND_OCEAN;
-                ambientSound.name = "ocean";
+                strlcpy(ambientSound.name, "ocean", sizeof(ambientSound.name));
                 Serial.printf("MODE: Ocean (seq %d)\n", ambientSound.sequence + 1);
             } else if (currentAmbientSoundType == SOUND_OCEAN) {
                 currentAmbientSoundType = SOUND_RAINFOREST;
-                ambientSound.name = "rainforest";
+                strlcpy(ambientSound.name, "rainforest", sizeof(ambientSound.name));
                 Serial.printf("MODE: Rainforest (seq %d)\n", ambientSound.sequence + 1);
             } else if (currentAmbientSoundType == SOUND_RAINFOREST) {
                 currentAmbientSoundType = SOUND_FIRE;
-                ambientSound.name = "fire";
+                strlcpy(ambientSound.name, "fire", sizeof(ambientSound.name));
                 Serial.printf("MODE: Fire (seq %d)\n", ambientSound.sequence + 1);
             } else {  // SOUND_FIRE
                 currentAmbientSoundType = SOUND_RAIN;
-                ambientSound.name = "rain";
+                strlcpy(ambientSound.name, "rain", sizeof(ambientSound.name));
                 Serial.printf("MODE: Rain (seq %d)\n", ambientSound.sequence + 1);
             }
             
@@ -1084,7 +1241,7 @@ void loop() {
         // Button 2 cycles modes as usual
         static uint32_t button1PressStart = 0;
         static uint32_t lastPomodoroAction = 0;
-        const uint32_t LONG_PRESS_DURATION = 2000;  // 2 seconds
+        const uint32_t LONG_PRESS_DURATION = LONG_PRESS_MS;  // 2 seconds
         const uint32_t ACTION_DEBOUNCE = 500;  // 500ms between actions
         
         if (currentLEDMode == LED_POMODORO && pomodoroState.active) {
@@ -1199,7 +1356,7 @@ void loop() {
                 serializeJson(reqDoc, reqMsg);
                 webSocket.sendTXT(reqMsg);
                 
-                ambientSound.name = soundName;
+                strlcpy(ambientSound.name, soundName, sizeof(ambientSound.name));
                 ambientSound.active = true;
                 isPlayingAmbient = true;  // Re-enable playback for new sound
                 isPlayingResponse = false;
@@ -1237,7 +1394,7 @@ void loop() {
                 
                 // Clear ambient audio state
                 ambientSound.active = false;
-                ambientSound.name = "";
+                ambientSound.name[0] = '\0';
                 ambientSound.sequence++;
                 ambientSound.drainUntil = millis() + 1000;  // Drain for 1s
                 
@@ -1278,7 +1435,7 @@ void loop() {
             
             // Clear alarm from memory
             for (int i = 0; i < MAX_ALARMS; i++) {
-                if (alarms[i].enabled && !alarms[i].triggered) {
+                if (alarms[i].enabled && alarms[i].triggered) {
                     DEBUG_PRINT(" Alarm %u dismissed and cleared from slot %d\n", alarms[i].alarmID, i);
                     
                     // Zero out the alarm slot
@@ -1417,8 +1574,8 @@ void loop() {
             }
             
             // Exit ambient VU mode
-            if (ambientVUMode) {
-                ambientVUMode = false;
+            if (isAmbientVUMode) {
+                isAmbientVUMode = false;
                 DEBUG_PRINTLN(" Ambient VU meter mode disabled");
             }
 
@@ -1586,7 +1743,7 @@ void loop() {
                     // Flush any residual Gemini audio still in queue
                     { AudioChunk dummy; while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {} }
                     i2s_zero_dma_buffer(I2S_NUM_1);
-                    ambientSound.name = "bell001";
+                    strlcpy(ambientSound.name, "bell001", sizeof(ambientSound.name));
                     ambientSound.active = true;
                     isPlayingAmbient = true;
                     isPlayingResponse = false;
@@ -1650,8 +1807,8 @@ void loop() {
                 currentLEDMode = LED_TIDE;
                 tideState.displayStartTime = millis();
                 DEBUG_PRINT(" Audio playback complete - switching to TIDE display (state=%s, level=%.2f)\n", 
-                             tideState.state.c_str(), tideState.waterLevel);
-            } else if (ambientVUMode) {
+                             tideState.state, tideState.waterLevel);
+            } else if (isAmbientVUMode) {
                 currentLEDMode = LED_AMBIENT_VU;
                 DEBUG_PRINTLN(" Audio playback complete - returning to AMBIENT VU mode");
             } else {
@@ -1662,50 +1819,7 @@ void loop() {
         }
     }
     
-    // Handle non-blocking Pomodoro flash animation
-    if (pomodoroState.flashing && (millis() - pomodoroState.flashStartTime) >= 200) {
-        pomodoroState.flashCount++;
-        pomodoroState.flashStartTime = millis();
-        
-        if (pomodoroState.flashCount >= 6) {
-            // Animation complete (3 on/off cycles = 6 state changes)
-            pomodoroState.flashing = false;
-        } else {
-            // Toggle LED state
-            if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-                if (pomodoroState.flashCount % 2 == 0) {
-                    fill_solid(leds, NUM_LEDS, CRGB::White);
-                } else {
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                }
-                FastLED.show();
-                xSemaphoreGive(ledMutex);
-            }
-        }
-    }
-
-    // Handle non-blocking timer flash animation (triggered by timerExpired WebSocket message).
-    // Runs at 200ms intervals in loop() — WebSocket task is never blocked.
-    if (timerState.flashing && (millis() - timerState.flashStartTime) >= 200) {
-        timerState.flashCount++;
-        timerState.flashStartTime = millis();
-
-        if (timerState.flashCount >= 6) {
-            // Animation complete (3 on/off cycles = 6 state changes)
-            timerState.flashing = false;
-        } else {
-            // Toggle LEDs green/black
-            if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-                if (timerState.flashCount % 2 == 0) {
-                    fill_solid(leds, NUM_LEDS, CRGB::Green);
-                } else {
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                }
-                FastLED.show();
-                xSemaphoreGive(ledMutex);
-            }
-        }
-    }
+    handleFlashAnimations();
     
     // Update Sea Gooseberry animation (non-blocking)
     if (currentLEDMode == LED_SEA_GOOSEBERRY) {
@@ -1717,86 +1831,9 @@ void loop() {
         eyeAnimation.update(millis());
     }
     
-    // Check for Pomodoro session completion and auto-advance
-    if (currentLEDMode == LED_POMODORO && pomodoroState.active && !pomodoroState.paused && pomodoroState.startTime > 0) {
-        uint32_t elapsed = (millis() - pomodoroState.startTime) / 1000;
-        int secondsRemaining = pomodoroState.totalSeconds - (int)elapsed;
-        
-        if (secondsRemaining <= 0) {
-            DEBUG_PRINTLN(" Pomodoro session complete!");
-            
-            // Start non-blocking flash animation
-            pomodoroState.flashing = true;
-            pomodoroState.flashCount = 0;
-            pomodoroState.flashStartTime = millis();
-            
-            // Play completion chime
-            playZenBell();
-            
-            // Advance to next session
-            if (pomodoroState.currentSession == PomodoroState::FOCUS) {
-                pomodoroState.sessionCount++;
-                
-                if (pomodoroState.sessionCount >= 4) {
-                    // After 4 focus sessions, take a long break
-                    DEBUG_PRINT("   Focus complete! Starting long break (%d min)\n", pomodoroState.longBreakDuration);
-                    pomodoroState.currentSession = PomodoroState::LONG_BREAK;
-                    pomodoroState.totalSeconds = pomodoroState.longBreakDuration * 60;
-                    
-                    // Start immediately (don't pause)
-                    pomodoroState.startTime = millis();
-                    pomodoroState.pausedTime = 0;
-                    pomodoroState.paused = false;
-                } else {
-                    // Normal short break after focus
-                    DEBUG_PRINT("   Focus complete! Starting short break (%d min) [%d/4]\n", pomodoroState.shortBreakDuration, pomodoroState.sessionCount);
-                    pomodoroState.currentSession = PomodoroState::SHORT_BREAK;
-                    pomodoroState.totalSeconds = pomodoroState.shortBreakDuration * 60;
-                    
-                    // Start immediately (don't pause)
-                    pomodoroState.startTime = millis();
-                    pomodoroState.pausedTime = 0;
-                    pomodoroState.paused = false;
-                }
-            } else if (pomodoroState.currentSession == PomodoroState::LONG_BREAK) {
-                // Long break complete - END OF CYCLE, return to IDLE
-                DEBUG_PRINTLN("   Long break complete! Pomodoro cycle finished - returning to IDLE");
-                pomodoroState.active = false;
-                pomodoroState.currentSession = PomodoroState::FOCUS;
-                pomodoroState.totalSeconds = pomodoroState.focusDuration * 60;
-                pomodoroState.sessionCount = 0;  // Reset counter for next cycle
-                pomodoroState.startTime = 0;
-                pomodoroState.pausedTime = 0;
-                pomodoroState.paused = false;
-                currentLEDMode = LED_IDLE;  // Return to IDLE - cycle complete
-            } else {
-                // Short break complete, return to focus
-                DEBUG_PRINT("   Break complete! Starting focus session (%d min)\n", pomodoroState.focusDuration);
-                pomodoroState.currentSession = PomodoroState::FOCUS;
-                pomodoroState.totalSeconds = pomodoroState.focusDuration * 60;
-                
-                // Start immediately (don't pause)
-                pomodoroState.startTime = millis();
-                pomodoroState.pausedTime = 0;
-                pomodoroState.paused = false;
-            }
-        }
-    }
+    handlePomodoroTick();
     
-    // Check for ambient sound streaming completion
-    // When stream ends, return to IDLE mode (no looping)
-    // Skip this check for meditation mode (has its own completion handler)
-    if (isPlayingAmbient && ambientSound.active && !firstAudioChunk && 
-        (millis() - lastAudioChunkTime) > 7000 && currentLEDMode != LED_MEDITATION) {
-        Serial.printf("Ambient sound completed: %s - returning to IDLE\n", ambientSound.name.c_str());
-        
-        // Return to IDLE mode
-        currentLEDMode = LED_IDLE;
-        isPlayingAmbient = false;
-        isPlayingResponse = false;
-        ambientSound.active = false;
-        ambientSound.name = "";
-    }
+    handleAmbientCompletion();
     
     // Periodic state dump while WAITING for Gemini response (shows thinking animation, timeout countdown)
     if (convState == ConvState::WAITING) {
@@ -2056,7 +2093,7 @@ void audioTask(void * parameter) {
             int numSamples = playbackChunk.length / 2;  // 2 bytes per sample
             int16_t* pcmSamples = (int16_t*)playbackChunk.data;
             
-            if (numSamples > 0 && numSamples <= 2880) {  // Max 2880 samples (stereo buffer size / 2)
+            if (numSamples > 0 && numSamples <= 960) {  // Max 960 samples (stereo buffer holds 960 stereo pairs)
                 // Calculate audio level
                 int32_t sum = 0;
                 for (int i = 0; i < numSamples; i++) {
@@ -2078,13 +2115,17 @@ void audioTask(void * parameter) {
                     stereoBuffer[i * 2 + 1] = (int16_t)sample;
                 }
                 
-                // Write to I2S (long timeout but not infinite - 500ms should be plenty)
+                // Write to I2S - guarded by mutex to prevent race with tone functions on main task
                 size_t bytes_written;
-                esp_err_t result = i2s_write(I2S_NUM_1, stereoBuffer, numSamples * 4, &bytes_written, pdMS_TO_TICKS(500));
-                
-                if (result != ESP_OK || bytes_written < numSamples * 4) {
-                    Serial.printf("I2S write failed: result=%d, wrote=%u/%u\n", result, bytes_written, numSamples*4);
-                    // Continue anyway - don't get stuck
+                if (xSemaphoreTake(i2sSpeakerMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    esp_err_t result = i2s_write(I2S_NUM_1, stereoBuffer, numSamples * 4, &bytes_written, pdMS_TO_TICKS(500));
+                    xSemaphoreGive(i2sSpeakerMutex);
+                    if (result != ESP_OK || bytes_written < numSamples * 4) {
+                        Serial.printf("I2S write failed: result=%d, wrote=%u/%u\n", result, bytes_written, numSamples*4);
+                    }
+                } else {
+                    // Mutex held by tone function (e.g. volume chime) - skip this frame
+                    Serial.println("[audioTask] I2S mutex busy - skipping frame");
                 }
                 
                 // Update last audio chunk time to prevent timeout while queue has data
@@ -2229,7 +2270,7 @@ void audioTask(void * parameter) {
                     }
                 }
             }
-        } else if (conversationMode || ambientVUMode) {
+        } else if (conversationMode || isAmbientVUMode) {
             recordingStartSent = false;  // Not recording - reset flag for next recording
             // audioTask is the sole reader of I2S_NUM_0. When the main loop opens a
             // conversation window, or the LED task needs ambient VU levels, this branch
@@ -2270,7 +2311,7 @@ void audioTask(void * parameter) {
                 }
                 
                 // --- Ambient VU meter ---
-                if (ambientVUMode && samples > 0) {
+                if (isAmbientVUMode && samples > 0) {
                     float rms = sqrtf((float)sumSq / samples);
                     
                     // Peak tracking + auto-gain
@@ -2346,7 +2387,10 @@ void playShutdownSound() {
  }
  
  size_t bytes_written;
- i2s_write(I2S_NUM_1, toneBuffer, numSamples * 4, &bytes_written, pdMS_TO_TICKS(100));
+ if (xSemaphoreTake(i2sSpeakerMutex, portMAX_DELAY) == pdTRUE) {
+     i2s_write(I2S_NUM_1, toneBuffer, numSamples * 4, &bytes_written, pdMS_TO_TICKS(200));
+     xSemaphoreGive(i2sSpeakerMutex);
+ }
  }
 }
 
@@ -2370,7 +2414,10 @@ void playVolumeChime() {
  }
  
  size_t bytes_written;
- i2s_write(I2S_NUM_1, toneBuffer, numSamples * 4, &bytes_written, pdMS_TO_TICKS(100));
+ if (xSemaphoreTake(i2sSpeakerMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+     i2s_write(I2S_NUM_1, toneBuffer, numSamples * 4, &bytes_written, pdMS_TO_TICKS(100));
+     xSemaphoreGive(i2sSpeakerMutex);
+ }
 }
 
 // ============== WEBSOCKET HANDLERS ==============
@@ -2464,24 +2511,24 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     FastLED.show();
                     xSemaphoreGive(ledMutex);
                 }
-                delay(500);
+                vTaskDelay(pdMS_TO_TICKS(500));  // Yield properly in FreeRTOS task context
                 
                 // Resume ambient mode if it was active before disconnect
-                if (ambientSound.active && !ambientSound.name.isEmpty()) {
+                if (ambientSound.active && ambientSound.name[0] != '\0') {
                     Serial.printf("Resuming ambient sound: %s (seq %d)\n", 
-                                 ambientSound.name.c_str(), ambientSound.sequence);
+                                 ambientSound.name, ambientSound.sequence);
                     
                     // Restore LED mode based on ambient sound
                     currentLEDMode = LED_AMBIENT;
                     
                     // Set the current ambient sound
-                    if (ambientSound.name == "rain") {
+                    if (strcmp(ambientSound.name, "rain") == 0) {
                         currentAmbientSoundType = SOUND_RAIN;
-                    } else if (ambientSound.name == "ocean") {
+                    } else if (strcmp(ambientSound.name, "ocean") == 0) {
                         currentAmbientSoundType = SOUND_OCEAN;
-                    } else if (ambientSound.name == "rainforest") {
+                    } else if (strcmp(ambientSound.name, "rainforest") == 0) {
                         currentAmbientSoundType = SOUND_RAINFOREST;
-                    } else if (ambientSound.name == "fire") {
+                    } else if (strcmp(ambientSound.name, "fire") == 0) {
                         currentAmbientSoundType = SOUND_FIRE;
                     }
                     
@@ -2497,7 +2544,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     isPlayingAmbient = true;
                     firstAudioChunk = true;
                     lastAudioChunkTime = millis();
-                } else if (ambientVUMode) {
+                } else if (isAmbientVUMode) {
                     // Resume VU meter mode
                     currentLEDMode = LED_AMBIENT_VU;
                     Serial.println("Resuming VU meter mode");
@@ -2669,7 +2716,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                         
                         if (isPlayingAmbient) {
                             Serial.printf("Starting ambient audio stream: %s (prebuffered %u packets)\n", 
-                                         ambientSound.name.c_str(), queueDepth);
+                                         ambientSound.name, queueDepth);
                         } else if (isPlayingAlarm) {
                             Serial.printf("Starting alarm audio playback (prebuffered %u packets)\n", queueDepth);
                         } else {
@@ -2699,7 +2746,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     // Radio: mark as actively streaming once first chunk arrives
                     if (radioState.active && !radioState.streaming) {
                         radioState.streaming = true;
-                        Serial.printf("Radio streaming started: %s\n", radioState.stationName.c_str());
+                        Serial.printf("Radio streaming started: %s\n", radioState.stationName);
                     }
                 }
                 
@@ -2753,7 +2800,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             
             // Pause ambient playback but keep mode state for resume on reconnect
             if (isPlayingAmbient || ambientSound.active) {
-                Serial.printf("Pausing ambient sound due to disconnect: %s (will resume)\n", ambientSound.name.c_str());
+                Serial.printf("Pausing ambient sound due to disconnect: %s (will resume)\n", ambientSound.name);
                 isPlayingAmbient = false;
                 isPlayingResponse = false;
                 // Keep ambientSound.active and name to resume on reconnect
@@ -2782,8 +2829,6 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 
 // ============== LED CONTROLLER ==============
 void updateLEDs() {
- static uint8_t brightness = 100;
- 
  // Smooth the audio level with exponential moving average
 // Fast rise (α=0.5, ~43ms time constant) so peaks track speech closely.
         // Decay is handled separately below (0.60× per frame when silent).
@@ -2810,1282 +2855,26 @@ void updateLEDs() {
  }
 
     switch(currentLEDMode) {
-        case LED_BOOT:
-            // Orange pulsing during boot to distinguish from idle blue
-            {
-                static uint32_t lastBootDebug = 0;
-                if (millis() - lastBootDebug > 1000) {
-                    Serial.println("LED_BOOT: Orange pulsing (connecting...)");
-                    lastBootDebug = millis();
-                }
-                brightness = constrain(100 + (int)(50 * sin(millis() / 500.0)), 0, 255);
-                fill_solid(leds, NUM_LEDS, CHSV(25, 255, brightness));  // Orange instead of cyan
-            }
-            break;
-            
-        case LED_IDLE:
-            // Gentle blue pulse - all strips in sync, bottom to top to bottom
-            // Smooth bouncing wave with even fade at both ends
-            {
-                // 5.9 second cycle (10% slower than 5.3s), bounces up and down
-                // ORIGINAL (to revert): 5333ms for 5.3s cycle
-                float t = (millis() % 5866) / 5866.0;
-                
-                // Create bouncing wave: centered for symmetry at both ends
-                // Range -2.513.5-2.5 (centered at row 5.5, perfectly symmetric)
-                // ORIGINAL (to revert): Range 0140, use "wavePos = (t * 2.0) * 14.0" and "wavePos = ((1.0 - t) * 2.0) * 14.0"
-                float wavePos;
-                if (t < 0.5) {
-                    // First half: bottom to top (-2.513.5)
-                    wavePos = (t * 2.0) * 16.0 - 2.5;
-                } else {
-                    // Second half: top to bottom (13.5-2.5)
-                    wavePos = ((1.0 - t) * 2.0) * 16.0 - 2.5;
-                }
-                
-                // Debug every 2 seconds
-                static uint32_t lastIdleDebug = 0;
-                if (millis() - lastIdleDebug > 2000) {
-                    Serial.printf("IDLE: t=%.2f, wavePos=%.2f, hue=160 (blue)\n", t, wavePos);
-                    lastIdleDebug = millis();
-                }
-                
-                // Process all strips identically (column-based indexing)
-                for (int col = 0; col < LED_COLUMNS; col++) {
-                    for (int row = 0; row < LEDS_PER_COLUMN; row++) {
-                        int ledIndex = col * LEDS_PER_COLUMN + row;
-                        
-                        // Calculate distance from wave center (based on row position)
-                        float distance = abs(wavePos - row);
-                        
-                        // Soft wave with gradient trail (6 LED spread for smoother effect)
-                        if (distance < IDLE_WAVE_SPREAD) {
-                            float waveBrightness = (1.0 - (distance / IDLE_WAVE_SPREAD));
-                            waveBrightness = waveBrightness * waveBrightness;  // Squared for softer falloff
-                            uint8_t brightness = (uint8_t)(waveBrightness * (IDLE_WAVE_BRIGHTNESS_MAX - IDLE_WAVE_BRIGHTNESS_MIN) + IDLE_WAVE_BRIGHTNESS_MIN);
-                            leds[ledIndex] = CHSV(160, 200, brightness);  // Blue hue locked at 160
-                        } else {
-                            // Base ambient glow when wave is far away
-                            leds[ledIndex] = CHSV(160, 200, IDLE_WAVE_BRIGHTNESS_MIN);  // Dim blue
-                        }
-                    }
-                }
-            }
-            break;
-            
-        case LED_RECORDING:
-            // VU meter during recording - vertical bars on all strips with fade trail
-            // Traditional VU meter colors: green  yellow  red
-            {
-                // Fade all LEDs for trail effect
-                for (int i = 0; i < NUM_LEDS; i++) {
-                    leds[i].fadeToBlackBy(80);  // Gentle fade creates smooth trail
-                }
-                
-                // Map audio level to row count (0-12 rows)
-                // Apply a noise floor matching the VAD threshold so ambient noise
-                // doesn't flash the bottom green LEDs. Only actual voice-level audio
-                // (above ~VAD_THRESHOLD) starts lighting the meter.
-                const int RECORDING_NOISE_FLOOR = 600; // just below VAD_THRESHOLD (700)
-                int levelAboveNoise = max(0, (int)smoothedAudioLevel - RECORDING_NOISE_FLOOR);
-                int numRows = map(constrain(levelAboveNoise, 0, 4400), 0, 4400, 0, LEDS_PER_COLUMN);
-                
-                // Light all strips identically (column-based)
-                for (int col = 0; col < LED_COLUMNS; col++) {
-                    for (int row = 0; row < LEDS_PER_COLUMN; row++) {
-                        int ledIndex = col * LEDS_PER_COLUMN + row;
-                        
-                        // Bounds check to prevent array overflow
-                        if (ledIndex >= NUM_LEDS) {
-                            Serial.printf("LED overflow: col=%d, row=%d, idx=%d\n", col, row, ledIndex);
-                            continue;
-                        }
-                        
-                        if (row < numRows) {
-                            // Traditional VU meter gradient based on row height
-                            // Green at bottom, yellow in middle, red at top
-                            float progress = (float)row / (float)LEDS_PER_COLUMN;
-                            
-                            if (progress < 0.5) {
-                                leds[ledIndex] = CRGB(0, 255, 0);  // Green (bottom 50% - 6 LEDs)
-                            } else if (progress < 0.83) {
-                                leds[ledIndex] = CRGB(255, 255, 0);  // Yellow (50-83% - 4 LEDs)
-                            } else {
-                                leds[ledIndex] = CRGB(255, 0, 0);  // Red (top 83-100% - 2 LEDs)
-                            }
-                        }
-                        // LEDs above numRows keep their faded value
-                    }
-                }
-            }
-            break;
-            
-        case LED_PROCESSING:
-            // Go dark while processing - clean, unambiguous "thinking" state
-            fill_solid(leds, NUM_LEDS, CRGB::Black);
-            break;
-            
-        case LED_AMBIENT_VU:
-            // Ambient sound VU meter - vertical bars on all strips with fade trail.
-            // Row count is computed by audioTask (the sole I2S_NUM_0 reader) and
-            // stored in the volatile ambientMicRows global - no i2s_read here.
-            {
-                // Fade all LEDs slightly for trail effect (instead of clearing)
-                for (int i = 0; i < NUM_LEDS; i++) {
-                    leds[i].fadeToBlackBy(80);  // Gentle fade creates smooth trail
-                }
-                
-                // Row count is produced by audioTask via the full auto-gain + compression
-                // + smoothing pipeline.  Just read it atomically.
-                int numRows = ambientMicRows;
-                
-                // VU meter gradient - vertical on all strips (column-based)
-                for (int col = 0; col < LED_COLUMNS; col++) {
-                    for (int row = 0; row < LEDS_PER_COLUMN; row++) {
-                        int ledIndex = col * LEDS_PER_COLUMN + row;
-                        
-                        if (row < numRows) {
-                            // Gradient based on row height
-                            if (row < LEDS_PER_COLUMN * 0.5) {
-                                leds[ledIndex] = CRGB(0, 255, 0);  // Green (bottom 50% - 6 LEDs)
-                            } else if (row < LEDS_PER_COLUMN * 0.83) {
-                                leds[ledIndex] = CRGB(255, 255, 0);  // Yellow (50-83% - 4 LEDs)
-                            } else {
-                                leds[ledIndex] = CRGB(255, 0, 0);  // Red (top 83-100% - 2 LEDs)
-                            }
-                        }
-                        // LEDs above numRows keep their faded value from fadeToBlackBy
-                    }
-                }
-            }
-            break;
-            
-        case LED_AUDIO_REACTIVE:
-            // VU meter during playback - vertical bars on all strips with fade trail
-            // Blue/teal/indigo gradient for Gemini speaking (AI, calm)
-            {
-                // Fade all LEDs for trail effect
-                for (int i = 0; i < NUM_LEDS; i++) {
-                    leds[i].fadeToBlackBy(80);  // Gentle fade creates smooth trail
-                }
-                
-                // Map audio level to row count (0-12 rows)
-                // Playback audio range: 0-3000, map to 0-12 rows
-                int numRows = map(constrain((int)smoothedAudioLevel, 0, 3000), 0, 3000, 0, LEDS_PER_COLUMN);
-                
-                // Light all strips identically (column-based)
-                for (int col = 0; col < LED_COLUMNS; col++) {
-                    for (int row = 0; row < LEDS_PER_COLUMN; row++) {
-                        int ledIndex = col * LEDS_PER_COLUMN + row;
-                        
-                        // Bounds check to prevent array overflow
-                        if (ledIndex >= NUM_LEDS) {
-                            Serial.printf("LED overflow: col=%d, row=%d, idx=%d\n", col, row, ledIndex);
-                            continue;
-                        }
-                        
-                        if (row < numRows) {
-                            // Blue  cyan  magenta gradient with distinct color zones
-                            // More distinct colors for better visibility
-                            float progress = (float)row / (float)LEDS_PER_COLUMN;
-                            
-                            if (progress < 0.5) {
-                                leds[ledIndex] = CRGB(0, 100, 200);  // Deeper blue (bottom 50% - 6 LEDs)
-                            } else if (progress < 0.83) {
-                                leds[ledIndex] = CRGB(0, 255, 150);  // Bright cyan (50-83% - 4 LEDs)
-                            } else {
-                                leds[ledIndex] = CRGB(200, 0, 255);  // Bright magenta (top 83-100% - 2 LEDs)
-                            }
-                        }
-                        // LEDs above numRows keep their faded value
-                    }
-                }
-            }
-            break;
-            
-        case LED_TIDE:
-            // Tide visualization: water level shown as vertical bars on all strips
-            // Blue = flooding (incoming), Orange = ebbing (outgoing)
-            // Wave effect ripples around the circular array
-            {
-                // Debug: log mode switch
-                static uint32_t lastDebugLog = 0;
-                if (millis() - lastDebugLog > 5000) {
-                    Serial.printf("LED_TIDE active: state=%s, level=%.2f, mode=%d\n", 
-                                 tideState.state.c_str(), tideState.waterLevel, currentLEDMode);
-                    lastDebugLog = millis();
-                }
-                
-                // Calculate base water level in rows (0-12)
-                int baseRows = max(1, (int)(tideState.waterLevel * LEDS_PER_COLUMN));
-                
-                // Choose color based on tide state
-                CRGB tideColor = tideState.state == "flooding" ? CRGB(0, 100, 255) : CRGB(255, 100, 0);
-                
-                // Create wave effect that travels around the circle
-                // Each column gets a phase offset based on its position
-                float time = millis() / 1000.0;
-                
-                for (int col = 0; col < LED_COLUMNS; col++) {
-                    // Phase offset for this column (creates traveling wave around circle)
-                    float phaseOffset = (float)col / (float)LED_COLUMNS * TWO_PI;
-                    
-                    // Wave oscillation: -2 to +2 rows
-                    float wave = sin(time * 1.5 + phaseOffset) * 2.0;
-                    
-                    // Calculate water level for this column with wave effect
-                    int waterRows = constrain(baseRows + (int)wave, 0, LEDS_PER_COLUMN);
-                    
-                    // Light the column from bottom up to water level
-                    for (int row = 0; row < LEDS_PER_COLUMN; row++) {
-                        int ledIndex = col * LEDS_PER_COLUMN + row;
-                        
-                        if (ledIndex >= NUM_LEDS) continue;
-                        
-                        if (row < waterRows) {
-                            // Add subtle brightness variation for water shimmer
-                            float shimmer = 0.7 + 0.3 * sin(time * 3.0 + phaseOffset * 2.0);
-                            uint8_t r = (uint8_t)(tideColor.r * shimmer);
-                            uint8_t g = (uint8_t)(tideColor.g * shimmer);
-                            uint8_t b = (uint8_t)(tideColor.b * shimmer);
-                            leds[ledIndex] = CRGB(r, g, b);
-                        } else {
-                            leds[ledIndex] = CRGB(0, 0, 0);
-                        }
-                    }
-                }
-                
-                // No timeout - stays until next interaction
-            }
-            break;
-            
-        case LED_TIMER:
-            // Timer countdown visualization
-            // Show progress as LEDs fade away
-            {
-                if (timerState.active) {
-                    uint32_t elapsed = (millis() - timerState.startTime) / 1000;
-                    int remaining = timerState.totalSeconds - elapsed;
-                    
-                    if (remaining <= 0) {
-                        // Timer finished - clear LEDs
-                        fill_solid(leds, NUM_LEDS, CRGB::Black);
-                    } else {
-                        // Calculate how many LEDs to show based on remaining time
-                        float progress = (float)remaining / (float)timerState.totalSeconds;
-                        float exactLEDs = progress * NUM_LEDS;
-                        int numLEDs = (int)exactLEDs;  // Full brightness LEDs
-                        float fractionalPart = exactLEDs - numLEDs;  // For fade-out LED
-                        
-                        // Color transitions: Green -> Yellow -> Orange -> Red as time runs out
-                        uint8_t hue;
-                        if (progress > 0.66) {
-                            hue = 96;  // Green
-                        } else if (progress > 0.33) {
-                            hue = 64;  // Yellow
-                        } else if (progress > 0.15) {
-                            hue = 32;  // Orange
-                        } else {
-                            hue = 0;   // Red (urgent)
-                        }
-                        
-                        // Pulse effect when timer is low
-                        uint8_t baseBrightness = 255;
-                        if (progress < 0.15) {
-                            baseBrightness = 128 + (uint8_t)(127 * sin(millis() / 200.0));
-                        }
-                        
-                        for (int i = 0; i < NUM_LEDS; i++) {
-                            if (i < numLEDs) {
-                                // Full brightness LEDs
-                                leds[i] = CHSV(hue, 255, baseBrightness);
-                            } else if (i == numLEDs && fractionalPart > 0) {
-                                // Fading LED - gradually dims as time runs out
-                                uint8_t fadeBrightness = (uint8_t)(baseBrightness * fractionalPart);
-                                leds[i] = CHSV(hue, 255, fadeBrightness);
-                            } else {
-                                leds[i] = CRGB::Black;
-                            }
-                        }
-                    }
-                } else {
-                    // Timer not active
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                }
-            }
-            break;
-            
-        case LED_MOON:
-            // Moon phase visualization - grows from center outward
-            // New moon = center only, Full moon = all columns, then shrinks back
-            {
-                if (moonState.active) {
-                    // Soft blue-white color (low saturation for pale moon glow)
-                    uint8_t moonHue = 160;  // Blue-cyan
-                    uint8_t moonSat = 80;   // Low saturation for pale white-blue
-                    
-                    // Gentle pulse effect for moon glow
-                    float pulse = 0.85 + 0.15 * sin(millis() / 1500.0);
-                    uint8_t baseBrightness = (uint8_t)(220 * pulse);
-                    
-                    // Calculate how many columns to light from center outward
-                    // illumination: 0% = 1 column (center), 100% = all 12 columns
-                    int numColumns = max(1, (int)((moonState.illumination / 100.0) * LED_COLUMNS));
-                    
-                    // Center column is column 5 or 6 (middle of 0-11)
-                    int centerCol = LED_COLUMNS / 2;  // 6 for 12 columns
-                    
-                    // Expand outward from center
-                    // e.g., 1 col = [6], 2 cols = [5,6], 3 cols = [5,6,7], etc.
-                    int leftMost = centerCol - (numColumns / 2);
-                    int rightMost = leftMost + numColumns - 1;
-                    
-                    // Clear all LEDs first
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                    
-                    // Light the columns from center outward
-                    for (int col = 0; col < LED_COLUMNS; col++) {
-                        if (col >= leftMost && col <= rightMost) {
-                            // This column should be lit - calculate brightness based on distance from center
-                            int distanceFromCenter = abs(col - centerCol);
-                            float brightnessFactor = 1.0 - (distanceFromCenter / (float)LED_COLUMNS * 0.3);  // Slight fade at edges
-                            uint8_t colBrightness = (uint8_t)(baseBrightness * brightnessFactor);
-                            
-                            // Light all rows in this column
-                            for (int row = 0; row < LEDS_PER_COLUMN; row++) {
-                                int ledIndex = col * LEDS_PER_COLUMN + row;
-                                if (ledIndex < NUM_LEDS) {
-                                    leds[ledIndex] = CHSV(moonHue, moonSat, colBrightness);
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Note: Auto-return removed - handled by auto-transition to conversation window
-                } else {
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                }
-            }
-            break;
-            
-        case LED_AMBIENT:
-            // Single ambient mode with different visualizations based on current sound
-            {
-                // Detect sound-type changes and reset the relevant init flag so each
-                // visualizer re-initialises cleanly when its mode is re-entered.
-                static AmbientSoundType lastAmbientType = (AmbientSoundType)-1;
-                static bool rainInitialized = false;
-                static bool oceanInitialized = false;
-                static bool rainforestInitialized = false;
-                if (currentAmbientSoundType != lastAmbientType) {
-                    rainInitialized = false;
-                    oceanInitialized = false;
-                    rainforestInitialized = false;
-                    lastAmbientType = currentAmbientSoundType;
-                }
-
-                if (currentAmbientSoundType == SOUND_RAIN) {
-                    // Falling rain effect - drops hit and run down like on a window
-                    static uint32_t lastDrop = 0;
-                    static float dropPosition[144] = {-1.0f};  // Vertical position of each drop (0=top, 12=bottom, -1=inactive)
-                    static float dropSpeed[144] = {0.0f};  // Speed of each drop (randomized)
-
-                    // Reset on first entry to rain mode (flag declared at outer block scope)
-                    if (!rainInitialized) {
-                        for (int i = 0; i < 144; i++) {
-                            dropPosition[i] = -1.0f;
-                            dropSpeed[i] = 0.0f;
-                        }
-                        lastDrop = millis();
-                        rainInitialized = true;
-                    }
-                    
-                    // Clear all LEDs
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                    
-                    // Add new drops randomly at random strips
-                    if (millis() - lastDrop > RAIN_DROP_SPAWN_INTERVAL_MS) {
-                        if (random(100) < RAIN_DROP_SPAWN_CHANCE) {  // 30% chance each 100ms
-                            int strip = random(LED_COLUMNS);  // Random strip
-                            // Only spawn if this strip doesn't already have an active drop
-                            if (dropPosition[strip] < 0.0f) {
-                                dropPosition[strip] = 0.0f;  // Start at top of strip
-                                dropSpeed[strip] = 0.08f + (random(0, 100) / 1000.0f);  // Random speed 0.08-0.18
-                            }
-                        }
-                        lastDrop = millis();
-                    }
-                    
-                    // Update and render drops running down
-                    for (int strip = 0; strip < LED_COLUMNS; strip++) {
-                        if (dropPosition[strip] >= 0.0f) {
-                            // Drop is active - move it down at its own speed
-                            dropPosition[strip] += dropSpeed[strip];
-                            
-                            // If reached bottom, deactivate
-                            if (dropPosition[strip] >= (float)LEDS_PER_COLUMN) {
-                                dropPosition[strip] = -1.0f;
-                                dropSpeed[strip] = 0.0f;
-                                continue;
-                            }
-                            
-                            // Render the drop with a 2-3 LED trail
-                            int currentLED = (int)dropPosition[strip];
-                            
-                            // Initial impact flash (first LED, very bright white-blue)
-                            if (dropPosition[strip] < 0.5f && currentLED == 0) {
-                                int ledIdx = strip * LEDS_PER_COLUMN + currentLED;
-                                leds[ledIdx] = CRGB(200, 220, 255);  // Bright white-blue flash
-                            }
-                            // Main drop (brightest blue)
-                            else if (currentLED < LEDS_PER_COLUMN) {
-                                int ledIdx = strip * LEDS_PER_COLUMN + currentLED;
-                                leds[ledIdx] = CHSV(160, 255, 255);  // Bright blue
-                            }
-                            
-                            // Trail (fading)
-                            if (currentLED > 0 && currentLED - 1 < LEDS_PER_COLUMN) {
-                                int ledIdx = strip * LEDS_PER_COLUMN + (currentLED - 1);
-                                leds[ledIdx] = CHSV(160, 255, 150);  // Dimmer
-                            }
-                            if (currentLED > 1 && currentLED - 2 < LEDS_PER_COLUMN) {
-                                int ledIdx = strip * LEDS_PER_COLUMN + (currentLED - 2);
-                                leds[ledIdx] = CHSV(160, 255, 80);  // Even dimmer
-                            }
-                        }
-                    }
-                } else if (currentAmbientSoundType == SOUND_OCEAN) {
-                    // Swelling ocean waves - synced with actual ocean sound amplitude
-                    // Wave height follows audio amplitude from playback stream
-                    static float smoothedWave = 0.0f;
-                    static uint32_t lastDebugLog = 0;
-
-                    // Reset on first entry to ocean mode (flag declared at outer block scope)
-                    if (!oceanInitialized) {
-                        smoothedWave = 0.0f;
-                        oceanInitialized = true;
-                    }
-                    
-                    // Use the actual playback audio level (calculated in audio task)
-                    // currentAudioLevel is the average amplitude from PCM playback
-                    float instantLevel = (float)currentAudioLevel;
-                    
-                    // Smooth the wave height for gentler, more fluid motion
-                    smoothedWave = smoothedWave * 0.80f + instantLevel * 0.20f;  // Balanced smoothing
-                    
-                    // Debug log every 2 seconds
-                    if (millis() - lastDebugLog > 2000) {
-                        Serial.printf("Ocean: Level=%d, Smoothed=%.0f, Rows=%d/%d\n", 
-                                     currentAudioLevel, smoothedWave, 
-                                     (int)(constrain(smoothedWave / 500.0f, 0.15f, 0.75f) * LEDS_PER_COLUMN), 
-                                     LEDS_PER_COLUMN);
-                        lastDebugLog = millis();
-                    }
-                    
-                    // Map audio level to wave height with gentler range
-                    // Cap at 75% height so waves don't constantly fill the entire display
-                    float normalizedWave = constrain(smoothedWave / 500.0f, 0.15f, 0.75f);  // Gentler range (was /400 and 0.95)
-                    
-                    // Convert to number of rows (vertical wave on all columns)
-                    int waveRows = (int)(normalizedWave * LEDS_PER_COLUMN);
-                    
-                    // Add MORE traveling wave phase for dramatic effect
-                    float time = millis() / 3000.0;
-                    
-                    for (int col = 0; col < LED_COLUMNS; col++) {
-                        // Phase offset for traveling wave effect
-                        float phaseOffset = (float)col / (float)LED_COLUMNS * TWO_PI;
-                        float phaseWave = sin(time + phaseOffset) * 3.0;  // 3 rows variation (was 1.5)
-                        
-                        int colWaveRows = constrain(waveRows + (int)phaseWave, 1, LEDS_PER_COLUMN);
-                        
-                        // Light column from bottom to wave height
-                        for (int row = 0; row < LEDS_PER_COLUMN; row++) {
-                            int ledIndex = col * LEDS_PER_COLUMN + row;
-                            
-                            if (ledIndex >= NUM_LEDS) continue;
-                            
-                            if (row < colWaveRows) {
-                                // Gradient from deep teal (bottom) to bright aquamarine (top)
-                                // Aquamarine colors: deep water (hue 170) to bright cyan-green (hue 140)
-                                float progress = (float)row / (float)colWaveRows;  // 0 at bottom, 1 at wave top
-                                
-                                // Hue: 170 (deep cyan-blue) -> 140 (bright aquamarine/turquoise)
-                                uint8_t hue = 170 - (uint8_t)(progress * 30);  // 170 -> 140
-                                
-                                // Saturation: fuller at bottom, slightly less at top for foam effect
-                                uint8_t saturation = 255 - (uint8_t)(progress * 40);  // 255 -> 215
-                                
-                                // Brightness: darker at bottom (deep water), brighter at top (surface/foam)
-                                uint8_t brightness = 80 + (uint8_t)(progress * 175);  // 80 -> 255
-                                
-                                leds[ledIndex] = CHSV(hue, saturation, brightness);
-                            } else {
-                                leds[ledIndex] = CRGB::Black;
-                            }
-                        }
-                    }
-                } else if (currentAmbientSoundType == SOUND_RAINFOREST) {
-                    // Tropical rainforest at dusk/night with fireflies and animal eyes
-                    static float fireflyPositions[6][3];  // 6 fireflies: [strip, row, brightness]
-                    static uint32_t fireflyTimers[6];
-                    static float eyePair[3];  // 1 pair: [strip, row, timer]
-                    // (rainforestInitialized declared at outer block scope)
-                    if (!rainforestInitialized) {
-                        for (int i = 0; i < 6; i++) {
-                            fireflyPositions[i][0] = -1.0f;  // inactive
-                            fireflyTimers[i] = 0;
-                        }
-                        eyePair[0] = -1.0f;  // inactive
-                        rainforestInitialized = true;
-                    }
-                    
-                    uint32_t now = millis();
-                    
-                    // Update fireflies
-                    for (int i = 0; i < 6; i++) {
-                        if (fireflyPositions[i][0] < 0.0f) {
-                            // Spawn new firefly (3% chance per frame)
-                            if (random(100) < 3) {
-                                fireflyPositions[i][0] = random(0, 12);  // strip
-                                fireflyPositions[i][1] = random(3, 10);  // row (mid-height)
-                                fireflyPositions[i][2] = 1.0f;  // full brightness
-                                fireflyTimers[i] = now + 2000 + random(0, 1000);  // 2-3s lifespan
-                            }
-                        } else {
-                            // Fade and drift
-                            fireflyPositions[i][2] -= 0.008f;  // fade slowly
-                            fireflyPositions[i][1] += random(-1, 2) * 0.05f;  // subtle drift
-                            
-                            if (now > fireflyTimers[i] || fireflyPositions[i][2] <= 0.0f) {
-                                fireflyPositions[i][0] = -1.0f;  // deactivate
-                            }
-                        }
-                    }
-                    
-                    // Update single animal eye pair
-                    if (eyePair[0] < 0.0f) {
-                        // Spawn new pair (0.5% chance per frame - rare)
-                        if (random(1000) < 5) {
-                            int strip = random(0, 9);  // leave room for pair
-                            eyePair[0] = strip;  // first eye strip
-                            eyePair[1] = random(5, 8);  // row (mid-height)
-                            eyePair[2] = now + 3000 + random(0, 2000);  // 3-5s duration (longer)
-                        }
-                    } else {
-                        if (now > (uint32_t)eyePair[2]) {
-                            eyePair[0] = -1.0f;  // deactivate
-                        }
-                    }
-                    
-                    // Render base canopy (dark emerald green gradient)
-                    for (int strip = 0; strip < 12; strip++) {
-                        // Each strip breathes at slightly different rate
-                        float stripPhase = (strip * 0.2f);
-                        float pulse = 0.7 + 0.3 * sin((now / 5000.0) + stripPhase);  // 5s cycle
-                        
-                        for (int row = 0; row < 12; row++) {
-                            int ledIdx = strip * 12 + row;
-                            
-                            // Vertical gradient: dark forest floor to lighter canopy
-                            float verticalProgress = (float)row / 11.0f;
-                            uint8_t hue = 85 + (uint8_t)(verticalProgress * 15.0f);  // 85-100 (emerald to green)
-                            uint8_t sat = 255 - (uint8_t)(verticalProgress * 40.0f);  // 255-215
-                            uint8_t brightness = 60 + (uint8_t)(verticalProgress * 80.0f * pulse);  // 60-140 (dark)
-                            
-                            leds[ledIdx] = CHSV(hue, sat, brightness);
-                        }
-                    }
-                    
-                    // Render fireflies
-                    for (int i = 0; i < 6; i++) {
-                        if (fireflyPositions[i][0] >= 0.0f) {
-                            int strip = (int)fireflyPositions[i][0];
-                            int row = (int)fireflyPositions[i][1];
-                            if (row >= 0 && row < 12 && strip >= 0 && strip < 12) {
-                                int ledIdx = strip * 12 + row;
-                                uint8_t brightness = (uint8_t)(255 * fireflyPositions[i][2]);
-                                leds[ledIdx] = CHSV(70, 200, brightness);  // Yellow-green
-                            }
-                        }
-                    }
-                    
-                    // Render animal eye pair (2 LEDs each for visibility)
-                    if (eyePair[0] >= 0.0f) {
-                        int strip1 = (int)eyePair[0];
-                        int strip2 = strip1 + 3;  // 3 strips apart for clear separation
-                        int row = (int)eyePair[1];
-                        
-                        if (strip1 < 12 && strip2 < 12 && row >= 0 && row < 11) {
-                            // Blink effect
-                            uint32_t duration = (uint32_t)eyePair[2] - now;
-                            uint32_t totalDuration = 4000;  // ~4s average
-                            uint32_t age = totalDuration - duration;
-                            
-                            uint8_t brightness = 255;
-                            // Blink twice during display
-                            if ((age > 1000 && age < 1150) || (age > 2500 && age < 2650)) {
-                                brightness = 30;  // blink
-                            }
-                            
-                            // Each eye is 2 LEDs vertically
-                            leds[strip1 * 12 + row] = CHSV(30, 220, brightness);  // Amber
-                            leds[strip1 * 12 + row + 1] = CHSV(30, 220, brightness);  // Amber
-                            leds[strip2 * 12 + row] = CHSV(30, 220, brightness);  // Amber
-                            leds[strip2 * 12 + row + 1] = CHSV(30, 220, brightness);  // Amber
-                        }
-                    }
-                }
-            }
-            
-            // Fire mode visualization (after rainforest check)
-            if (currentAmbientSoundType == SOUND_FIRE) {
-                // Rising/falling flames with sparks
-                static float flameHeights[12];  // Per-strip flame height (0.0-1.0)
-                static float flamePhases[12];   // Per-strip phase offset
-                static float sparkPositions[12]; // Per-strip spark position (-1 = none)
-                static float sparkBrightness[12]; // Per-strip spark brightness
-                static bool fireInitialized = false;
-                
-                // Initialize on first run
-                if (!fireInitialized) {
-                    for (int s = 0; s < 12; s++) {
-                        flameHeights[s] = 0.3f + (random(0, 300) / 1000.0f);  // 0.3-0.6
-                        flamePhases[s] = random(0, 1000) / 1000.0f;  // 0.0-1.0
-                        sparkPositions[s] = -1.0f;  // No spark
-                        sparkBrightness[s] = 0.0f;
-                    }
-                    fireInitialized = true;
-                }
-                
-                // Update flame heights (organic sine wave motion)
-                float globalTime = millis() / 1000.0f;
-                for (int s = 0; s < 12; s++) {
-                    // Each strip has its own frequency and phase (slower for relaxation)
-                    float frequency = 0.3f + (s * 0.03f);  // 0.3-0.63 Hz variation (was 0.5-1.1)
-                    float targetHeight = 0.35f + 0.12f * sin((globalTime * frequency) + flamePhases[s]);  // 0.23-0.47 (reduced amplitude)
-                    
-                    // Smooth approach to target (slower for gentler motion)
-                    flameHeights[s] += (targetHeight - flameHeights[s]) * 0.05f;
-                    
-                    // Spawn new sparks occasionally (2% chance per frame from flame tip, reduced from 5%)
-                    if (sparkPositions[s] < 0.0f && random(100) < 2 && flameHeights[s] > 0.3f) {
-                        sparkPositions[s] = flameHeights[s] * 12.0f;  // Start at flame tip
-                        sparkBrightness[s] = 1.0f;
-                    }
-                    
-                    // Update existing sparks (float upward and fade)
-                    if (sparkPositions[s] >= 0.0f) {
-                        sparkPositions[s] += 0.18f + (random(0, 70) / 1000.0f);  // 0.18-0.25 LEDs/frame
-                        sparkBrightness[s] -= 0.12f;  // Fade over ~8 frames
-                        
-                        // Remove if reached top or fully faded
-                        if (sparkPositions[s] >= 12.0f || sparkBrightness[s] <= 0.0f) {
-                            sparkPositions[s] = -1.0f;
-                            sparkBrightness[s] = 0.0f;
-                        }
-                    }
-                }
-                
-                // Clear all LEDs first
-                fill_solid(leds, NUM_LEDS, CRGB::Black);
-                
-                // Render flames for each strip
-                for (int strip = 0; strip < 12; strip++) {
-                    int maxFlameRow = (int)(flameHeights[strip] * 12.0f);
-                    maxFlameRow = constrain(maxFlameRow, 0, 6);  // Cap at row 6 (max flame height)
-                    
-                    for (int row = 0; row < 12; row++) {
-                        // LED index: strip * 12 + row (all wired bottom-up)
-                        int ledIdx = strip * 12 + row;
-                        if (ledIdx < 0 || ledIdx >= NUM_LEDS) continue;
-                        
-                        // Check if spark is at this position
-                        bool isSpark = false;
-                        if (sparkPositions[strip] >= 0.0f) {
-                            int sparkRow = (int)sparkPositions[strip];
-                            if (row == sparkRow && sparkBrightness[strip] > 0.0f) {
-                                isSpark = true;
-                                // Bright yellow-orange spark
-                                uint8_t sparkHue = 25 + random(0, 10);  // 25-35 (yellow-orange)
-                                uint8_t sparkBr = (uint8_t)(255 * sparkBrightness[strip]);
-                                leds[ledIdx] = CHSV(sparkHue, 220, sparkBr);
-                            }
-                        }
-                        
-                        // Render flame if below max height and not spark
-                        if (!isSpark && row <= maxFlameRow) {
-                            // Progress from bottom (0.0) to tip (1.0)
-                            float progress = (float)row / (float)maxFlameRow;
-                            
-                            // Color gradient: deep red  orange  yellow-orange
-                            uint8_t hue;
-                            if (progress < 0.4f) {
-                                // Bottom 40%: Deep red (0-5)
-                                hue = 0 + (uint8_t)(progress * 2.5f * 5.0f);
-                            } else if (progress < 0.7f) {
-                                // Mid 30%: Red to orange (5-15)
-                                hue = 5 + (uint8_t)((progress - 0.4f) * 3.33f * 10.0f);
-                            } else {
-                                // Top 30%: Orange to yellow-orange (15-25)
-                                hue = 15 + (uint8_t)((progress - 0.7f) * 3.33f * 10.0f);
-                            }
-                            
-                            // Subtle hue variation (1 for gentle organic feel)
-                            hue += random(-1, 2);
-                            
-                            // Brightness gradient: dimmer at base, brighter at tips
-                            uint8_t brightness;
-                            if (progress < 0.5f) {
-                                brightness = 150 + (uint8_t)(progress * 2.0f * 50.0f);  // 150-200
-                            } else {
-                                brightness = 200 + (uint8_t)((progress - 0.5f) * 2.0f * 55.0f);  // 200-255
-                            }
-                            
-                            // Gentle brightness variation (5 for subtle glow)
-                            brightness += random(-5, 6);
-                            brightness = constrain(brightness, 100, 255);
-                            
-                            leds[ledIdx] = CHSV(hue, 255, brightness);
-                        }
-                    }
-                }
-            }  // End of fire mode
-            
-            break;  // End of LED_AMBIENT case
-            
-        case LED_RADIO:
-            // Internet radio mode visualization
-            {
-                if (!radioState.streaming) {
-                    // Discovery mode: slow sine-wave teal pulse (waiting for Gemini to pick a station)
-                    static float radioPulsePhase = 0.0f;
-                    radioPulsePhase += 0.004f;
-                    if (radioPulsePhase > TWO_PI) radioPulsePhase -= TWO_PI;
-                    float brightness = 0.30f + 0.15f * sinf(radioPulsePhase);  // 30-45% brightness
-                    uint8_t b = (uint8_t)(brightness * 255);
-                    CRGB teal = CRGB(0, (uint8_t)(b * 0.7f), b);  // teal: 0, 0.7B, B
-                    fill_solid(leds, NUM_LEDS, teal);
-                } else if (radioState.isHLS && !isPlayingAmbient) {
-                    // HLS buffering: slow orange pulse to show "buffering"
-                    static float hlsPulsePhase = 0.0f;
-                    hlsPulsePhase += 0.003f;
-                    if (hlsPulsePhase > TWO_PI) hlsPulsePhase -= TWO_PI;
-                    float brightness = 0.25f + 0.20f * sinf(hlsPulsePhase);
-                    uint8_t b = (uint8_t)(brightness * 255);
-                    fill_solid(leds, NUM_LEDS, CRGB(b, (uint8_t)(b * 0.5f), 0));
-                } else if (!radioState.visualsActive) {
-                    // VU visuals off: static teal at 40%
-                    fill_solid(leds, NUM_LEDS, CRGB(0, (uint8_t)(0.4f * 180), (uint8_t)(0.4f * 255)));
-                } else {
-                    // VU meter using playback audio level, teal color scheme
-                    // Fade all LEDs for trail effect
-                    for (int i = 0; i < NUM_LEDS; i++) {
-                        leds[i].fadeToBlackBy(80);
-                    }
-                    
-                    // Map playback audio to row count (0-12 rows), same as LED_AUDIO_REACTIVE
-                    int numRows = map(constrain((int)smoothedAudioLevel, 0, 3000), 0, 3000, 0, LEDS_PER_COLUMN);
-                    
-                    for (int col = 0; col < LED_COLUMNS; col++) {
-                        for (int row = 0; row < LEDS_PER_COLUMN; row++) {
-                            int ledIdx = col * LEDS_PER_COLUMN + row;
-                            if (ledIdx >= NUM_LEDS) continue;
-                            if (row < numRows) {
-                                // Teal gradient: low = dark teal, high = bright cyan
-                                float progress = (float)row / (float)LEDS_PER_COLUMN;
-                                uint8_t g = (uint8_t)(progress * 200);
-                                uint8_t b_val = (uint8_t)(100 + progress * 155);
-                                leds[ledIdx] = CRGB(0, g, b_val);
-                            }
-                        }
-                    }
-                }
-            }
-            break;
-
-        case LED_POMODORO:
-            // Pomodoro timer visualization with hybrid countdown/countup
-            // Focus (red): countdown from full
-            // Breaks (green/blue): count-up to full
-            {
-                if (pomodoroState.active) {
-                    // Calculate time remaining or elapsed
-                    int secondsRemaining;
-                    if (pomodoroState.paused) {
-                        // When paused, use saved time (or full duration if just started)
-                        secondsRemaining = pomodoroState.pausedTime > 0 ? pomodoroState.pausedTime : pomodoroState.totalSeconds;
-                    } else if (pomodoroState.startTime > 0) {
-                        uint32_t elapsed = (millis() - pomodoroState.startTime) / 1000;
-                        secondsRemaining = max(0, pomodoroState.totalSeconds - (int)elapsed);
-                    } else {
-                        secondsRemaining = pomodoroState.totalSeconds;
-                    }
-                    
-                    // Calculate progress (0.0 to 1.0)
-                    float progress = 1.0 - ((float)secondsRemaining / (float)pomodoroState.totalSeconds);
-                    
-                    // Determine if this is a break session
-                    bool isBreakSession = (pomodoroState.currentSession == PomodoroState::SHORT_BREAK || 
-                                          pomodoroState.currentSession == PomodoroState::LONG_BREAK);
-                    
-                    // Choose color based on session type
-                    CRGB sessionColor;
-                    if (pomodoroState.currentSession == PomodoroState::FOCUS) {
-                        sessionColor = CRGB(255, 0, 0);  // Red for focus
-                    } else if (pomodoroState.currentSession == PomodoroState::SHORT_BREAK) {
-                        sessionColor = CRGB(0, 255, 0);  // Green for short break
-                    } else {
-                        sessionColor = CRGB(0, 100, 255);  // Blue for long break
-                    }
-                    
-                    // Calculate number of rows to light
-                    int litRows;
-                    if (isBreakSession) {
-                        // Breaks: count UP (filling = recharging energy)
-                        litRows = (int)ceil(progress * LEDS_PER_COLUMN);
-                    } else {
-                        // Focus: count DOWN (draining = time running out)
-                        litRows = (int)ceil((1.0 - progress) * LEDS_PER_COLUMN);
-                    }
-                    litRows = constrain(litRows, 0, LEDS_PER_COLUMN);
-                    
-                    // Pulse effect for active LED (slow breathing) - smooth sine wave
-                    float activePulse = 1.0;
-                    if (pomodoroState.paused) {
-                        // When paused, ALL LEDs breathe together
-                        float breathe = sin(millis() / 3000.0 * PI);
-                        activePulse = 0.30 + 0.70 * ((breathe + 1.0) / 2.0);
-                    } else {
-                        // When running, only active LED breathes (brighter for diffuser)
-                        float breathe = sin(millis() / 2000.0 * PI);  // Faster 4-second cycle
-                        activePulse = 0.70 + 0.30 * ((breathe + 1.0) / 2.0);  // 70-100% range
-                    }
-                    
-                    // Calculate which LED is currently "active" (the moving indicator)
-                    // Use floor for discrete LED positions
-                    int activeLED;
-                    
-                    if (isBreakSession) {
-                        // Countup: active LED moves from bottom (0) to top (11)
-                        activeLED = constrain((int)(progress * LEDS_PER_COLUMN), 0, LEDS_PER_COLUMN - 1);
-                    } else {
-                        // Countdown: active LED moves from top (11) to bottom (0)
-                        // As progress goes 01, active LED goes 110
-                        activeLED = constrain(LEDS_PER_COLUMN - 1 - (int)(progress * LEDS_PER_COLUMN), 0, LEDS_PER_COLUMN - 1);
-                    }
-                    
-                    // Debug logging (every 5 seconds)
-                    static uint32_t lastPomodoroDebug = 0;
-                    if (millis() - lastPomodoroDebug > 5000) {
-                        Serial.printf("Progress: %.1f%%, Active LED row: %d, Pulse: %.2f, Paused: %d, Remaining: %ds\n",
-                                     progress * 100, activeLED, activePulse, pomodoroState.paused, secondsRemaining);
-                        lastPomodoroDebug = millis();
-                    }
-                    
-                    // Light all columns identically (vertical bars)
-                    for (int col = 0; col < LED_COLUMNS; col++) {
-                        for (int row = 0; row < LEDS_PER_COLUMN; row++) {
-                            int ledIndex = col * LEDS_PER_COLUMN + row;
-                            if (ledIndex >= NUM_LEDS) continue;
-                            
-                            // Determine if this LED should be lit
-                            // LEDs stay lit from bottom (0) up to and including the active LED
-                            bool shouldBeLit = (row <= activeLED);
-                            
-                            if (!shouldBeLit) {
-                                leds[ledIndex] = CRGB::Black;
-                                continue;
-                            }
-                            
-                            // All lit LEDs get brightness treatment
-                            float ledBrightness;
-                            
-                            if (pomodoroState.paused) {
-                                // When paused: all LEDs breathe together at same brightness
-                                ledBrightness = activePulse;
-                            } else {
-                                // When running: active LED breathes, others stay at 10%
-                                if (row == activeLED) {
-                                    ledBrightness = activePulse;  // 70-100% breathing
-                                } else {
-                                    ledBrightness = 0.10;  // 10% for inactive LEDs (visible background)
-                                }
-                            }
-                            
-                            // Apply brightness to session color
-                            uint8_t r = (uint8_t)(sessionColor.r * ledBrightness);
-                            uint8_t g = (uint8_t)(sessionColor.g * ledBrightness);
-                            uint8_t b = (uint8_t)(sessionColor.b * ledBrightness);
-                            leds[ledIndex] = CRGB(r, g, b);
-                        }
-                    }
-                } else {
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                }
-            }
-            break;
-            
-        case LED_MEDITATION:
-            // Meditation breathing visualization with box breathing (4-4-4-4)
-            // Smooth bouncing indicator shows breath position
-            // NOTE: Uses raw FastLED, not NeoMatrix, to avoid interference
-            {
-                if (meditationState.active) {
-                    // Define chakra colors (RGB)
-                    const CRGB chakraColors[7] = {
-                        CRGB(255, 0, 0),      // ROOT - Red
-                        CRGB(255, 100, 0),    // SACRAL - Orange
-                        CRGB(255, 200, 0),    // SOLAR - Yellow
-                        CRGB(0, 255, 0),      // HEART - Green
-                        CRGB(0, 100, 255),    // THROAT - Blue (more blue, less cyan)
-                        CRGB(75, 0, 130),     // THIRD_EYE - Indigo (darker purple)
-                        CRGB(180, 0, 255)     // CROWN - Violet (brighter purple)
-                    };
-                    
-                    CRGB currentColor = chakraColors[meditationState.currentChakra];
-                    
-                    // Smooth color transition between chakras
-                    static int lastChakra = -1;  // -1 = uninitialized
-                    static CRGB lastColor = CRGB::Black;
-                    static uint32_t colorTransitionStart = 0;
-                    
-                    // Initialize on first use
-                    if (lastChakra == -1) {
-                        lastChakra = meditationState.currentChakra;
-                        lastColor = currentColor;
-                        colorTransitionStart = millis() - COLOR_TRANSITION_MS;  // Already complete
-                    }
-                    
-                    // Detect chakra change and start color transition
-                    if (meditationState.currentChakra != lastChakra) {
-                        lastChakra = meditationState.currentChakra;
-                        colorTransitionStart = millis();
-                        
-                        Serial.printf("Chakra changed to %s: RGB(%d,%d,%d) - starting 3s color fade\n", 
-                                     CHAKRA_NAMES[meditationState.currentChakra],
-                                     currentColor.r, currentColor.g, currentColor.b);
-                    }
-                    
-                    // Calculate color blend during transition
-                    CRGB displayColor;
-                    if (millis() - colorTransitionStart < COLOR_TRANSITION_MS) {
-                        // Mid-transition: blend from lastColor to currentColor
-                        float blendProgress = (float)(millis() - colorTransitionStart) / COLOR_TRANSITION_MS;
-                        displayColor = CRGB(
-                            lastColor.r + (currentColor.r - lastColor.r) * blendProgress,
-                            lastColor.g + (currentColor.g - lastColor.g) * blendProgress,
-                            lastColor.b + (currentColor.b - lastColor.b) * blendProgress
-                        );
-                    } else {
-                        // Transition complete: use current color
-                        displayColor = currentColor;
-                        lastColor = currentColor;  // Update for next transition
-                    }
-                    
-                    if (meditationState.phaseStartTime > 0) {
-                        // Calculate phase progress
-                        const uint32_t PHASE_DURATION = 4000;  // 4 seconds per phase
-                        uint32_t phaseElapsed = millis() - meditationState.phaseStartTime;
-                        
-                        // Check if phase is complete and advance
-                        if (phaseElapsed >= PHASE_DURATION) {
-                            meditationState.phase = (MeditationState::BreathPhase)((meditationState.phase + 1) % 4);
-                            meditationState.phaseStartTime = millis();
-                            phaseElapsed = 0;
-                            
-                            const char* phaseNames[] = {"INHALE", "HOLD_TOP", "EXHALE", "HOLD_BOTTOM"};
-                            Serial.printf("Breath phase: %s\n", phaseNames[meditationState.phase]);
-                        }
-                        
-                        // CRITICAL: Capture phase state at start of frame to prevent mid-frame changes
-                        MeditationState::BreathPhase currentPhase = meditationState.phase;
-                        float phaseProgress = (float)phaseElapsed / PHASE_DURATION;
-                        
-                        // Calculate brightness based on breath phase (all LEDs breathe together)
-                        // 20% to 100% breathing effect for entire sphere
-                        float breathBrightness = MEDITATION_BREATH_MIN;  // Default to minimum
-                        
-                        switch (currentPhase) {
-                            case MeditationState::INHALE:
-                                // Smooth fade from 20% to 100% over 4 seconds
-                                breathBrightness = MEDITATION_BREATH_MIN + ((MEDITATION_BREATH_MAX - MEDITATION_BREATH_MIN) * phaseProgress);
-                                break;
-                            case MeditationState::HOLD_TOP:
-                                // Hold at 100% for 4 seconds
-                                breathBrightness = MEDITATION_BREATH_MAX;
-                                break;
-                            case MeditationState::EXHALE:
-                                // Smooth fade from 100% to 20% over 4 seconds
-                                breathBrightness = MEDITATION_BREATH_MAX - ((MEDITATION_BREATH_MAX - MEDITATION_BREATH_MIN) * phaseProgress);
-                                break;
-                            case MeditationState::HOLD_BOTTOM:
-                                // Hold at 20% for 4 seconds
-                                breathBrightness = MEDITATION_BREATH_MIN;
-                                break;
-                        }
-                        
-                        // Apply smooth easing for more organic breathing feel
-                        float easedBrightness = (1.0 - cos(breathBrightness * PI)) / 2.0;
-                        
-                        // Convert to 0-255 range
-                        uint8_t brightness = (uint8_t)(easedBrightness * 255);
-                        
-                        // Set all LEDs to the same chakra color at calculated brightness
-                        CRGB breathColor = CRGB(
-                            (displayColor.r * brightness) / 255,
-                            (displayColor.g * brightness) / 255,
-                            (displayColor.b * brightness) / 255
-                        );
-                        
-                        fill_solid(leds, NUM_LEDS, breathColor);
-                    } else {
-                        // Not started yet (phaseStartTime = 0): Show static chakra color at 30%
-                        for (int i = 0; i < NUM_LEDS; i++) {
-                            uint8_t r = (uint8_t)((displayColor.r * 77) / 255);  // 30% = 77/255
-                            uint8_t g = (uint8_t)((displayColor.g * 77) / 255);
-                            uint8_t b = (uint8_t)((displayColor.b * 77) / 255);
-                            leds[i] = CRGB(r, g, b);
-                        }
-                    }
-                } else {
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                }
-            }
-            break;
-            
-        case LED_LAMP:
-            // White lamp with spiral swoosh lighting effect
-            // Button 1: cycle colors (WHITE  RED  GREEN  BLUE)
-            {
-                if (lampState.active) {
-                    const uint32_t FADE_DURATION_MS = 150;  // Quick fade-up per LED
-                    const uint32_t LED_INTERVAL_MS = 40;    // 40ms between lighting each LED (slowed down for better visual)
-                    
-                    uint32_t now = millis();
-                    
-                    // Get RGB values for current and previous colors at 50% brightness
-                    auto getColorRGB = [](LampState::Color color) -> CRGB {
-                        switch (color) {
-                            case LampState::RED:   return CRGB(128, 0, 0);    // 50% red
-                            case LampState::GREEN: return CRGB(0, 128, 0);    // 50% green
-                            case LampState::BLUE:  return CRGB(0, 0, 128);    // 50% blue
-                            default:               return CRGB(128, 128, 128);  // 50% white
-                        }
-                    };
-                    
-                    CRGB targetColor = getColorRGB(lampState.currentColor);
-                    CRGB previousColor = getColorRGB(lampState.previousColor);
-                    
-                    // Light next LED if it's time
-                    if (!lampState.fullyLit && (now - lampState.lastUpdate) >= LED_INTERVAL_MS) {
-                        // Calculate LED index: spiral pattern (row by row, rotating around strips)
-                        int ledIndex = lampState.currentCol * LEDS_PER_COLUMN + lampState.currentRow;
-                        
-                        if (ledIndex < NUM_LEDS) {
-                            lampState.ledStartTimes[ledIndex] = now;
-                            lampState.lastUpdate = now;
-                            
-                            // Move to next LED in spiral
-                            lampState.currentCol++;
-                            if (lampState.currentCol >= LED_COLUMNS) {
-                                lampState.currentCol = 0;
-                                lampState.currentRow++;
-                                
-                                if (lampState.currentRow >= LEDS_PER_COLUMN) {
-                                    lampState.fullyLit = true;
-                                    lampState.transitioning = false;
-                                    Serial.println("Lamp fully lit");
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Render all LEDs with fade effect
-                    for (int i = 0; i < NUM_LEDS; i++) {
-                        if (lampState.transitioning && lampState.ledStartTimes[i] == 0) {
-                            // Not reached by spiral yet - show previous color
-                            leds[i] = previousColor;
-                        } else if (lampState.ledStartTimes[i] > 0) {
-                            uint32_t elapsed = now - lampState.ledStartTimes[i];
-                            
-                            if (elapsed < FADE_DURATION_MS) {
-                                // Fading up to new color
-                                float progress = (float)elapsed / FADE_DURATION_MS;
-                                progress = progress * progress;  // Ease-in
-                                
-                                if (lampState.transitioning) {
-                                    // Blend from previous to target color
-                                    leds[i] = CRGB(
-                                        previousColor.r + (targetColor.r - previousColor.r) * progress,
-                                        previousColor.g + (targetColor.g - previousColor.g) * progress,
-                                        previousColor.b + (targetColor.b - previousColor.b) * progress
-                                    );
-                                } else {
-                                    // Fading from black to target color (initial lighting)
-                                    leds[i] = CRGB(
-                                        (targetColor.r * progress),
-                                        (targetColor.g * progress),
-                                        (targetColor.b * progress)
-                                    );
-                                }
-                            } else {
-                                // Fully lit at target color
-                                leds[i] = targetColor;
-                            }
-                        } else {
-                            // Not lit yet (initial lighting)
-                            leds[i] = CRGB::Black;
-                        }
-                    }
-                } else {
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                }
-            }
-            break;
-            
-        case LED_SEA_GOOSEBERRY:
-            // Sea Gooseberry Mode - organic downward-traveling iridescent waves
-            // Mimics real comb jelly bioluminescence with phase-shifted rainbow colors
-            {
-                seaGooseberry.render(leds, NUM_LEDS);
-            }
-            break;
-            
-        case LED_EYES:
-            // Eye Animation Mode - expressive robot eyes
-            // Uses strips 2-3 for left eye, 11-12 for right eye
-            {
-                eyeAnimation.render(leds);
-            }
-            break;
-            
-        case LED_ALARM:
-            // Alarm ringing - pulsing orange/red from center outward
-            {
-                if (alarmState.ringing) {
-                    const uint32_t PULSE_DURATION_MS = 1500;  // 1.5 seconds per pulse cycle
-                    const float MAX_RADIUS = 8.0f;  // Maximum pulse radius (extends beyond sphere)
-                    
-                    uint32_t now = millis();
-                    uint32_t elapsed = now - alarmState.pulseStartTime;
-                    
-                    // Reset pulse if cycle complete
-                    if (elapsed >= PULSE_DURATION_MS) {
-                        alarmState.pulseStartTime = now;
-                        elapsed = 0;
-                    }
-                    
-                    // Calculate current pulse radius (0 to MAX_RADIUS)
-                    float progress = (float)elapsed / PULSE_DURATION_MS;
-                    alarmState.pulseRadius = progress * MAX_RADIUS;
-                    
-                    // Sphere center point (in LED grid space)
-                    const float centerX = LED_COLUMNS / 2.0f;
-                    const float centerY = LEDS_PER_COLUMN / 2.0f;
-                    
-                    // Render pulse effect
-                    for (int col = 0; col < LED_COLUMNS; col++) {
-                        for (int row = 0; row < LEDS_PER_COLUMN; row++) {
-                            int ledIndex = col * LEDS_PER_COLUMN + row;
-                            
-                            // Calculate distance from center
-                            float dx = col - centerX;
-                            float dy = row - centerY;
-                            float distance = sqrt(dx * dx + dy * dy);
-                            
-                            // Calculate brightness based on distance from pulse wavefront
-                            float wavefront = alarmState.pulseRadius;
-                            float distanceFromWave = abs(distance - wavefront);
-                            
-                            // Make wave thicker and brighter at the front
-                            const float WAVE_THICKNESS = 2.5f;
-                            float intensity = 0.0f;
-                            
-                            if (distanceFromWave < WAVE_THICKNESS) {
-                                // Inside the wave - bright
-                                intensity = 1.0f - (distanceFromWave / WAVE_THICKNESS);
-                                intensity = intensity * intensity;  // Ease curve
-                            } else if (distance < wavefront) {
-                                // Behind the wave - dim glow
-                                intensity = 0.2f;
-                            }
-                            
-                            // Color: orange to red gradient based on intensity
-                            uint8_t red = 255;
-                            uint8_t green = (uint8_t)(120 * (1.0f - intensity * 0.5f));  // More orange at edges, more red at center
-                            uint8_t blue = 0;
-                            
-                            leds[ledIndex] = CRGB(
-                                (uint8_t)(red * intensity),
-                                (uint8_t)(green * intensity),
-                                blue
-                            );
-                        }
-                    }
-                } else {
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                }
-            }
-            break;
-            
-        case LED_CONVERSATION_WINDOW:
-            // Progress bar countdown - vertical bars showing remaining conversation window time
-            // All strips sync together
-            {
-                if (conversationMode) {
-                    uint32_t elapsed = millis() - conversationWindowStart;
-                    uint32_t remaining = CONVERSATION_WINDOW_MS - elapsed;
-                    
-                    if (remaining > 0) {
-                        // Calculate number of rows to light based on remaining time
-                        float progress = (float)remaining / (float)CONVERSATION_WINDOW_MS;
-                        int numRows = (int)(progress * LEDS_PER_COLUMN);
-                        
-                        // Pulse effect in final 3 seconds for urgency
-                        uint8_t brightness = 255;
-                        if (remaining < 3000) {
-                            float pulse = 0.5 + 0.5 * sin(millis() / 150.0);
-                            brightness = (uint8_t)(255 * pulse);
-                        }
-                        
-                        // Cyan color for conversation listening mode - all strips sync
-                        for (int col = 0; col < LED_COLUMNS; col++) {
-                            for (int row = 0; row < LEDS_PER_COLUMN; row++) {
-                                int ledIndex = col * LEDS_PER_COLUMN + row;
-                                
-                                if (row < numRows) {
-                                    leds[ledIndex] = CHSV(160, 200, brightness);  // Cyan
-                                } else {
-                                    leds[ledIndex] = CRGB::Black;
-                                }
-                            }
-                        }
-                    } else {
-                        // Window expired - clear LEDs
-                        fill_solid(leds, NUM_LEDS, CRGB::Black);
-                    }
-                } else {
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                }
-            }
-            break;
-            
-        case LED_CONNECTED:
-            {
-                static uint32_t lastConnDebug = 0;
-                if (millis() - lastConnDebug > 500) {
-                    Serial.println("LED_CONNECTED: Solid green");
-                    lastConnDebug = millis();
-                }
-                fill_solid(leds, NUM_LEDS, CRGB(0, 255, 0));  // Pure green
-            }
-            break;
-            
-        case LED_ERROR:
-            brightness = (millis() / 200) % 2 ? 255 : 50;
-            fill_solid(leds, NUM_LEDS, CHSV(0, 255, brightness));
-            break;
+        case LED_BOOT:            renderLedBoot(leds);              break;
+        case LED_IDLE:            renderLedIdle(leds);              break;
+        case LED_RECORDING:       renderLedRecording(leds);         break;
+        case LED_PROCESSING:      renderLedProcessing(leds);        break;
+        case LED_AMBIENT_VU:      renderLedAmbientVU(leds);         break;
+        case LED_AUDIO_REACTIVE:  renderLedAudioReactive(leds);     break;
+        case LED_TIDE:            renderLedTide(leds);              break;
+        case LED_TIMER:           renderLedTimer(leds);             break;
+        case LED_MOON:            renderLedMoon(leds);              break;
+        case LED_AMBIENT:         ambientRenderer.render(leds, NUM_LEDS); break;
+        case LED_RADIO:           renderLedRadio(leds);             break;
+        case LED_POMODORO:        renderLedPomodoro(leds);          break;
+        case LED_MEDITATION:      renderLedMeditation(leds);        break;
+        case LED_LAMP:            renderLedLamp(leds);              break;
+        case LED_SEA_GOOSEBERRY:  seaGooseberry.render(leds, NUM_LEDS); break;
+        case LED_EYES:            eyeAnimation.render(leds);        break;
+        case LED_ALARM:           renderLedAlarm(leds);             break;
+        case LED_CONVERSATION_WINDOW: renderLedConversationWindow(leds); break;
+        case LED_CONNECTED:       renderLedConnected(leds);         break;
+        case LED_ERROR:           renderLedError(leds);             break;
     }
 }
 

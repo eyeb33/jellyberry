@@ -179,7 +179,7 @@ Press **Button 2** to cycle through modes in this order:
 - **Colors:** Soft rainbow gradients (blue, cyan, green, magenta)
 - **Pattern:** 8 primary bright ribs + 4 dimmer in-between strips
 - **Motion:** Organic, phase-shifted waves rotating around the sphere
-- **Breathing:** Slow 30-second global brightness modulation
+- **Breathing:** Slow 25-second global brightness modulation
 
 ### Biology Inspiration
 Mimics real sea gooseberries (Pleurobrachia spp.) - transparent comb jellies with 8 meridional rows of beating cilia. The cilia refract light to create traveling waves of rainbow color flowing from pole to pole.

@@ -117,18 +117,18 @@ HSV Hue values:
   Range: ±64 hues
 
 
-BREATHING EFFECT (30-second cycle):
+BREATHING EFFECT (25-second cycle):
 
-Brightness      1.3 ┤     ╱╲
-Multiplier      1.2 ┤    ╱  ╲
-                1.1 ┤   ╱    ╲
-                1.0 ┤--╱------╲--╱------╲
-                0.9 ┤ ╱        ╲╱        ╲
-                0.8 ┤╱                    ╲
+Brightness      1.3 ┬     ╭╰
+Multiplier      1.2 ┬    ╭  ╰
+                1.1 ┬   ╭    ╰
+                1.0 ┬--╭------╰--╭------╰
+                0.9 ┬ ╭        ╮╯        ╰
+                0.8 ┬╭                    ╰
                 0.7 ┴────────────────────────> Time (seconds)
-                    0    10    20    30    40
+                    0    10    20    25    30
 
 Sine wave: brightness = 1.0 ± (0.3 × sin(phase × 2π))
-Period: 30 seconds
+Period: 25 seconds
 Depth: ±30% (0.7 to 1.3)
 ```

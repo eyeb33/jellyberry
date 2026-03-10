@@ -17,7 +17,7 @@ Real sea gooseberries have 8 meridional comb rows running from pole to pole. Eac
 - **2 Overlapping Waves** - different speeds for visual depth
 - **Phase-Shifted Rotation** - each rib slightly ahead/behind neighbors
 - **Organic Timing** - ±10% speed variation per rib, never mechanical
-- **Slow Breathing** - 30-second global brightness cycle (±30%)
+- **Slow Breathing** - 25-second global brightness cycle (±30%)
 
 ---
 
@@ -102,7 +102,7 @@ NUM_WAVES_PER_STRIP = 1-3         // Randomised per strip at startup, reshuffled
 
 ### Breathing Effect
 ```cpp
-BREATHING_PERIOD = 30000.0f       // 30 second breathing cycle
+BREATHING_PERIOD = 25000.0f       // 25 second breathing cycle
 BREATHING_DEPTH = 0.3f            // ±30% brightness variation
 ```
 

@@ -190,20 +190,20 @@ void EyeAnimationVisualizer::drawHeartEye(CRGB* leds, int stripStart) {
     };
 
     // Top bumps
-    safeSet(stripStart,     3, CRGB::Red);
-    safeSet(stripStart,     4, CRGB::Red);
-    safeSet(stripStart + 1, 3, CRGB::Red);
-    safeSet(stripStart + 1, 4, CRGB::Red);
+    safeSet(stripStart,     3, eyeColor);
+    safeSet(stripStart,     4, eyeColor);
+    safeSet(stripStart + 1, 3, eyeColor);
+    safeSet(stripStart + 1, 4, eyeColor);
     
     // Middle
     for (int h = 5; h <= 7; h++) {
-        safeSet(stripStart,     h, CRGB::Red);
-        safeSet(stripStart + 1, h, CRGB::Red);
+        safeSet(stripStart,     h, eyeColor);
+        safeSet(stripStart + 1, h, eyeColor);
     }
     
     // Bottom point
-    safeSet(stripStart,     8, CRGB::Red);
-    safeSet(stripStart + 1, 8, CRGB::Red);
+    safeSet(stripStart,     8, eyeColor);
+    safeSet(stripStart + 1, 8, eyeColor);
 }
 
 int EyeAnimationVisualizer::ledIndexForCoord(int strip, int height) {

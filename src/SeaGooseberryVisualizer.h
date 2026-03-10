@@ -1,5 +1,4 @@
-#ifndef SEA_GOOSEBERRY_VISUALIZER_H
-#define SEA_GOOSEBERRY_VISUALIZER_H
+#pragma once
 
 #include <Arduino.h>
 #include <FastLED.h>
@@ -101,5 +100,3 @@ private:
     CRGB getBandColor(float bandPhase, float ledPositionInBand, int stripIndex);  // Color with vertical gradient
     float getGaussianBrightness(float distance);  // Gaussian brightness curve
 };
-
-#endif // SEA_GOOSEBERRY_VISUALIZER_H

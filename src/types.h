@@ -30,7 +30,7 @@ enum AmbientSoundType { SOUND_RAIN, SOUND_OCEAN, SOUND_RAINFOREST, SOUND_FIRE };
 
 // Tide visualization state
 struct TideState {
-    String state;  // "flooding" or "ebbing"
+    char state[16];  // "flooding" or "ebbing"
     float waterLevel;  // 0.0 to 1.0
     int nextChangeMinutes;
     uint32_t displayStartTime;
@@ -50,7 +50,7 @@ struct TimerState {
 
 // Moon phase visualization state
 struct MoonState {
-    String phaseName;
+    char phaseName[32];
     int illumination;  // 0-100%
     float moonAge;
     uint32_t displayStartTime;
@@ -59,7 +59,7 @@ struct MoonState {
 
 // Ambient sound state
 struct AmbientSound {
-    String name;  // "rain", "ocean", "rainforest", "fire"
+    char name[64];  // "rain", "ocean", "rainforest", "fire", or station name
     bool active;
     uint16_t sequence;  // Increments each time we request a new sound
     uint16_t discardedCount;  // Count discarded chunks to reduce log spam
@@ -104,8 +104,8 @@ struct RadioState {
     bool streaming = false;       // false = discovery phase, true = station playing
     bool visualsActive = true;    // VU meter on/off toggle (Button 2 while playing)
     bool isHLS = false;           // HLS stream — longer initial buffer wait
-    String stationName;           // Current station name
-    String streamUrl;             // Direct stream URL
+    char stationName[64];           // Current station name
+    char streamUrl[256];             // Direct stream URL
     float savedVolume = 1.0f;     // Saved before Button 1 duck, restored after
 };
 

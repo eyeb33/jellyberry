@@ -1,4 +1,4 @@
-#include "ws_handler.h"
+﻿#include "ws_handler.h"
 
 // ── Shared audio-drain helper ────────────────────────────────────────────────
 // Drain buffered audio, zero I2S DMA, and set a suppression window.
@@ -33,6 +33,13 @@ void transitionConvState(ConvState newState) {
     }
 }
 
+// ── Safe WebSocket send with error logging ───────────────────────────────────
+static void wsSendMessage(const String& msg) {
+    if (!webSocket.sendTXT(msg.c_str(), msg.length())) {
+        Serial.printf("[WS] sendTXT failed (%u bytes)\n", msg.length());
+    }
+}
+
 void handleWebSocketMessage(uint8_t* payload, size_t length) {
  JsonDocument doc;
  DeserializationError error = deserializeJson(doc, payload, length);
@@ -41,9 +48,10 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  Serial.printf("JSON parse error: %s\n", error.c_str());
  return;
  }
- 
+ const char* msgType = doc["type"] | "";
+
  // Handle server ready message
- if (doc["type"].is<const char*>() && doc["type"] == "ready") {
+ if (strcmp(msgType, "ready") == 0) {
  Serial.printf("Server: %s\n", doc["message"].as<const char*>());
  return;
  }
@@ -52,7 +60,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  // Show LED_PROCESSING so the user knows the device is working, not frozen.
  // convState stays IDLE (the button press that triggered this was dropped);
  // the user just needs to press again once reconnectComplete arrives.
- if (doc["type"].is<const char*>() && doc["type"] == "reconnecting") {
+ if (strcmp(msgType, "reconnecting") == 0) {
  Serial.println("Gemini reconnecting after idle — showing connecting animation");
  currentLEDMode = LED_PROCESSING;
  transitionConvState(ConvState::IDLE);
@@ -61,7 +69,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
 
  // Handle lazy-reconnect complete: Gemini is ready again.
  // Restore the mode that was active before reconnection.
- if (doc["type"].is<const char*>() && doc["type"] == "reconnectComplete") {
+ if (strcmp(msgType, "reconnectComplete") == 0) {
  Serial.println("Gemini reconnect complete — ready for interaction");
  transitionConvState(ConvState::IDLE);
  // Restore active mode rather than unconditionally going to LED_IDLE
@@ -80,7 +88,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
 
  // Handle setup complete message
- if (doc["type"].is<const char*>() && doc["type"] == "setupComplete") {
+ if (strcmp(msgType, "setupComplete") == 0) {
  Serial.println("Setup complete - ready for interaction");
  // Prime state machine for the incoming boot greeting: treat it like a pending Gemini response.
  // Without this, convState stays IDLE and the auto-transition block (which guards on WAITING)
@@ -90,7 +98,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
  
  // Handle turn complete
- if (doc["type"].is<const char*>() && doc["type"] == "turnComplete") {
+ if (strcmp(msgType, "turnComplete") == 0) {
  // Always store turnComplete, even during recording.
  // Gemini sends exactly ONE turnComplete per turn. If we discard it because
  // recordingActive=true, no second one will ever arrive and the device hangs.
@@ -115,7 +123,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
  
  // Handle function calls
- if (doc["type"].is<const char*>() && doc["type"] == "functionCall") {
+ if (strcmp(msgType, "functionCall") == 0) {
  String funcName = doc["name"].as<String>();
  Serial.printf("Function call: %s\n", funcName.c_str());
  
@@ -156,23 +164,23 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
  
  // Handle tide data from server
- if (doc["type"].is<const char*>() && doc["type"] == "tideData") {
+ if (strcmp(msgType, "tideData") == 0) {
  Serial.println("Received tide data - storing for display after speech");
- tideState.state = doc["state"].as<String>();
+ strlcpy(tideState.state, doc["state"] | "", sizeof(tideState.state));
  tideState.waterLevel = doc["waterLevel"].as<float>();
  tideState.nextChangeMinutes = doc["nextChangeMinutes"].as<int>();
  tideState.active = true;
  // Don't switch LED mode yet - let it display after audio finishes
  
  Serial.printf("Tide: %s, water level: %.1f%%, next change in %d minutes\n",
- tideState.state.c_str(), 
+ tideState.state,
  tideState.waterLevel * 100,
  tideState.nextChangeMinutes);
  return;
  }
  
  // Handle sunrise/sunset data from server
- if (doc["type"].is<const char*>() && doc["type"] == "sunData") {
+ if (strcmp(msgType, "sunData") == 0) {
  dayNightData.sunriseTime = doc["sunrise"].as<long long>() / 1000; // Convert ms to seconds
  dayNightData.sunsetTime = doc["sunset"].as<long long>() / 1000;
  dayNightData.valid = true;
@@ -196,7 +204,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
  
  // Handle timer set from server
- if (doc["type"].is<const char*>() && doc["type"] == "timerSet") {
+ if (strcmp(msgType, "timerSet") == 0) {
  Serial.println("Timer set - storing for display after speech");
  timerState.totalSeconds = doc["durationSeconds"].as<int>();
  timerState.startTime = millis();
@@ -210,7 +218,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
  
  // Handle alarm set from server
- if (doc["type"].is<const char*>() && doc["type"] == "setAlarm") {
+ if (strcmp(msgType, "setAlarm") == 0) {
  uint32_t alarmID = doc["alarmID"].as<uint32_t>();
  time_t triggerTime = doc["triggerTime"].as<long long>() / 1000; // Convert ms to seconds
  
@@ -246,7 +254,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
  
  // Handle timer cancelled
- if (doc["type"].is<const char*>() && doc["type"] == "timerCancelled") {
+ if (strcmp(msgType, "timerCancelled") == 0) {
  Serial.println("Timer cancelled");
  timerState.active = false;
  if (currentLEDMode == LED_TIMER) {
@@ -256,7 +264,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
  
  // Handle timer expired
- if (doc["type"].is<const char*>() && doc["type"] == "timerExpired") {
+ if (strcmp(msgType, "timerExpired") == 0) {
  Serial.println("Timer expired!");
  timerState.active = false;
  // Trigger non-blocking flash animation (runs in loop() — does NOT block WebSocket task).
@@ -276,7 +284,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
  
  // Handle cancel alarm from server
- if (doc["type"].is<const char*>() && doc["type"] == "cancelAlarm") {
+ if (strcmp(msgType, "cancelAlarm") == 0) {
  String which = doc["which"].as<String>();
  Serial.printf("Cancel alarm request: %s\n", which.c_str());
  
@@ -347,7 +355,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
  
  // Handle list alarms request
- if (doc["type"].is<const char*>() && doc["type"] == "listAlarms") {
+ if (strcmp(msgType, "listAlarms") == 0) {
  Serial.println("List alarms request");
  
  struct tm timeinfo;
@@ -382,36 +390,36 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  
  String responseMsg;
  serializeJson(responseDoc, responseMsg);
- webSocket.sendTXT(responseMsg);
+ wsSendMessage(responseMsg);
  Serial.printf("Sent alarm list: %d alarm(s)\n", alarmArray.size());
  }
  return;
  }
  
  // Handle moon data
- if (doc["type"].is<const char*>() && doc["type"] == "moonData") {
+ if (strcmp(msgType, "moonData") == 0) {
  Serial.println("Received moon data - storing for display after speech");
- moonState.phaseName = doc["phaseName"].as<String>();
+ strlcpy(moonState.phaseName, doc["phaseName"] | "", sizeof(moonState.phaseName));
  moonState.illumination = doc["illumination"].as<int>();
  moonState.moonAge = doc["moonAge"].as<float>();
  moonState.active = true;
  // Don't switch LED mode yet - let it display after audio finishes
  
  Serial.printf("Moon: %s (%d%% illuminated, %.1f days old)\n", 
- moonState.phaseName.c_str(), moonState.illumination, moonState.moonAge);
+ moonState.phaseName, moonState.illumination, moonState.moonAge);
  return;
  }
  
  // Handle ambient stream completion
- if (doc["type"].is<const char*>() && doc["type"] == "ambientComplete") {
+ if (strcmp(msgType, "ambientComplete") == 0) {
  String soundName = doc["sound"].as<String>();
  uint16_t sequence = doc["sequence"].as<uint16_t>();
  Serial.printf("Ambient track complete: %s (seq %d)\n", soundName.c_str(), sequence);
  
  // Validate: Only process if this completion matches what we're currently playing
- if (soundName != ambientSound.name) {
+ if (strcmp(ambientSound.name, soundName.c_str()) != 0) {
  Serial.printf("Ignoring stale completion: expected '%s', got '%s'\n", 
- ambientSound.name.c_str(), soundName.c_str());
+ ambientSound.name, soundName.c_str());
  return;
  }
  
@@ -432,9 +440,9 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  reqDoc["sequence"] = ++ambientSound.sequence;
  String reqMsg;
  serializeJson(reqDoc, reqMsg);
- webSocket.sendTXT(reqMsg);
+ wsSendMessage(reqMsg);
  
- ambientSound.name = nextSound;
+ strlcpy(ambientSound.name, nextSound, sizeof(ambientSound.name));
  firstAudioChunk = true;
  lastAudioChunkTime = millis();
  } else {
@@ -452,7 +460,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
  
  // Handle Pomodoro commands
- if (doc["type"].is<const char*>() && doc["type"] == "pomodoroStart") {
+ if (strcmp(msgType, "pomodoroStart") == 0) {
  // Get custom durations if provided, otherwise use current settings
  if (doc["focusMinutes"].is<int>()) {
  pomodoroState.focusDuration = doc["focusMinutes"].as<int>();
@@ -479,7 +487,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  return;
  }
  
- if (doc["type"].is<const char*>() && doc["type"] == "pomodoroPause") {
+ if (strcmp(msgType, "pomodoroPause") == 0) {
  Serial.println("Pomodoro paused via voice command");
  if (pomodoroState.active && !pomodoroState.paused) {
  uint32_t elapsed = (millis() - pomodoroState.startTime) / 1000;
@@ -491,7 +499,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  return;
  }
  
- if (doc["type"].is<const char*>() && doc["type"] == "pomodoroResume") {
+ if (strcmp(msgType, "pomodoroResume") == 0) {
  Serial.println("Pomodoro resumed via voice command");
  if (pomodoroState.active && pomodoroState.paused) {
  pomodoroState.startTime = millis();
@@ -501,7 +509,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  return;
  }
  
- if (doc["type"].is<const char*>() && doc["type"] == "pomodoroStop") {
+ if (strcmp(msgType, "pomodoroStop") == 0) {
  Serial.println("Pomodoro stopped via voice command");
  pomodoroState.active = false;
  pomodoroState.paused = false;
@@ -511,7 +519,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  return;
  }
  
- if (doc["type"].is<const char*>() && doc["type"] == "pomodoroSkip") {
+ if (strcmp(msgType, "pomodoroSkip") == 0) {
  Serial.println("Skipping to next Pomodoro session");
  if (pomodoroState.active) {
  // Trigger session transition by setting remaining time to 0
@@ -521,7 +529,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  return;
  }
  
- if (doc["type"].is<const char*>() && doc["type"] == "pomodoroStatusRequest") {
+ if (strcmp(msgType, "pomodoroStatusRequest") == 0) {
  Serial.println("Pomodoro status requested");
  
  JsonDocument statusDoc;
@@ -556,14 +564,14 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  
  String statusMsg;
  serializeJson(statusDoc, statusMsg);
- webSocket.sendTXT(statusMsg);
+ wsSendMessage(statusMsg);
  Serial.println("Sent Pomodoro status to server");
  return;
  }
 
  // Handle device state request — returns full device state snapshot to the server
  // Used by the get_device_state Gemini tool to give the model accurate self-awareness.
- if (doc["type"].is<const char*>() && doc["type"] == "deviceStateRequest") {
+ if (strcmp(msgType, "deviceStateRequest") == 0) {
  Serial.println("Device state requested");
 
  JsonDocument stateDoc;
@@ -645,11 +653,11 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
 
  String stateMsg;
  serializeJson(stateDoc, stateMsg);
- webSocket.sendTXT(stateMsg);
+ wsSendMessage(stateMsg);
  Serial.printf("Sent deviceStateResponse (%d chars)\n", stateMsg.length());
  return;
  }
- if (doc["type"].is<const char*>() && doc["type"] == "ambientStart") {
+ if (strcmp(msgType, "ambientStart") == 0) {
  const char* sound = doc["sound"] | "rain";
  Serial.printf("ambientStart: %s\n", sound);
 
@@ -659,7 +667,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  stopDoc["action"] = "stopAmbient";
  String stopMsg;
  serializeJson(stopDoc, stopMsg);
- webSocket.sendTXT(stopMsg);
+ wsSendMessage(stopMsg);
  }
 
  // Stop meditation if active
@@ -671,16 +679,16 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  // Map sound name to type
  if (strcmp(sound, "ocean") == 0) {
  currentAmbientSoundType = SOUND_OCEAN;
- ambientSound.name = "ocean";
+ strlcpy(ambientSound.name, "ocean", sizeof(ambientSound.name));
  } else if (strcmp(sound, "rainforest") == 0) {
  currentAmbientSoundType = SOUND_RAINFOREST;
- ambientSound.name = "rainforest";
+ strlcpy(ambientSound.name, "rainforest", sizeof(ambientSound.name));
  } else if (strcmp(sound, "fire") == 0) {
  currentAmbientSoundType = SOUND_FIRE;
- ambientSound.name = "fire";
+ strlcpy(ambientSound.name, "fire", sizeof(ambientSound.name));
  } else {
  currentAmbientSoundType = SOUND_RAIN;
- ambientSound.name = "rain";
+ strlcpy(ambientSound.name, "rain", sizeof(ambientSound.name));
  }
 
  ambientSound.active = true;
@@ -706,14 +714,14 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  String ambientMsg;
  serializeJson(ambientDoc, ambientMsg);
  Serial.printf("Ambient audio request: %s (seq %d)\n", ambientMsg.c_str(), ambientSound.sequence);
- webSocket.sendTXT(ambientMsg);
+ wsSendMessage(ambientMsg);
  }
  currentLEDMode = LED_AMBIENT;
  return;
  }
 
  // Handle meditationStart - voice-commanded meditation
- if (doc["type"].is<const char*>() && doc["type"] == "meditationStart") {
+ if (strcmp(msgType, "meditationStart") == 0) {
  Serial.println("meditationStart");
 
  // Stop ambient if playing
@@ -722,7 +730,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  stopDoc["action"] = "stopAmbient";
  String stopMsg;
  serializeJson(stopDoc, stopMsg);
- webSocket.sendTXT(stopMsg);
+ wsSendMessage(stopMsg);
  isPlayingAmbient = false;
  ambientSound.active = false;
  ambientSound.sequence++;
@@ -745,7 +753,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  // No Gemini audio playing - start immediately (phaseStartTime syncs to first chunk)
  meditationState.phaseStartTime = 0;
  meditationState.streaming = false;
- ambientSound.name = "bell001";
+ strlcpy(ambientSound.name, "bell001", sizeof(ambientSound.name));
  ambientSound.active = true;
  isPlayingAmbient = true;
  isPlayingResponse = false;
@@ -760,7 +768,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  String meditationReqMsg;
  serializeJson(meditationReqDoc, meditationReqMsg);
  Serial.printf("Meditation starting: %s (seq %d)\n", meditationReqMsg.c_str(), ambientSound.sequence);
- webSocket.sendTXT(meditationReqMsg);
+ wsSendMessage(meditationReqMsg);
  }
  meditationState.streaming = true;
  Serial.println("Meditation breathing and audio started (ROOT chakra)");
@@ -770,7 +778,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
 
  // Handle radioStart - start internet radio stream
- if (doc["type"].is<const char*>() && doc["type"] == "radioStart") {
+ if (strcmp(msgType, "radioStart") == 0) {
  const char* stationName = doc["stationName"] | "Radio";
  const char* streamUrl = doc["streamUrl"] | "";
  bool isHLS = doc["isHLS"] | false;
@@ -782,7 +790,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  stopDoc["action"] = "stopAmbient";
  String stopMsg;
  serializeJson(stopDoc, stopMsg);
- webSocket.sendTXT(stopMsg);
+ wsSendMessage(stopMsg);
  isPlayingAmbient = false;
  ambientSound.active = false;
  ambientSound.sequence++;
@@ -804,12 +812,12 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  radioState.streaming = false; // will become true after first chunk arrives
  radioState.visualsActive = true;
  radioState.isHLS = isHLS;
- radioState.stationName = stationName;
- radioState.streamUrl = streamUrl;
+ strlcpy(radioState.stationName, stationName, sizeof(radioState.stationName));
+ strlcpy(radioState.streamUrl, streamUrl, sizeof(radioState.streamUrl));
 
  // Reuse ambient pipeline for radio PCM chunks
  ambientSound.active = true;
- ambientSound.name = stationName;
+ strlcpy(ambientSound.name, stationName, sizeof(ambientSound.name));
  ambientSound.sequence++;
  isPlayingAmbient = true;
  isPlayingResponse = false;
@@ -827,15 +835,15 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  String radioReqMsg;
  serializeJson(radioReqDoc, radioReqMsg);
  Serial.printf("Radio request sent (seq %d)\n", ambientSound.sequence);
- webSocket.sendTXT(radioReqMsg);
+ wsSendMessage(radioReqMsg);
  }
  currentLEDMode = LED_RADIO;
  return;
  }
 
  // Handle radioEnded - station went offline or stream stopped
- if (doc["type"].is<const char*>() && doc["type"] == "radioEnded") {
- const char* stationName = doc["stationName"] | radioState.stationName.c_str();
+ if (strcmp(msgType, "radioEnded") == 0) {
+ const char* stationName = doc["stationName"] | radioState.stationName;
  bool isError = doc["error"] | false;
  Serial.printf("radioEnded: %s (error: %s)\n", stationName, isError ? "yes" : "no");
 
@@ -847,11 +855,11 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  // Clear radio + ambient state
  radioState.active = false;
  radioState.streaming = false;
- radioState.stationName = "";
- radioState.streamUrl = "";
+ radioState.stationName[0] = '\0';
+ radioState.streamUrl[0] = '\0';
  isPlayingAmbient = false;
  ambientSound.active = false;
- ambientSound.name = "";
+ ambientSound.name[0] = '\0';
  ambientSound.sequence++;
 
  drainAudioAndSilence(2000); // radio stream may have queued chunks; 2s window to flush tail
@@ -860,7 +868,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
 
  // Handle lampStart - voice-commanded lamp
- if (doc["type"].is<const char*>() && doc["type"] == "lampStart") {
+ if (strcmp(msgType, "lampStart") == 0) {
  const char* color = doc["color"] | "white";
  Serial.printf("lampStart: %s\n", color);
 
@@ -870,7 +878,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  stopDoc["action"] = "stopAmbient";
  String stopMsg;
  serializeJson(stopDoc, stopMsg);
- webSocket.sendTXT(stopMsg);
+ wsSendMessage(stopMsg);
  isPlayingAmbient = false;
  ambientSound.active = false;
  ambientSound.sequence++;
@@ -910,7 +918,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
 
  // Handle switchToIdle - voice-commanded return to idle
- if (doc["type"].is<const char*>() && doc["type"] == "switchToIdle") {
+ if (strcmp(msgType, "switchToIdle") == 0) {
  Serial.println("switchToIdle");
 
  // Stop ambient if playing
@@ -919,12 +927,12 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  stopDoc["action"] = "stopAmbient";
  String stopMsg;
  serializeJson(stopDoc, stopMsg);
- webSocket.sendTXT(stopMsg);
+ wsSendMessage(stopMsg);
  }
  isPlayingAmbient = false;
  isPlayingResponse = false;
  ambientSound.active = false;
- ambientSound.name = "";
+ ambientSound.name[0] = '\0';
  ambientSound.sequence++;
 
  // Restore meditation volume if needed
@@ -949,8 +957,8 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
  radioState.active = false;
  radioState.streaming = false;
- radioState.stationName = "";
- radioState.streamUrl = "";
+ radioState.stationName[0] = '\0';
+ radioState.streamUrl[0] = '\0';
  }
 
  drainAudioAndSilence(500);
@@ -959,7 +967,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
  
  // Handle text responses
- if (doc["type"].is<const char*>() && doc["type"] == "text") {
+ if (strcmp(msgType, "text") == 0) {
  Serial.printf("Text: %s\n", doc["text"].as<const char*>());
  return;
  }

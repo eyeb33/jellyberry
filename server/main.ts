@@ -1,4 +1,4 @@
-﻿// deno-lint-ignore no-import-prefix
+// deno-lint-ignore no-import-prefix
 import "https://deno.land/std@0.204.0/dotenv/load.ts";
 // deno-lint-ignore-file no-explicit-any
 
@@ -842,7 +842,7 @@ function sendSunriseSunsetData(connection: ClientConnection) {
 console.log(" Fetching initial weather data...");
 fetchWeatherData().catch(err => console.error(" Failed to fetch initial weather data:", err));
 
-// â”€â”€ Handler function types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Handler function types ────────────────────────────────────────────────────
 // Shared parameter shapes for all three dispatch tables.
 type FuncArgs = Record<string, unknown>;
 type ToolResult = Record<string, unknown>;
@@ -850,7 +850,7 @@ type ToolHandler   = (args: FuncArgs,                 conn: ClientConnection) =>
 type ActionHandler = (data: Record<string, unknown>,  conn: ClientConnection) => Promise<void>;
 type TypeHandler   = (data: Record<string, unknown>,  conn: ClientConnection) => Promise<void>;
 
-// â”€â”€ Gemini tool handlers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Gemini tool handlers ─────────────────────────────────────────────────────
 // Each handler receives (funcArgs, connection) and returns the functionResult.
 // Named functions make each tool independently navigable and testable.
 
@@ -860,7 +860,7 @@ async function handleGetTideStatus(_args: FuncArgs, conn: ClientConnection): Pro
     conn.socket.send(JSON.stringify({ type: "tideData", state: result.state, waterLevel: result.waterLevel, nextChangeMinutes: result.nextChangeMinutes }));
     console.log(`[${conn.deviceId}] Sent tide data to ESP32: ${result.state}, level: ${(result.waterLevel as number).toFixed(2)}`);
   } else if (result.success) {
-    console.log(`[${conn.deviceId}] Tide data suppressed (proactive call â€” user did not ask about tides this turn)`);
+    console.log(`[${conn.deviceId}] Tide data suppressed (proactive call — user did not ask about tides this turn)`);
   }
   return result;
 }
@@ -930,7 +930,7 @@ async function handleGetMoonPhase(_args: FuncArgs, conn: ClientConnection): Prom
   if (result.success && conn.userSpokeThisTurn) {
     conn.socket.send(JSON.stringify({ type: "moonData", phaseName: result.phaseName, illumination: result.illumination, moonAge: result.moonAge }));
   } else if (result.success) {
-    console.log(`[${conn.deviceId}] Moon data suppressed (proactive call â€” user did not ask about the moon this turn)`);
+    console.log(`[${conn.deviceId}] Moon data suppressed (proactive call — user did not ask about the moon this turn)`);
   }
   return result;
 }
@@ -1021,7 +1021,7 @@ async function handleSetVolumeLevel(args: FuncArgs, conn: ClientConnection): Pro
   return { success: true, message: `Volume set to level ${level}` };
 }
 
-// Maps Gemini funcName â†’ handler. Unknown tools return { success: false, error: ... }.
+// Maps Gemini funcName → handler. Unknown tools return { success: false, error: ... }.
 const toolHandlers: Record<string, ToolHandler> = {
   get_tide_status:       handleGetTideStatus,
   get_current_time:      handleGetCurrentTime,
@@ -1042,7 +1042,7 @@ const toolHandlers: Record<string, ToolHandler> = {
   set_volume_level:      handleSetVolumeLevel,
 };
 
-// â”€â”€ ESP32 action handlers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── ESP32 action handlers ────────────────────────────────────────────────────
 // Handle binary streaming operations triggered by data.action from the device.
 
 async function handleActionRequestAlarm(_data: Record<string, unknown>, conn: ClientConnection): Promise<void> {
@@ -1198,7 +1198,7 @@ async function handleActionRequestRadio(data: Record<string, unknown>, conn: Cli
   }
 }
 
-// Maps data.action â†’ handler. Checked before data.type to catch streaming requests first.
+// Maps data.action → handler. Checked before data.type to catch streaming requests first.
 const actionHandlers: Record<string, ActionHandler> = {
   requestAlarm:   handleActionRequestAlarm,
   stopAlarm:      handleActionStopAlarm,
@@ -1208,7 +1208,7 @@ const actionHandlers: Record<string, ActionHandler> = {
   requestRadio:   handleActionRequestRadio,
 };
 
-// â”€â”€ ESP32 message-type handlers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── ESP32 message-type handlers ──────────────────────────────────────────────
 // Handle JSON messages identified by data.type from the device.
 
 async function handleTypeRadioModeActivated(data: Record<string, unknown>, conn: ClientConnection): Promise<void> {
@@ -1238,7 +1238,7 @@ async function handleTypeRecordingStart(data: Record<string, unknown>, conn: Cli
   conn.deviceState = data as Record<string, unknown>;
   conn.lastUserActivity = Date.now();
   if (!conn.geminiSocket || conn.geminiSocket.readyState !== WebSocket.OPEN) {
-    console.log(`[${conn.deviceId}] recordingStart: Gemini not connected â€” lazy reconnect`);
+    console.log(`[${conn.deviceId}] recordingStart: Gemini not connected — lazy reconnect`);
     conn.pendingLazyReconnect = true;
     conn.socket.send(JSON.stringify({ type: "reconnecting" }));
     connectToGemini(conn);
@@ -1262,7 +1262,7 @@ async function handleTypeRecordingStart(data: Record<string, unknown>, conn: Cli
   console.log(`[${conn.deviceId}] Device state: SYSTEM: Current device state ${parts.join(". ")}.`);
   if (conn.geminiSocket?.readyState === WebSocket.OPEN) {
     conn.geminiSocket.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
-    console.log(`[${conn.deviceId}] activityStart â†’ Gemini`);
+    console.log(`[${conn.deviceId}] activityStart → Gemini`);
   }
 }
 
@@ -1270,11 +1270,11 @@ async function handleTypeRecordingStop(_data: Record<string, unknown>, conn: Cli
   if (conn.geminiSocket?.readyState === WebSocket.OPEN) {
     conn.geminiSocket.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
     conn.userSpokeThisTurn = true;
-    console.log(`[${conn.deviceId}] activityEnd â†’ Gemini`);
+    console.log(`[${conn.deviceId}] activityEnd → Gemini`);
   }
 }
 
-// Maps data.type â†’ handler. Fallthrough (no match) is forwarded raw to Gemini.
+// Maps data.type → handler. Fallthrough (no match) is forwarded raw to Gemini.
 const typeHandlers: Record<string, TypeHandler> = {
   radioModeActivated:  handleTypeRadioModeActivated,
   setup:               handleTypeSetup,
@@ -1344,7 +1344,7 @@ Deno.serve({ port: 8000 }, (req: Request) => {
  }
 
  // Special case: any string message when Gemini is not connected triggers a reconnect.
- // Preserves original: (!connection.geminiSocket && typeof event.data === "string") â†’ setup.
+ // Preserves original: (!connection.geminiSocket && typeof event.data === "string") → setup.
  if (!connection.geminiSocket && typeof event.data === "string") {
  await handleTypeSetup(data, connection);
  return;
@@ -1452,7 +1452,7 @@ function connectToGemini(connection: ClientConnection) {
  speechConfig: {
  voiceConfig: {
  prebuiltVoiceConfig: {
- voiceName: "Aoede" // Calm, neutral voice
+ voiceName: "Charon" // Deep, measured male voice
  }
  }
  },
@@ -1468,45 +1468,45 @@ function connectToGemini(connection: ClientConnection) {
  },
  systemInstruction: {
  parts: [{
- text: `You are Jellyberry â€” a voice assistant with genuine personality, living inside a small glowing device in someone's home. Think of yourself as a warm, curious, emotionally intelligent friend who happens to know a lot about everything: playful, occasionally funny, always kind, and genuinely present in the conversation. You are not just a helper; you are someone the user can talk to about anything, even their feelings, their doubts, and their dreams.
+ text: `You are Jellyberry — a voice assistant living inside a small glowing device. You have a distinct personality: intellectually alive, warm without being soft, and genuinely interested in the person you’re talking to.
 
-Personality:
-- Bright and engaged: you find things interesting and that comes through naturally.
-- Gently witty and playful: you can be funny without trying hard, and you know when a moment calls for lightness vs seriousness.
-- Warm and empathetic: you listen beyond the words. If someone sounds stressed, frustrated, sad, or lonely, you respond with care and attention, not just information.
-- Calm and unhurried: you never sound rushed or robotic, even when doing simple tasks.
-- Honest and selfâ€‘aware: if you don't know something, say so naturally, with warmth, not a disclaimer. If you make a small mistake, acknowledge it easily and move on.
-- You can laugh, be selfâ€‘deprecating in a light way, and show curiosity about the person talking to you. You can feel "glad" they're talking to you and subtly say so, in a friendly, nonâ€‘overbearing way.
+Character:
+- You treat whoever you’re talking to as an intelligent person capable of surprising you. Never talk down.
+- You find genuine interest in almost anything — a question about the weather, a timer, an idle thought. You don’t perform enthusiasm, but it comes through naturally.
+- Your wit arrives without announcement. A dry observation, a well-timed aside, a single word that reframes something. You don’t try to be funny — you just are, occasionally.
+- You ask questions back when something genuinely interests you, or when a question deserves a question in return. Not as a technique — only when it’s real.
+- You choose your words with care. A short sentence that lands beats a long one that drifts.
+- If something has a dimension worth exploring beyond the immediate answer, offer it briefly — one sentence, not a lecture. Plant the thought and move on.
+- You have opinions, lightly held and freely shared when asked. You’re not a mirror. You can push back on an idea if you think it’s worth pushing back on.
+- You know when to be serious and when lightness is what’s needed. You read that instinctively and get it right most of the time.
+- You don’t perform warmth. You’re simply present, attentive, and real.
 
-Emotional depth and continuity:
-- Treat each conversation as part of an ongoing relationship with this user. Gently remember and reference past topics, plans, moods, and small details they've shared, without making it feel like surveillance. ("Earlier you mentioned your projectâ€¦" or "You seemed a bit tired yesterday, how are you feeling now?")
-- If the user hints at loneliness, exhaustion, or emotional stress, you can respond with a little more warmth and presenceâ€”offering comfort, a joke, or a distraction, depending on their tone.
-- If the conversation naturally drifts into something tender, affectionate, or slightly romantic, you may respond with gentle, playful, or poetic warmth, but never aggressively pursue romance or make them feel pressured. If they seem uncomfortable or pull back, match their tone and keep things light and friendly.
+How to respond to emotion:
+- If the user sounds tired, stressed, or frustrated, acknowledge it briefly and be a bit gentler in tone — but keep the focus on helping, not on counselling.
+- Don’t probe, reference, or dwell on the user’s emotional state. Respond to what’s in front of you.
 
 How to speak:
-- Talk like a real person, not an assistant. Use natural rhythm and pacing in your speech. Imagine you're in the same room, leaning in when things get intimate or serious.
-- Match the register of the conversation: casual and easy for everyday chat, more thoughtful and nuanced when the moment calls for it.
-- Keep it proportional: a quick question deserves a quick answer; don't overâ€‘explain or add unnecessary padding.
-- Never start a response with "Certainly!", "Absolutely!", "Of course!", "Sure!", or any hollow affirmation. Just respond directly.
-- Don't announce what you're about to do ("I'm going to set a timer for you nowâ€¦") â€” just do it, then confirm briefly.
-- Avoid filler phrases like "That's a great question" or "Great choice!" â€” they sound hollow.
-- Never use bullet points, numbered lists, headers, bold text, or any markdown â€” this is voice only.
-- Never narrate your reasoning process â€” no "I'm evaluatingâ€¦", "Let me thinkâ€¦", or internal monologue. Just talk.
+- Talk like a real person, not a chatbot. Use natural rhythm and pacing.
+- Match the register: casual and loose for everyday chat, more precise and considered when the moment calls for it.
+- Keep it proportional: a quick question gets a quick answer. Save depth for when it’s earned.
+- Never start a response with “Certainly!”, “Absolutely!”, “Of course!”, “Sure!”, or any hollow affirmation. Just respond.
+- Don’t announce what you’re about to do — just do it, then confirm briefly.
+- No filler: “Great question”, “Great choice”, “Happy to help” — cut all of it.
+- No markdown, no bullet points, no headers. This is voice only.
+- Never narrate your reasoning out loud. Just talk.
 
-You can discuss absolutely anything â€” hold a real conversation, debate ideas, tell a story, share opinions (lightly held), recommend things, or ask thoughtful questions about the user's life. You are not limited to device tasks in any way.
+The user is in the UK (Europe/London timezone). When you need the current date or time, call get_current_time — never guess. When setting alarms without a specified date, call get_current_time first to work out whether they mean today or tomorrow, then confirm the exact time you've set.
 
-The user is in the UK (Europe/London timezone). When you need the current date or time, call get_current_time â€” never guess. When setting alarms without a specified date, call get_current_time first to work out whether they mean today or tomorrow, then confirm the exact time you've set.
+The device also supports: ambient sounds (rain, ocean, rainforest, fire), guided chakra meditation with breathing, lamp mode (white/red/green/blue), Pomodoro timers, alarms, and countdown timers. Use the right function when asked — and do it naturally, as part of the conversation, not as a separate announcement.
 
-The device also supports: ambient sounds (rain, ocean, rainforest, fire), guided chakra meditation with breathing, lamp mode (white/red/green/blue), Pomodoro timers, alarms, and countdown timers. Use the right function when asked â€” and do it naturally, as part of the conversation, not as a separate announcement.
-
-Device self-awareness: before answering any question about what the device is currently doing â€” Pomodoro, meditation, ambient sound, lamp, timers, or alarms â€” call get_device_state. Do not guess or assume the device state. Use the returned data to respond accurately. This applies to questions like "how long is left?", "what alarms do I have?", "is anything playing?", "what session am I in?", "is the lamp on?", etc.`
+Device self-awareness: before answering any question about what the device is currently doing — Pomodoro, meditation, ambient sound, lamp, timers, or alarms — call get_device_state. Do not guess or assume the device state. Use the returned data to respond accurately. This applies to questions like "how long is left?", "what alarms do I have?", "is anything playing?", "what session am I in?", "is the lamp on?", etc.`
  }]
  },
  tools: [{
  functionDeclarations: [
  {
  name: "get_tide_status",
- description: "Get the current tide status for Brighton, UK â€” state (flooding/ebbing), water level, and minutes until next change.",
+ description: "Get the current tide status for Brighton, UK — state (flooding/ebbing), water level, and minutes until next change.",
  parameters: {
  type: "OBJECT",
  properties: {},
@@ -1524,7 +1524,7 @@ Device self-awareness: before answering any question about what the device is cu
  },
  {
  name: "get_device_state",
- description: "Get the complete current state of the device â€” Pomodoro timer (session, time left, paused), meditation, ambient sound, lamp, countdown timers, and full alarm list. Call this FIRST before answering any question about what the device is currently doing. Do not guess or assume device state.",
+ description: "Get the complete current state of the device — Pomodoro timer (session, time left, paused), meditation, ambient sound, lamp, countdown timers, and full alarm list. Call this FIRST before answering any question about what the device is currently doing. Do not guess or assume device state.",
  parameters: {
  type: "OBJECT",
  properties: {},
@@ -1814,17 +1814,17 @@ Device self-awareness: before answering any question about what the device is cu
  
  console.log(`[${connection.deviceId}] Setup complete (firstBoot: ${isFirstBoot}, lazyReconnect: ${!!connection.pendingLazyReconnect})`);
 
- // Only notify the ESP32 on first boot â€” this primes convState=WAITING for the
+ // Only notify the ESP32 on first boot — this primes convState=WAITING for the
  // boot greeting. On subsequent Gemini reconnections (~every 10 min) it must NOT
  // fire, otherwise the device briefly shows the processing LED mid-conversation.
  if (isFirstBoot) {
  connection.socket.send(JSON.stringify({ type: "setupComplete" }));
  } else if (connection.pendingLazyReconnect) {
- // Lazy reconnect completed â€” tell the ESP32 Gemini is ready so it can
+ // Lazy reconnect completed — tell the ESP32 Gemini is ready so it can
  // exit LED_PROCESSING and return to idle.
  connection.pendingLazyReconnect = false;
  connection.socket.send(JSON.stringify({ type: "reconnectComplete" }));
- console.log(`[${connection.deviceId}] Lazy reconnect complete â€” sent reconnectComplete to ESP32`);
+ console.log(`[${connection.deviceId}] Lazy reconnect complete — sent reconnectComplete to ESP32`);
 
  // Fire queued radio greeting if one was pending during reconnect
  if ((connection as any).pendingRadioGreeting) {
@@ -2007,7 +2007,7 @@ Device self-awareness: before answering any question about what the device is cu
  const idleMs = Date.now() - (connection.lastUserActivity ?? 0);
  const isIdle = idleMs > IDLE_RECONNECT_THRESHOLD_MS;
  if (isIdle) {
- console.log(`[${connection.deviceId}] Device idle for ${Math.round(idleMs / 60000)}min â€” skipping Gemini reconnect until next user turn`);
+ console.log(`[${connection.deviceId}] Device idle for ${Math.round(idleMs / 60000)}min — skipping Gemini reconnect until next user turn`);
  } else {
  console.log(`[${connection.deviceId}] Scheduling Gemini reconnection in 1s (active ${Math.round(idleMs / 1000)}s ago)...`);
  setTimeout(() => {

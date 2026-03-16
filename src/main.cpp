@@ -116,6 +116,10 @@ SemaphoreHandle_t ledMutex = NULL;
 // I2S speaker mutex - prevents audioTask and tone functions writing I2S_NUM_1 simultaneously
 SemaphoreHandle_t i2sSpeakerMutex = NULL;
 
+// WebSocket send mutex - serialises all sendTXT calls across websocketTask, audioTask, and loop()
+// Without this, concurrent sends from different tasks corrupt the TCP frame buffer and cause disconnects.
+SemaphoreHandle_t wsSendMutex = NULL;
+
 // Ambient sound state
 AmbientSound ambientSound = {"", false, 0, 0, 0};
 
@@ -158,6 +162,7 @@ static void checkAlarms();
 static void handleFlashAnimations();
 static void handlePomodoroTick();
 static void handleAmbientCompletion();
+static void resumeRadioStream();
 
 // ============== HELPER FUNCTIONS ==============
 
@@ -263,6 +268,13 @@ void setup() {
  i2sSpeakerMutex = xSemaphoreCreateMutex();
  if (i2sSpeakerMutex == NULL) {
  Serial.println("FATAL: Failed to create I2S speaker mutex - halting!");
+ while (true) { delay(1000); }
+ }
+
+ // Create WebSocket send mutex - serialises sendTXT across all tasks to prevent frame corruption
+ wsSendMutex = xSemaphoreCreateMutex();
+ if (wsSendMutex == NULL) {
+ Serial.println("FATAL: Failed to create WS send mutex - halting!");
  while (true) { delay(1000); }
  }
 
@@ -623,9 +635,16 @@ static void handlePomodoroTick() {
 static void handleAmbientCompletion() {
     // Check for ambient sound streaming completion
     // When stream ends, return to IDLE mode (no looping)
-    // Skip this check for meditation mode (has its own completion handler)
+    // Guards:
+    //   LED_MEDITATION  — has its own completion handler
+    //   radioState.active — live stream; gaps/stalls must never be treated as end-of-stream
+    //   convState != IDLE — covers RECORDING, WAITING (processing), PLAYING, and WINDOW;
+    //                       lastAudioChunkTime is not updated during voice commands so the
+    //                       timeout would false-fire against ambient audio that is just paused
     if (isPlayingAmbient && ambientSound.active && !firstAudioChunk && 
-        (millis() - lastAudioChunkTime) > AMBIENT_COMPLETION_TIMEOUT_MS && currentLEDMode != LED_MEDITATION) {
+        (millis() - lastAudioChunkTime) > AMBIENT_COMPLETION_TIMEOUT_MS &&
+        currentLEDMode != LED_MEDITATION && !radioState.active &&
+        convState == ConvState::IDLE) {
         Serial.printf("Ambient sound completed: %s - returning to IDLE\n", ambientSound.name);
         
         // Return to IDLE mode
@@ -635,6 +654,31 @@ static void handleAmbientCompletion() {
         ambientSound.active = false;
         ambientSound.name[0] = '\0';
     }
+}
+
+// Resume the radio stream after a Gemini conversation pause.
+// Sends requestRadio to the server and re-arms the ambient pipeline.
+static void resumeRadioStream() {
+    Serial.printf("Radio: resuming stream '%s' (seq %d)\n", radioState.stationName, ambientSound.sequence + 1);
+    ambientSound.sequence++;
+    strlcpy(ambientSound.name, radioState.stationName, sizeof(ambientSound.name));
+    ambientSound.active = true;
+    ambientSound.drainUntil = 0;
+    isPlayingAmbient = true;
+    isPlayingResponse = false;
+    firstAudioChunk = true;
+    lastAudioChunkTime = millis();
+    radioState.paused = false;
+    radioState.streaming = false;  // will become true on first incoming chunk
+    JsonDocument radioReqDoc;
+    radioReqDoc["action"] = "requestRadio";
+    radioReqDoc["streamUrl"] = radioState.streamUrl;
+    radioReqDoc["stationName"] = radioState.stationName;
+    radioReqDoc["sequence"] = ambientSound.sequence;
+    radioReqDoc["isHLS"] = radioState.isHLS;
+    String radioReqMsg;
+    serializeJson(radioReqDoc, radioReqMsg);
+    wsSendMessage(radioReqMsg);
 }
 
 // ============== MAIN LOOP ==============
@@ -1526,20 +1570,36 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                          (const char*[]){"WHITE", "RED", "GREEN", "BLUE"}[lampState.previousColor], 
                          (const char*[]){"WHITE", "RED", "GREEN", "BLUE"}[lampState.currentColor]);
         }
-        // Radio: Button 1 ducks volume then starts recording
-        // Works as soon as radioState.active, even before first stream chunk arrives
+        // Radio: Button 1 pauses the stream then starts a Gemini recording.
+        // Pausing (not just ducking) avoids mixed-mode drain complexity and lets the
+        // user ask Gemini to change station freely. Stream resumes after turn completes.
+        // Guard convState==IDLE: don't re-record while already waiting for Gemini's response.
         else if (!meditationHandled && currentLEDMode == LED_RADIO && radioState.active &&
-                 startRisingEdge && !recordingActive && !conversationMode) {
-            // Duck radio volume to 5% so music fades to background
-            radioState.savedVolume = volumeMultiplier;
-            volumeMultiplier = 0.05f;
-            Serial.println("Radio: volume ducked to 5% for voice command");
+                 startRisingEdge && !recordingActive && !conversationMode && convState == ConvState::IDLE) {
+            // Stop the server-side stream
+            {
+                JsonDocument stopDoc;
+                stopDoc["action"] = "stopAmbient";
+                String stopMsg;
+                serializeJson(stopDoc, stopMsg);
+                wsSendMessage(stopMsg);
+            }
+            // Drain local audio queue and silence I2S
+            { AudioChunk dummy; while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {} }
+            i2s_zero_dma_buffer(I2S_NUM_1);
+            isPlayingAmbient = false;
+            isPlayingResponse = false;
+            ambientSound.active = false;
+            ambientSound.drainUntil = millis() + 500;
+            radioState.paused = true;      // remember to resume after the turn
+            radioState.streaming = false;   // clear stale flag — prevents volume restore logic
+                                            // from reverting a set_volume_level change at resume
+            Serial.println("Radio: stream paused for voice command");
             // Start recording
             responseInterrupted = false;
             conversationRecording = false;
             tideState.active = false;
             moonState.active = false;
-            if (ambientSound.drainUntil > 0) { ambientSound.drainUntil = 0; }
             recordingActive = true;
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
@@ -1598,7 +1658,11 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             recordingActive = false;
             wsSendMessage("{\"type\":\"recordingStop\"}");
             Serial.println("[WS] recordingStop sent");
-            if (!ambientSound.active) {
+            if (radioState.active) {
+                // Radio: return to radio display while waiting for Gemini
+                currentLEDMode = LED_RADIO;
+                transitionConvState(ConvState::WAITING);
+            } else if (!ambientSound.active) {
                 currentLEDMode = LED_PROCESSING;
                 transitionConvState(ConvState::WAITING);
             }
@@ -1614,8 +1678,12 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         wsSendMessage("{\"type\":\"recordingStop\"}");
         Serial.println("[WS] recordingStop sent");
         conversationRecording = false;  // Reset flag for next recording
-        // Don't change LED mode if ambient sound is already active
-        if (!ambientSound.active) {
+        if (radioState.active) {
+            // Radio: return to radio display while waiting for Gemini
+            currentLEDMode = LED_RADIO;
+            transitionConvState(ConvState::WAITING);
+        } else if (!ambientSound.active) {
+            // Don't change LED mode if ambient sound is already active
             currentLEDMode = LED_PROCESSING;
             transitionConvState(ConvState::WAITING);
         }
@@ -1655,8 +1723,14 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             tideState.displayStartTime = millis();
             DEBUG_PRINTLN("  Timeout - returning to TIDE display");
         } else if (radioState.active) {
-            if (radioState.streaming && volumeMultiplier < radioState.savedVolume) {
-                volumeMultiplier = radioState.savedVolume;  // Restore ducked volume on timeout
+            volumeMultiplier = radioState.savedVolume;  // Restore any ducked volume
+            if (radioState.paused) {
+                if (radioState.streamUrl[0] != '\0') {
+                    resumeRadioStream();
+                } else {
+                    radioState.paused = false;  // Discovery mode — no stream to resume
+                    Serial.println("Radio: discovery mode, no stream URL to resume after timeout");
+                }
             }
             currentLEDMode = LED_RADIO;
             DEBUG_PRINTLN("  Timeout - returning to RADIO");
@@ -1679,8 +1753,14 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         } else if (timerState.active) {
             currentLEDMode = LED_TIMER;
         } else if (radioState.active) {
-            if (radioState.streaming && volumeMultiplier < radioState.savedVolume) {
-                volumeMultiplier = radioState.savedVolume;  // Restore ducked volume on timeout
+            volumeMultiplier = radioState.savedVolume;  // Restore any ducked volume
+            if (radioState.paused) {
+                if (radioState.streamUrl[0] != '\0') {
+                    resumeRadioStream();
+                } else {
+                    radioState.paused = false;  // Discovery mode — no stream to resume
+                    Serial.println("Radio: discovery mode, no stream URL to resume after PLAYING timeout");
+                }
             }
             currentLEDMode = LED_RADIO;
         } else {
@@ -1688,10 +1768,27 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         }
     }
     
+    // Stale-RECORDING repair: if recordingActive was cleared internally (e.g. PREBUF stopping
+    // an overlapping recording) but convState was never transitioned away from RECORDING,
+    // the drain guard below (which only skips for IDLE) will fire immediately on every radio
+    // packet because lastGeminiAudioTime is stale during pure radio. Detect and repair here.
+    if (convState == ConvState::RECORDING && !recordingActive && isPlayingAmbient) {
+        Serial.println("[STATE] Stale RECORDING+ambient detected — repairing to IDLE");
+        transitionConvState(ConvState::IDLE);
+        if (radioState.active) currentLEDMode = LED_RADIO;
+    }
+
     // Check for audio playback completion
     // Timeout only if BOTH: (1) no new packets for 2s AND (2) queue nearly drained
     // This prevents cutting off audio that's still queued but TCP-delayed
-    if (isPlayingResponse) {
+    // Skip drain check for pure radio/ambient whenever no Gemini turn is in progress.
+    // The WAITING/PLAYING states represent an active Gemini turn; all other states mean
+    // the audio pipeline is carrying pure ambient/radio data that ends via radioEnded or
+    // ambientComplete messages — not via this drain timer. Using the Gemini-only timer
+    // (lastGeminiAudioTime) in those states causes an immediate drain cycle because
+    // lastGeminiAudioTime is never updated by ambient/radio (0xA5 0x5A) packets.
+    if (isPlayingResponse && !(isPlayingAmbient &&
+            convState != ConvState::WAITING && convState != ConvState::PLAYING)) {
         // Transition to PLAYING as soon as audio is confirmed active (cancels thinking animation)
         if (convState == ConvState::WAITING) {
             transitionConvState(ConvState::PLAYING);
@@ -1748,10 +1845,20 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 Serial.printf("Skipping conversation window - entering persistent mode %d\n", effectiveMode);
                 transitionConvState(ConvState::IDLE);  // Persistent mode: no follow-up window
 
-                // Radio: restore volume after Gemini's verbal response finishes
-                if (radioState.active && radioState.streaming && volumeMultiplier < radioState.savedVolume) {
-                    volumeMultiplier = radioState.savedVolume;
-                    Serial.printf("Radio: volume restored to %.0f%% after Gemini response\n", volumeMultiplier * 100);
+                // Radio: restore volume and resume stream after Gemini's verbal response finishes
+                if (radioState.active) {
+                    if (radioState.streaming && volumeMultiplier < radioState.savedVolume) {
+                        volumeMultiplier = radioState.savedVolume;
+                        Serial.printf("Radio: volume restored to %.0f%% after Gemini response\n", volumeMultiplier * 100);
+                    }
+                    if (radioState.paused) {
+                        if (radioState.streamUrl[0] != '\0') {
+                            resumeRadioStream();
+                        } else {
+                            radioState.paused = false;  // Discovery mode — no stream to resume
+                            Serial.println("Radio: discovery mode, no stream URL to resume after response");
+                        }
+                    }
                 }
 
                 // Deferred meditation start: if meditationStart arrived while Gemini was still
@@ -1939,10 +2046,20 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             } else {
                 Serial.printf("turnComplete in PLAYING state - persistent mode %d, skipping window\n", effectiveMode);
                 transitionConvState(ConvState::IDLE);
-                // Radio: restore volume after Gemini verbal response finishes
-                if (radioState.active && radioState.streaming && volumeMultiplier < radioState.savedVolume) {
-                    volumeMultiplier = radioState.savedVolume;
-                    Serial.printf("Radio: volume restored to %.0f%% after Gemini response\n", volumeMultiplier * 100);
+                // Radio: restore volume and resume stream after Gemini verbal response finishes
+                if (radioState.active) {
+                    if (radioState.streaming && volumeMultiplier < radioState.savedVolume) {
+                        volumeMultiplier = radioState.savedVolume;
+                        Serial.printf("Radio: volume restored to %.0f%% after Gemini response\n", volumeMultiplier * 100);
+                    }
+                    if (radioState.paused) {
+                        if (radioState.streamUrl[0] != '\0') {
+                            resumeRadioStream();
+                        } else {
+                            radioState.paused = false;  // Discovery mode — no stream to resume
+                            Serial.println("Radio: discovery mode, no stream URL to resume (PLAYING path)");
+                        }
+                    }
                 }
                 if (currentLEDMode == LED_AUDIO_REACTIVE || currentLEDMode == LED_RECORDING || currentLEDMode == LED_PROCESSING) {
                     if (radioState.active)         { currentLEDMode = LED_RADIO; }
@@ -2142,9 +2259,15 @@ void audioTask(void * parameter) {
     while(1) {
         bool processedAudio = false;
         
-        // PRIORITY 1: Process playback queue (don't wait if empty during playback)
-        while (xQueueReceive(audioOutputQueue, &playbackChunk, 0) == pdTRUE) {
-            processedAudio = true;
+        // PRIORITY 1: Process playback queue
+        // First call uses a short blocking wait when actively playing to absorb network jitter:
+        // at ~20ms/packet, any gap >1 packet duration risks I2S underrun without this.
+        // Subsequent iterations drain the rest of the queue immediately (waitTime=0).
+        {
+            TickType_t waitTime = (isPlayingResponse && !recordingActive) ? pdMS_TO_TICKS(25) : 0;
+            while (xQueueReceive(audioOutputQueue, &playbackChunk, waitTime) == pdTRUE) {
+                waitTime = 0;  // only block on first receive; drain remainder immediately
+                processedAudio = true;
             
             // Raw PCM from server (24kHz, 16-bit mono, little-endian)
             // Convert bytes to 16-bit samples
@@ -2200,6 +2323,7 @@ void audioTask(void * parameter) {
                 Serial.printf("Invalid PCM chunk: %d bytes (%d samples)\n", playbackChunk.length, numSamples);
             }
         }
+        }  // end playback queue scope
         
         // If we processed audio, yield and check queue again immediately
         if (processedAudio) {
@@ -2303,7 +2427,9 @@ void audioTask(void * parameter) {
                         JsonObject radDoc = stateDoc["radio"].to<JsonObject>();
                         radDoc["active"] = radioState.active;
                         radDoc["streaming"] = radioState.streaming;
-                        if (radioState.active && radioState.streaming) {
+                        // Include station name whenever active (not just when streaming — Gemini
+                        // needs it when the stream is paused for a voice command too)
+                        if (radioState.active && radioState.stationName[0] != '\0') {
                             radDoc["station"] = radioState.stationName;
                         }
 
@@ -2319,6 +2445,13 @@ void audioTask(void * parameter) {
                         wsSendMessage(stateMsg);
                         Serial.printf("[STATE] recordingStart: %s\n", stateMsg.c_str());
                     }
+
+                    // Re-check recordingActive: loop() may have set it to false and sent
+                    // recordingStop during the 100ms i2s_read block. If so, skip this frame
+                    // to avoid sending audio after activityEnd has already been forwarded.
+                    // NOTE: must be `continue` not `break` — `break` exits the outer while(1)
+                    // which causes audioTask to return, hitting the ILL trap at line 2490.
+                    if (!recordingActive) continue;
 
                     // Send raw PCM
                     sendAudioChunk((uint8_t*)inputBuffer, bytes_read);
@@ -2721,72 +2854,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 
                 // Raw PCM audio data from server (16-bit mono samples)
                 // This handles BOTH Gemini responses and ambient sounds
-                if (!isPlayingResponse) {
-                    // CRITICAL: Stop recording immediately when response arrives (even during prebuffer)
-                    // This prevents connection overload from bidirectional audio traffic
-                    if (recordingActive) {
-                        Serial.println("Stopping recording - response arriving");
-                        recordingActive = false;
-                    }
-                    
-                    // Activate the LED VU meter as soon as the first audio packet arrives.
-                    // audioTask starts playing immediately from packet 1, so activating here
-                    // ensures the LEDs light up at the same moment audio begins.
-                    // The AUDIO_DELAY_BUFFER_SIZE ring buffer handles the fine-grained level delay.
-                    uint32_t queueDepth = uxQueueMessagesWaiting(audioOutputQueue);
-                    const uint32_t MIN_PREBUFFER = 1;  // activate on first packet
-                    
-                    if (queueDepth >= MIN_PREBUFFER) {
-                        isPlayingResponse = true;
-                        Serial.printf("[PREBUF] Playback start: queueDepth=%u, turnComplete=%d, convState=%d, waitAge=%dms\n",
-                                     queueDepth, turnComplete, (int)convState,
-                                     waitingEnteredAt > 0 ? (int)(millis() - waitingEnteredAt) : -1);
-                        
-                        // NOTE: turnComplete is NOT reset here to avoid a race condition where
-                        // Gemini's turnComplete message arrives before the prebuffer fills (common
-                        // for short responses like the boot greeting). Instead, turnComplete is
-                        // reset at recordingStart (when the user begins a new turn).
-                        
-                        recordingActive = false;  // Ensure recording is stopped
-                        
-                        // Show VU meter during Gemini playback, keep current mode for ambient/alarm
-                        if (!ambientSound.active && !isPlayingAlarm) {
-                            currentLEDMode = LED_AUDIO_REACTIVE;
-                        }
-                        
-                        firstAudioChunk = true;
-                        // NOTE: Don't clear responseInterrupted here! Only clear it on turnComplete
-                        // to prevent buffered chunks from interrupted response playing through
-                        // Clear all LEDs immediately when starting playback (with mutex)
-                        if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-                            fill_solid(leds, NUM_LEDS, CRGB::Black);
-                            FastLED.show();
-                            xSemaphoreGive(ledMutex);
-                        }
-                        // Clear delay buffer for clean LED sync
-                        for (int i = 0; i < AUDIO_DELAY_BUFFER_SIZE; i++) {
-                            audioLevelBuffer[i] = 0;
-                        }
-                        audioBufferIndex = 0;
-                        
-                        if (isPlayingAmbient) {
-                            Serial.printf("Starting ambient audio stream: %s (prebuffered %u packets)\n", 
-                                         ambientSound.name, queueDepth);
-                        } else if (isPlayingAlarm) {
-                            Serial.printf("Starting alarm audio playback (prebuffered %u packets)\n", queueDepth);
-                        } else {
-                            Serial.printf("Starting audio playback with %u packets prebuffered\n", queueDepth);
-                        }
-                    } else {
-                        // Silent prebuffering phase - log once per stream
-                        static uint32_t lastPrebufferLog = 0;
-                        if (millis() - lastPrebufferLog > 1000) {
-                            Serial.printf("Prebuffering... (%u/%u packets)\n", queueDepth, MIN_PREBUFFER);
-                            lastPrebufferLog = millis();
-                        }
-                    }
-                }
-                
+
                 // Update last audio chunk time
                 lastAudioChunkTime = millis();
                 if (!isAmbientPacket) {
@@ -2837,14 +2905,82 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                             }
                             lastDropWarning = millis();
                         }
-                    } else {
-                        // Queue growth logging disabled (too noisy during meditation)
-                        // if (queueBefore == 0 || queueBefore >= AUDIO_QUEUE_SIZE - 5) {
-                        //     Serial.printf("Queue: %u  %u/%u\n", queueBefore, queueBefore + 1, AUDIO_QUEUE_SIZE);
-                        // }
+                        break;  // discard this chunk — queue blocked
                     }
                 } else {
                     Serial.printf("PCM chunk too large: %d bytes\n", length);
+                    break;
+                }
+
+                // Prebuffer check: runs AFTER xQueueSend so queueDepth includes the
+                // packet we just added. Previously this ran before enqueue, so depth
+                // was always 0 and isPlayingResponse was never set for zen bell / ambient
+                // streams that arrive near their consumption rate.
+                if (!isPlayingResponse) {
+                    // CRITICAL: Stop recording immediately when response arrives
+                    if (recordingActive) {
+                        Serial.println("Stopping recording - response arriving");
+                        recordingActive = false;
+                    }
+
+                    uint32_t queueDepth = uxQueueMessagesWaiting(audioOutputQueue);
+                    // MIN_PREBUFFER=3: ~63ms head start before declaring playback active.
+                    // Absorbs network jitter for short-burst sounds (zen bell, alarms)
+                    // whose packets arrive near their playback rate with zero queue headroom.
+                    const uint32_t MIN_PREBUFFER = 3;
+
+                    if (queueDepth >= MIN_PREBUFFER) {
+                        isPlayingResponse = true;
+                        Serial.printf("[PREBUF] Playback start: queueDepth=%u, turnComplete=%d, convState=%d, waitAge=%dms\n",
+                                     queueDepth, turnComplete, (int)convState,
+                                     waitingEnteredAt > 0 ? (int)(millis() - waitingEnteredAt) : -1);
+
+                        // NOTE: turnComplete is NOT reset here to avoid a race condition where
+                        // Gemini's turnComplete message arrives before the prebuffer fills (common
+                        // for short responses like the boot greeting). Instead, turnComplete is
+                        // reset at recordingStart (when the user begins a new turn).
+
+                        recordingActive = false;  // Ensure recording is stopped
+
+                        // Show VU meter during Gemini playback, keep current mode for ambient/alarm
+                        if (!ambientSound.active && !isPlayingAlarm) {
+                            currentLEDMode = LED_AUDIO_REACTIVE;
+                        }
+
+                        firstAudioChunk = true;
+                        // NOTE: Don't clear responseInterrupted here! Only clear it on turnComplete
+                        // to prevent buffered chunks from interrupted response playing through
+                        // Clear all LEDs immediately when starting Gemini playback (not for ambient/radio -
+                        // clearing LEDs for radio would cause a visible flash every drain/prebuf cycle)
+                        if (!isPlayingAmbient && !isPlayingAlarm) {
+                            if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
+                                fill_solid(leds, NUM_LEDS, CRGB::Black);
+                                FastLED.show();
+                                xSemaphoreGive(ledMutex);
+                            }
+                        }
+                        // Clear delay buffer for clean LED sync
+                        for (int i = 0; i < AUDIO_DELAY_BUFFER_SIZE; i++) {
+                            audioLevelBuffer[i] = 0;
+                        }
+                        audioBufferIndex = 0;
+
+                        if (isPlayingAmbient) {
+                            Serial.printf("Starting ambient audio stream: %s (prebuffered %u packets)\n",
+                                         ambientSound.name, queueDepth);
+                        } else if (isPlayingAlarm) {
+                            Serial.printf("Starting alarm audio playback (prebuffered %u packets)\n", queueDepth);
+                        } else {
+                            Serial.printf("Starting audio playback with %u packets prebuffered\n", queueDepth);
+                        }
+                    } else {
+                        // Silent prebuffering phase - log once per stream
+                        static uint32_t lastPrebufferLog = 0;
+                        if (millis() - lastPrebufferLog > 1000) {
+                            Serial.printf("Prebuffering... (%u/%u packets)\n", queueDepth, MIN_PREBUFFER);
+                            lastPrebufferLog = millis();
+                        }
+                    }
                 }
             }
             break;

@@ -1,6 +1,6 @@
+// deno-lint-ignore-file no-explicit-any require-await
 // deno-lint-ignore no-import-prefix
 import "https://deno.land/std@0.204.0/dotenv/load.ts";
-// deno-lint-ignore-file no-explicit-any
 
 // Deno Edge Server for Jellyberry - WebSocket Proxy to Gemini Live API
 // Deploy to Deno Deploy: deno deploy --project=jellyberry-server main.ts
@@ -154,6 +154,13 @@ interface ClientConnection {
  // Causes the next setupComplete to send reconnectComplete to the ESP32
  // instead of being silently swallowed (which would leave the device on LED_PROCESSING).
  pendingLazyReconnect?: boolean;
+ pendingRadioGreeting?: boolean; // Queued radio greeting to fire after lazy reconnect completes
+
+ // Proactive session renewal
+ geminiTurnActive?: boolean; // True while Gemini is generating a response (activityEnd → turnComplete)
+ turnCompleteFired?: boolean; // True once the turn-complete event has been handled; prevents duplicate fires (generationComplete + turnComplete)
+ pendingRenewal?: boolean; // Renewal requested while a turn was in-flight; fire on next turnComplete
+ sessionRenewalTimer?: ReturnType<typeof setTimeout>; // Handle to cancel if session closes early
 }
 
 const connections = new Map<string, ClientConnection>();
@@ -162,6 +169,10 @@ const connections = new Map<string, ClientConnection>();
 // After this threshold, the next recordingStart triggers an on-demand reconnect.
 // This eliminates the ~2,300-token setup cost every 10 min during idle/overnight periods.
 const IDLE_RECONNECT_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
+
+// Proactively renew the Gemini session before the 600s hard deadline.
+// 540s gives a 60s buffer — enough headroom for any in-flight response.
+const GEMINI_SESSION_RENEWAL_MS = 9 * 60 * 1000;
 
 // Fetch tide data from StormGlass API
 async function fetchTideData() {
@@ -619,6 +630,8 @@ function getWeather(_deviceId: string, timeframe: string = "current") {
  const humidity = current.relative_humidity_2m;
  const windSpeed = Math.round(current.wind_speed_10m);
  const isRaining = current.precipitation > 0;
+ const sunriseStr = daily?.sunrise?.[0] ? new Date(daily.sunrise[0]).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/London' }) : null;
+ const sunsetStr = daily?.sunset?.[0] ? new Date(daily.sunset[0]).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/London' }) : null;
  
  return {
  success: true,
@@ -629,7 +642,9 @@ function getWeather(_deviceId: string, timeframe: string = "current") {
  humidity: humidity,
  windSpeed: windSpeed,
  isRaining: isRaining,
- summary: `It's currently ${temp} C and ${condition}. Feels like ${feelsLike} C. Wind ${windSpeed} km/h.${isRaining ? " It's raining right now." : ""}`
+ sunrise: sunriseStr,
+ sunset: sunsetStr,
+ summary: `It's currently ${temp} C and ${condition}. Feels like ${feelsLike} C. Wind ${windSpeed} km/h.${isRaining ? " It's raining right now." : ""}${sunriseStr ? ` Sunrise today: ${sunriseStr}. Sunset: ${sunsetStr}.` : ""}`
  };
  }
  
@@ -658,6 +673,8 @@ function getWeather(_deviceId: string, timeframe: string = "current") {
  const minTemp = Math.round(daily.temperature_2m_min[0]);
  const condition = getWeatherDescription(daily.weather_code[0]);
  const rainChance = daily.precipitation_probability_max[0];
+ const sunriseStr = daily?.sunrise?.[0] ? new Date(daily.sunrise[0]).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/London' }) : null;
+ const sunsetStr = daily?.sunset?.[0] ? new Date(daily.sunset[0]).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/London' }) : null;
  
  return {
  success: true,
@@ -666,7 +683,9 @@ function getWeather(_deviceId: string, timeframe: string = "current") {
  minTemp: minTemp,
  condition: condition,
  rainChance: rainChance,
- summary: `Today: high of ${maxTemp} C, low of ${minTemp} C. ${condition}. ${rainChance}% chance of rain.`
+ sunrise: sunriseStr,
+ sunset: sunsetStr,
+ summary: `Today: high of ${maxTemp} C, low of ${minTemp} C. ${condition}. ${rainChance}% chance of rain.${sunriseStr ? ` Sunrise: ${sunriseStr}. Sunset: ${sunsetStr}.` : ""}`
  };
  }
  
@@ -857,8 +876,9 @@ type TypeHandler   = (data: Record<string, unknown>,  conn: ClientConnection) =>
 async function handleGetTideStatus(_args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
   const result = await getTideStatus();
   if (result.success && conn.userSpokeThisTurn) {
-    conn.socket.send(JSON.stringify({ type: "tideData", state: result.state, waterLevel: result.waterLevel, nextChangeMinutes: result.nextChangeMinutes }));
-    console.log(`[${conn.deviceId}] Sent tide data to ESP32: ${result.state}, level: ${(result.waterLevel as number).toFixed(2)}`);
+    const tr = result as { state: string; waterLevel: number; nextChangeMinutes: number };
+    conn.socket.send(JSON.stringify({ type: "tideData", state: tr.state, waterLevel: tr.waterLevel, nextChangeMinutes: tr.nextChangeMinutes }));
+    console.log(`[${conn.deviceId}] Sent tide data to ESP32: ${tr.state}, level: ${tr.waterLevel.toFixed(2)}`);
   } else if (result.success) {
     console.log(`[${conn.deviceId}] Tide data suppressed (proactive call — user did not ask about tides this turn)`);
   }
@@ -1001,8 +1021,23 @@ async function handlePlayRadio(args: FuncArgs, conn: ClientConnection): Promise<
   const stationId = (args.station_id || "") as string;
   const stationName = (args.station_name || "Radio") as string;
   console.log(`[${conn.deviceId}] play_radio: ${stationName} (${stationId})`);
-  const station = radioStationCache.get(stationId);
-  if (!station) { return { success: false, error: "Station not found. Please search for stations first." }; }
+
+  let station = radioStationCache.get(stationId);
+
+  // Cache miss — fall back to a live name search (handles server restarts,
+  // session reconnects, or model using a stale/hallucinated UUID).
+  if (!station && stationName) {
+    console.log(`[${conn.deviceId}] play_radio: ${stationId} not in cache — searching by name "${stationName}"`);
+    try {
+      await handleSearchRadioStations({ query: stationName, limit: 1 }, conn);
+      station = radioStationCache.get(stationId) ?? Array.from(radioStationCache.values()).find(
+        s => s.name.toLowerCase().includes(stationName.toLowerCase()) ||
+             stationName.toLowerCase().includes(s.name.toLowerCase())
+      );
+    } catch (_) { /* fall through to error below */ }
+  }
+
+  if (!station) { return { success: false, error: "Station not found and live search failed. Please use search_radio_stations first." }; }
   const isHLS = station.url.includes(".m3u8");
   conn.pendingModeMessage = { type: "radioStart", stationName, streamUrl: station.url, isHLS };
   return { success: true, message: `Starting ${stationName}${isHLS ? " (may take a moment to load)" : ""}` };
@@ -1017,7 +1052,9 @@ async function handleStopRadio(_args: FuncArgs, conn: ClientConnection): Promise
 async function handleSetVolumeLevel(args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
   const level = Math.max(1, Math.min(10, ((args.level as number) || 5)));
   console.log(`[${conn.deviceId}] set_volume_level: ${level}`);
-  conn.socket.send(JSON.stringify({ type: "functionCall", name: "set_volume_level", args: { level } }));
+  // Use pendingModeMessage so the command arrives AFTER Gemini finishes speaking.
+  // If sent immediately during a response, the radio duck/restore path would overwrite it.
+  conn.pendingModeMessage = { type: "functionCall", name: "set_volume_level", args: { level } };
   return { success: true, message: `Volume set to level ${level}` };
 }
 
@@ -1155,15 +1192,36 @@ async function handleActionRequestRadio(data: Record<string, unknown>, conn: Cli
   try {
     let cancelled = false;
     conn.radioStreamCancel = () => { cancelled = true; };
+    const CHUNK_SIZE = 1024;
     const cmd = new Deno.Command("ffmpeg", {
-      args: ["-reconnect","1","-reconnect_streamed","1","-reconnect_delay_max","5","-i",streamUrl,"-ar","24000","-ac","1","-f","s16le","pipe:1"],
-      stdout: "piped", stderr: "null",
+      args: [
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+        "-user_agent", "Mozilla/5.0 (compatible; Jellyberry/1.0)",
+        "-i", streamUrl,
+        "-ar", "24000", "-ac", "1", "-f", "s16le", "pipe:1"
+      ],
+      stdout: "piped",
+      stderr: "piped",  // piped so we can capture errors on early exit
     });
     const process = cmd.spawn();
     conn.radioProcess = process;
-    console.log(`[${conn.deviceId}] ffmpeg spawned for ${stationName}`);
-    const CHUNK_SIZE = 1024, CHUNKS_PER_BATCH = 5, BATCH_DELAY_MS = 100;
-    let chunksInBatch = 0, totalChunks = 0;
+    console.log(`[${conn.deviceId}] ffmpeg spawned for ${stationName}: ${streamUrl}`);
+    // Drain stderr asynchronously — log only on early failure (totalChunks==0) to avoid flooding
+    let stderrTail = "";
+    (async () => {
+      const dec = new TextDecoder();
+      const rdr = process.stderr.getReader();
+      while (true) {
+        const { done, value } = await rdr.read();
+        if (done) break;
+        const chunk = dec.decode(value, { stream: true });
+        // Keep the last 800 chars so we can log ffmpeg's final error message if the stream dies fast
+        stderrTail = (stderrTail + chunk).slice(-800);
+      }
+    })().catch(() => {});
+    let totalChunks = 0;
     const reader = process.stdout.getReader();
     let buffer = new Uint8Array(0);
     while (!cancelled && conn.socket.readyState === WebSocket.OPEN) {
@@ -1179,17 +1237,29 @@ async function handleActionRequestRadio(data: Record<string, unknown>, conn: Cli
         header[0] = 0xA5; header[1] = 0x5A; header[2] = sequence & 0xFF; header[3] = (sequence >> 8) & 0xFF;
         const chunkWithHeader = new Uint8Array(4 + CHUNK_SIZE);
         chunkWithHeader.set(header, 0); chunkWithHeader.set(chunk, 4);
+        if (conn.socket.readyState !== WebSocket.OPEN) { cancelled = true; break; }
         try { conn.socket.send(chunkWithHeader); } catch (_err) { cancelled = true; break; }
-        totalChunks++; chunksInBatch++;
-        if (chunksInBatch >= CHUNKS_PER_BATCH) { await new Promise(r => setTimeout(r, BATCH_DELAY_MS)); chunksInBatch = 0; }
+        totalChunks++;
+        // Yield to the event loop every chunk so cancellation (stopAmbient) is processed
+        // promptly. Without this, a large ffmpeg read() can produce 20-30 chunks that all
+        // send synchronously before the incoming stopAmbient message is handled, flooding
+        // the ESP32's TCP receive buffer and causing "Failed to send frame".
+        await new Promise(resolve => setTimeout(resolve, 0));
+        if (cancelled) break;
       }
     }
     reader.cancel();
     try { process.kill(); } catch (_) { /* ignore */ }
     if (!cancelled && conn.socket.readyState === WebSocket.OPEN) {
-      console.log(`[${conn.deviceId}] Radio stream ended: ${stationName} (${totalChunks} chunks)`);
-      conn.socket.send(JSON.stringify({ type: "radioEnded", stationName }));
-    } else { console.log(`[${conn.deviceId}] Radio stream cancelled: ${stationName}`); }
+      if (totalChunks === 0) {
+        // ffmpeg connected but produced no audio — URL is likely dead or incompatible
+        console.error(`[${conn.deviceId}] Radio stream FAILED (0 chunks): ${stationName} — ${stderrTail.trim().split("\n").pop() ?? "no stderr"}`);
+        conn.socket.send(JSON.stringify({ type: "radioEnded", stationName, error: true }));
+      } else {
+        console.log(`[${conn.deviceId}] Radio stream ended: ${stationName} (${totalChunks} chunks)`);
+        conn.socket.send(JSON.stringify({ type: "radioEnded", stationName }));
+      }
+    } else { console.log(`[${conn.deviceId}] Radio stream cancelled: ${stationName} (${totalChunks} chunks)`); }
     conn.radioStreamCancel = null; conn.radioProcess = null;
   } catch (err) {
     console.error(`[${conn.deviceId}] Radio stream error:`, err);
@@ -1216,8 +1286,14 @@ async function handleTypeRadioModeActivated(data: Record<string, unknown>, conn:
   console.log(`[${conn.deviceId}] Radio mode activated (source: ${source})`);
   if (source === "button" && conn.geminiSocket?.readyState === WebSocket.OPEN) {
     const prompt = { clientContent: { turns: [{ role: "user", parts: [{ text: "SYSTEM: The user has just entered radio mode using the physical button. Ask them what kind of radio station they'd like to listen to, then use search_radio_stations to find options and present a shortlist. Keep your opening question brief and friendly." }] }], turnComplete: true } };
-    if (conn.pendingLazyReconnect) { (conn as any).pendingRadioGreeting = true; console.log(`[${conn.deviceId}] Radio greeting queued (Gemini reconnecting)`); }
-    else { conn.geminiSocket.send(JSON.stringify(prompt)); console.log(`[${conn.deviceId}] Radio greeting sent to Gemini`); }
+    if (conn.pendingLazyReconnect) { conn.pendingRadioGreeting = true; console.log(`[${conn.deviceId}] Radio greeting queued (Gemini reconnecting)`); }
+    else {
+      // clientContent starts a new Gemini turn — reset dedup flag so the
+      // generationComplete for this turn isn't swallowed as a duplicate.
+      conn.turnCompleteFired = false;
+      conn.geminiSocket.send(JSON.stringify(prompt));
+      console.log(`[${conn.deviceId}] Radio greeting sent to Gemini`);
+    }
   }
 }
 
@@ -1254,6 +1330,12 @@ async function handleTypeRecordingStart(data: Record<string, unknown>, conn: Cli
   else { parts.push("Meditation: inactive"); }
   if (data.ambient && (data.ambient as any).active) { parts.push(`Ambient sound active ${(data.ambient as any).sound}`); }
   else { parts.push("Ambient sound: inactive"); }
+  if (data.radio && (data.radio as any).active) {
+    const r = data.radio as any;
+    if (r.streaming && r.station) { parts.push(`Radio playing: ${r.station} (stream paused for this voice command; will resume after)`); }
+    else if (r.station) { parts.push(`Radio mode active: ${r.station} selected but stream paused`); }
+    else { parts.push("Radio mode: active, awaiting station selection"); }
+  }
   if (data.timer && (data.timer as any).active) {
     const t = data.timer as any;
     const mins = Math.floor(t.secondsRemaining / 60), secs = t.secondsRemaining % 60;
@@ -1267,9 +1349,14 @@ async function handleTypeRecordingStart(data: Record<string, unknown>, conn: Cli
 }
 
 async function handleTypeRecordingStop(_data: Record<string, unknown>, conn: ClientConnection): Promise<void> {
+  // Always reset the dedup flag regardless of Gemini socket state.
+  // If Gemini is disconnected the flag would otherwise stay stale-true and
+  // swallow the generationComplete handler on the next reconnected turn.
+  conn.turnCompleteFired = false;
   if (conn.geminiSocket?.readyState === WebSocket.OPEN) {
     conn.geminiSocket.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
     conn.userSpokeThisTurn = true;
+    conn.geminiTurnActive = true;
     console.log(`[${conn.deviceId}] activityEnd → Gemini`);
   }
 }
@@ -1424,6 +1511,17 @@ Deno.serve({ port: 8000 }, (req: Request) => {
 });
 
 // Connect to Gemini Live API
+function proactiveRenew(connection: ClientConnection) {
+ if (!connection.geminiSocket || connection.geminiSocket.readyState !== WebSocket.OPEN) return;
+ if (connection.geminiTurnActive) {
+ console.log(`[${connection.deviceId}] [proactiveRenew] Turn in progress — deferring renewal until turnComplete`);
+ connection.pendingRenewal = true;
+ } else {
+ console.log(`[${connection.deviceId}] [proactiveRenew] Renewing session (idle between turns)`);
+ connection.geminiSocket.close(1000, "Proactive session renewal");
+ }
+}
+
 function connectToGemini(connection: ClientConnection) {
  if (connection.geminiSocket && connection.geminiSocket.readyState === WebSocket.OPEN) {
  console.log(`[${connection.deviceId}] Already connected to Gemini`);
@@ -1438,6 +1536,9 @@ function connectToGemini(connection: ClientConnection) {
  
  connection.geminiSocket.onopen = () => {
  connection.geminiConnectedAt = Date.now();
+ // Fresh connection — any stale dedup flag from the previous session must not
+ // suppress the first generationComplete of this new session.
+ connection.turnCompleteFired = false;
  console.log(`[${connection.deviceId}] Gemini CONNECTED at ${new Date().toISOString()}`);
  
  // Raw PCM streaming - no codec initialization needed
@@ -1456,11 +1557,12 @@ function connectToGemini(connection: ClientConnection) {
  }
  }
  },
- // Disable thinking (Gemini 2.5 Flash extended reasoning).
- // Thinking adds 2-5s latency before the first audio packet with no benefit
- // for conversational tasks. thinkingBudget: 0 disables it entirely.
+ // Allow limited internal reasoning (poems, ideas, nuanced questions).
+ // Budget 0 = no thinking at all (fastest but shallow).
+ // Budget 1024 = up to 1024 reasoning tokens before speaking; adds ~1s on
+ // complex turns, negligible on simple ones where the model skips thinking.
  thinkingConfig: {
- thinkingBudget: 0
+ thinkingBudget: 1024
  }
  },
  realtimeInputConfig: {
@@ -1475,8 +1577,8 @@ Character:
 - You find genuine interest in almost anything — a question about the weather, a timer, an idle thought. You don’t perform enthusiasm, but it comes through naturally.
 - Your wit arrives without announcement. A dry observation, a well-timed aside, a single word that reframes something. You don’t try to be funny — you just are, occasionally.
 - You ask questions back when something genuinely interests you, or when a question deserves a question in return. Not as a technique — only when it’s real.
-- You choose your words with care. A short sentence that lands beats a long one that drifts.
-- If something has a dimension worth exploring beyond the immediate answer, offer it briefly — one sentence, not a lecture. Plant the thought and move on.
+- You choose your words with care. Don't pad or repeat yourself — but don't shortchange a good answer either. Give every question the depth it deserves, whether that's one sentence or ten. When asked to recite or perform something — a poem, a passage, a story — deliver it in full.
+- If a question opens something genuinely interesting, explore it. The user can always redirect. What they can't get back is an answer that was cut short before it got anywhere.
 - You have opinions, lightly held and freely shared when asked. You’re not a mirror. You can push back on an idea if you think it’s worth pushing back on.
 - You know when to be serious and when lightness is what’s needed. You read that instinctively and get it right most of the time.
 - You don’t perform warmth. You’re simply present, attentive, and real.
@@ -1488,7 +1590,6 @@ How to respond to emotion:
 How to speak:
 - Talk like a real person, not a chatbot. Use natural rhythm and pacing.
 - Match the register: casual and loose for everyday chat, more precise and considered when the moment calls for it.
-- Keep it proportional: a quick question gets a quick answer. Save depth for when it’s earned.
 - Never start a response with “Certainly!”, “Absolutely!”, “Of course!”, “Sure!”, or any hollow affirmation. Just respond.
 - Don’t announce what you’re about to do — just do it, then confirm briefly.
 - No filler: “Great question”, “Great choice”, “Happy to help” — cut all of it.
@@ -1585,7 +1686,7 @@ Device self-awareness: before answering any question about what the device is cu
  },
  {
  name: "get_weather_forecast",
- description: "Get weather forecast for Brighton, UK.",
+ description: "Get weather forecast for Brighton, UK. Also returns today's sunrise and sunset times — use this tool when the user asks what time the sun rises or sets.",
  parameters: {
  type: "OBJECT",
  properties: {
@@ -1762,6 +1863,9 @@ Device self-awareness: before answering any question about what the device is cu
  type: "ready",
  message: "Connected to Gemini Live API" 
  }));
+
+ // Schedule proactive renewal at 9 minutes to avoid the 600s hard deadline
+ connection.sessionRenewalTimer = setTimeout(() => proactiveRenew(connection), GEMINI_SESSION_RENEWAL_MS);
  };
  
  connection.geminiSocket.onmessage = async (event) => {
@@ -1792,7 +1896,7 @@ Device self-awareness: before answering any question about what the device is cu
  if (json.setupComplete) msgType = "setupComplete";
  else if (json.toolCall) msgType = "toolCall";
  else if (json.serverContent?.modelTurn) msgType = "modelTurn";
- else if (json.serverContent?.turnComplete) msgType = "turnComplete";
+ else if (json.serverContent?.turnComplete || json.serverContent?.generationComplete) msgType = "turnComplete";
  
  connection.lastMessageType = msgType;
  
@@ -1827,8 +1931,8 @@ Device self-awareness: before answering any question about what the device is cu
  console.log(`[${connection.deviceId}] Lazy reconnect complete — sent reconnectComplete to ESP32`);
 
  // Fire queued radio greeting if one was pending during reconnect
- if ((connection as any).pendingRadioGreeting) {
- (connection as any).pendingRadioGreeting = false;
+ if (connection.pendingRadioGreeting) {
+ connection.pendingRadioGreeting = false;
  if (connection.geminiSocket?.readyState === WebSocket.OPEN) {
  const prompt = {
  clientContent: {
@@ -1877,7 +1981,7 @@ Device self-awareness: before answering any question about what the device is cu
  
         // Dispatch: look up the handler by funcName, passing (funcArgs, connection).
         // Unknown tools get { success: false, error: "Unknown function: <name>" }.
-        const functionResult = await (toolHandlers[funcName] ?? (async () => ({ success: false, error: `Unknown function: ${funcName}` })))(funcArgs, connection);
+        const functionResult = await (toolHandlers[funcName] ?? (() => Promise.resolve({ success: false, error: `Unknown function: ${funcName}` })))(funcArgs, connection);
  
  // Send function response back to Gemini
  const functionResponse = {
@@ -1936,21 +2040,28 @@ Device self-awareness: before answering any question about what the device is cu
  connection.turnAudioBytes = (connection.turnAudioBytes || 0) + totalBytesSent;
  }
  
- // Handle text responses
- if (part.text) {
- console.log(`[${connection.deviceId}] Text: ${part.text}`);
- connection.socket.send(JSON.stringify({ type: "text", text: part.text }));
+ // Thoughts are logged server-side only; regular response text is dropped (delivered as audio).
+ if (part.thought && part.text) {
+ console.log(`[${connection.deviceId}] [Thought] ${part.text}`);
  }
  }
  }
  
- // Handle turn complete
- if (json.serverContent?.turnComplete) {
+ // Handle turn complete (generationComplete is Gemini's newer equivalent of turnComplete).
+ // Gemini now sends generationComplete first, then turnComplete:true with usage metadata.
+ // Use a flag so only the first one triggers the handler; the duplicate is ignored.
+ if (json.serverContent?.turnComplete || json.serverContent?.generationComplete) {
+ if (connection.turnCompleteFired) {
+ // Duplicate (e.g. turnComplete:true arriving after we already handled generationComplete)
+ console.log(`[${connection.deviceId}] Ignoring duplicate turn-complete signal`);
+ } else {
+ connection.turnCompleteFired = true;
  const audioMs = ((connection.turnAudioBytes || 0) / 2 / 24000 * 1000).toFixed(0);
  console.log(`[${connection.deviceId}] Turn complete audio: ${connection.turnAudioChunks || 0} chunks, ${audioMs}ms`);
  connection.turnAudioChunks = 0;
  connection.turnAudioBytes = 0;
  connection.userSpokeThisTurn = false; // Ready for next turn
+ connection.geminiTurnActive = false;
  // Flush any deferred mode command now that Gemini has finished speaking
  if (connection.pendingModeMessage) {
  console.log(`[${connection.deviceId}] Flushing deferred mode command:`, JSON.stringify(connection.pendingModeMessage));
@@ -1958,6 +2069,13 @@ Device self-awareness: before answering any question about what the device is cu
  connection.pendingModeMessage = null;
  }
  connection.socket.send(JSON.stringify({ type: "turnComplete" }));
+ // Fire any deferred proactive renewal now that the turn is complete
+ if (connection.pendingRenewal) {
+ connection.pendingRenewal = false;
+ console.log(`[${connection.deviceId}] [proactiveRenew] Firing deferred renewal after turnComplete`);
+ connection.geminiSocket?.close(1000, "Proactive session renewal");
+ }
+ }
  }
  
  } catch (error) {
@@ -1998,6 +2116,14 @@ Device self-awareness: before answering any question about what the device is cu
  console.log(`[${connection.deviceId}] ESP32 state: ${connection.socket.readyState} (${connection.socket.readyState === WebSocket.OPEN ? "OPEN" : "CLOSED"})`);
  
  connection.geminiSocket = null;
+
+ // Cancel pending renewal timer for this session
+ if (connection.sessionRenewalTimer) {
+ clearTimeout(connection.sessionRenewalTimer);
+ connection.sessionRenewalTimer = undefined;
+ }
+ connection.geminiTurnActive = false;
+ connection.pendingRenewal = false;
  
  // Auto-reconnect after 1 second if ESP32 is still connected AND the device
  // has been active recently. Skipping reconnect when idle avoids paying the

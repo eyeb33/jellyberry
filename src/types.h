@@ -107,6 +107,7 @@ struct RadioState {
     char stationName[64];           // Current station name
     char streamUrl[256];             // Direct stream URL
     float savedVolume = 1.0f;     // Saved before Button 1 duck, restored after
+    bool paused = false;          // Stream paused for Gemini conversation; will resume after turn
 };
 
 // Lamp mode state

@@ -16,6 +16,7 @@
 extern WebSocketsClient        webSocket;
 extern CRGB                    leds[];
 extern SemaphoreHandle_t       ledMutex;
+extern SemaphoreHandle_t       wsSendMutex;
 
 extern LEDMode    currentLEDMode;
 

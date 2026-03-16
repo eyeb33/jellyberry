@@ -35,7 +35,15 @@ void transitionConvState(ConvState newState) {
 
 // ── Safe WebSocket send with error logging ───────────────────────────────────
 bool wsSendMessage(const String& msg) {
+    // Serialise all sends: WebSocketsClient::sendTXT is not thread-safe and is called
+    // from websocketTask (WS loop / ping), audioTask (mic PCM), and loop() (control msgs).
+    // Concurrent calls corrupt the internal frame buffer and cause server disconnects.
+    if (wsSendMutex && xSemaphoreTake(wsSendMutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+        Serial.printf("[WS] send mutex timeout — dropped %u bytes\n", msg.length());
+        return false;
+    }
     bool ok = webSocket.sendTXT(msg.c_str(), msg.length());
+    if (wsSendMutex) xSemaphoreGive(wsSendMutex);
     if (!ok) Serial.printf("[WS] sendTXT failed (%u bytes)\n", msg.length());
     return ok;
 }
@@ -136,28 +144,21 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  volumeMultiplier = max(0.1f, volumeMultiplier - 0.2f);
  Serial.printf("Volume down: %.0f%%\n", volumeMultiplier * 100);
  }
- // Play a brief chime at the new volume
- playVolumeChime();
- 
+
  } else if (funcName == "set_volume_percent") {
  int percent = doc["args"]["percent"].as<int>();
  volumeMultiplier = constrain(percent / 100.0f, 0.1f, 2.0f);
  Serial.printf("Volume set: %d%%\n", percent);
- 
- // Play a brief chime at the new volume
- playVolumeChime();
- 
+
  } else if (funcName == "set_volume_level") {
  // 1-10 scale from Gemini, maps to 10%-100%
  int level = doc["args"]["level"].as<int>();
  level = constrain(level, 1, 10);
- volumeMultiplier = level * 10 / 100.0f; // 1→0.10, 10→1.00
- // Save to radioState if radio is active (so duck/restore works correctly)
- if (radioState.active && radioState.streaming) {
+ float newVolume = level * 10 / 100.0f; // 1→0.10, 10→1.00
+ Serial.printf("Volume: level %d → %.0f%% (was %.0f%%)\n", level, newVolume * 100, volumeMultiplier * 100);
+ volumeMultiplier = newVolume;
+ // Always update savedVolume so radio duck/restore doesn't revert the change
  radioState.savedVolume = volumeMultiplier;
- }
- Serial.printf("Volume level %d: %.0f%%\n", level, volumeMultiplier * 100);
- playVolumeChime();
  }
  
  return;
@@ -810,6 +811,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  // Set radio state
  radioState.active = true;
  radioState.streaming = false; // will become true after first chunk arrives
+ radioState.paused = false;    // clear any pause from a previous conversation
  radioState.visualsActive = true;
  radioState.isHLS = isHLS;
  strlcpy(radioState.stationName, stationName, sizeof(radioState.stationName));
@@ -857,6 +859,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  // Clear radio + ambient state
  radioState.active = false;
  radioState.streaming = false;
+ radioState.paused = false;
  radioState.stationName[0] = '\0';
  radioState.streamUrl[0] = '\0';
  isPlayingAmbient = false;

@@ -394,7 +394,6 @@ void setup() {
             Serial.printf("\n Connection attempt failed (status: %d)\n", WiFi.status());
         }
     }
-    4
     if (!connected) {
         Serial.println("WiFi connection failed after all retries");
         currentLEDMode = LED_ERROR;

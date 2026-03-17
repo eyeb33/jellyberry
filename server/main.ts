@@ -81,9 +81,8 @@ async function searchRadioStations(query: string, tag: string, limit: number): P
 // Track which devices have received their first boot greeting
 const deviceFirstBoot = new Map<string, boolean>();
 
-// Helper function to decode WebSocket close codes
-function getCloseCodeDescription(code: number): string {
- const codes: Record<number, string> = {
+// WebSocket close code lookup
+const CLOSE_CODES: Record<number, string> = {
  1000: "Normal Closure",
  1001: "Going Away",
  1002: "Protocol Error",
@@ -99,8 +98,9 @@ function getCloseCodeDescription(code: number): string {
  1013: "Try Again Later",
  1014: "Bad Gateway",
  1015: "TLS Handshake"
- };
- return codes[code] || "Unknown";
+};
+function getCloseCodeDescription(code: number): string {
+ return CLOSE_CODES[code] || "Unknown";
 }
 
 // Debug: Check if API key is loaded
@@ -575,8 +575,7 @@ async function fetchWeatherData() {
 }
 
 // Weather code to description mapping (WMO codes)
-function getWeatherDescription(code: number): string {
- const weatherCodes: Record<number, string> = {
+const WEATHER_CODES: Record<number, string> = {
  0: "clear sky",
  1: "mainly clear",
  2: "partly cloudy",
@@ -601,13 +600,13 @@ function getWeatherDescription(code: number): string {
  95: "thunderstorm",
  96: "thunderstorm with slight hail",
  99: "thunderstorm with heavy hail"
- };
- 
- return weatherCodes[code] || "unknown conditions";
+};
+function getWeatherDescription(code: number): string {
+ return WEATHER_CODES[code] || "unknown conditions";
 }
 
 // Get weather forecast
-function getWeather(_deviceId: string, timeframe: string = "current") {
+function getWeather(timeframe: string = "current") {
  try {
  const data = weatherDataCache;
  
@@ -939,7 +938,7 @@ async function handleCancelTimer(_args: FuncArgs, conn: ClientConnection): Promi
 async function handleGetWeatherForecast(args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
   const timeframe = (args.timeframe || "current") as string;
   if (!weatherDataCache) { await fetchWeatherData(); }
-  const result = getWeather(conn.deviceId, timeframe);
+  const result = getWeather(timeframe);
   console.log(`[${conn.deviceId}] Weather (${timeframe}): ${result.summary || result.error}`);
   return result;
 }
@@ -1278,6 +1277,9 @@ const actionHandlers: Record<string, ActionHandler> = {
   requestRadio:   handleActionRequestRadio,
 };
 
+// Shared radio greeting prompt — identical in two handlers; extracted to avoid drift.
+const RADIO_GREETING_PROMPT = { clientContent: { turns: [{ role: "user", parts: [{ text: "SYSTEM: The user has just entered radio mode using the physical button. Ask them what kind of radio station they'd like to listen to, then use search_radio_stations to find options and present a shortlist. Keep your opening question brief and friendly." }] }], turnComplete: true } };
+
 // ── ESP32 message-type handlers ──────────────────────────────────────────────
 // Handle JSON messages identified by data.type from the device.
 
@@ -1285,13 +1287,12 @@ async function handleTypeRadioModeActivated(data: Record<string, unknown>, conn:
   const source = (data.source as string) || "button";
   console.log(`[${conn.deviceId}] Radio mode activated (source: ${source})`);
   if (source === "button" && conn.geminiSocket?.readyState === WebSocket.OPEN) {
-    const prompt = { clientContent: { turns: [{ role: "user", parts: [{ text: "SYSTEM: The user has just entered radio mode using the physical button. Ask them what kind of radio station they'd like to listen to, then use search_radio_stations to find options and present a shortlist. Keep your opening question brief and friendly." }] }], turnComplete: true } };
     if (conn.pendingLazyReconnect) { conn.pendingRadioGreeting = true; console.log(`[${conn.deviceId}] Radio greeting queued (Gemini reconnecting)`); }
     else {
       // clientContent starts a new Gemini turn — reset dedup flag so the
       // generationComplete for this turn isn't swallowed as a duplicate.
       conn.turnCompleteFired = false;
-      conn.geminiSocket.send(JSON.stringify(prompt));
+      conn.geminiSocket.send(JSON.stringify(RADIO_GREETING_PROMPT));
       console.log(`[${conn.deviceId}] Radio greeting sent to Gemini`);
     }
   }
@@ -1372,7 +1373,7 @@ const typeHandlers: Record<string, TypeHandler> = {
 };
 
 // Handle ESP32 device WebSocket connections
-Deno.serve({ port: 8000 }, (req: Request) => {
+Deno.serve({ port: 8000, hostname: "0.0.0.0" }, (req: Request) => {
  const url = new URL(req.url);
  
  // Health check endpoint
@@ -1934,16 +1935,7 @@ Device self-awareness: before answering any question about what the device is cu
  if (connection.pendingRadioGreeting) {
  connection.pendingRadioGreeting = false;
  if (connection.geminiSocket?.readyState === WebSocket.OPEN) {
- const prompt = {
- clientContent: {
- turns: [{
- role: "user",
- parts: [{ text: "SYSTEM: The user has just entered radio mode using the physical button. Ask them what kind of radio station they'd like to listen to, then use search_radio_stations to find options and present a shortlist. Keep your opening question brief and friendly." }]
- }],
- turnComplete: true
- }
- };
- connection.geminiSocket.send(JSON.stringify(prompt));
+ connection.geminiSocket.send(JSON.stringify(RADIO_GREETING_PROMPT));
  console.log(`[${connection.deviceId}] Pending radio greeting fired after reconnect`);
  }
  }
@@ -2013,11 +2005,7 @@ Device self-awareness: before answering any question about what the device is cu
  connection.lastAudioChunkTime = now;
  
  // Decode base64 to raw PCM bytes (16-bit little-endian)
- const binaryString = atob(base64Audio);
- const pcmBytes = new Uint8Array(binaryString.length);
- for (let i = 0; i < binaryString.length; i++) {
- pcmBytes[i] = binaryString.charCodeAt(i);
- }
+ const pcmBytes = Uint8Array.from(atob(base64Audio), c => c.charCodeAt(0));
  
  // Stream raw PCM directly to ESP32 without encoding
  // PCM is already 16-bit little-endian mono at 24kHz from Gemini

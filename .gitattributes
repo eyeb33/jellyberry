@@ -1,0 +1,18 @@
+# Normalize line endings to LF in the repo, checkout as CRLF on Windows
+* text=auto
+
+# C++ source — force LF, preserve UTF-8
+*.cpp text eol=lf
+*.h   text eol=lf
+
+# TypeScript / JSON — force LF
+*.ts   text eol=lf
+*.json text eol=lf
+
+# Scripts
+*.ps1 text eol=crlf
+
+# Binary files — never touch
+*.bin binary
+*.csv binary
+*.opus binary

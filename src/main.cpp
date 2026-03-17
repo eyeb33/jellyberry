@@ -394,7 +394,7 @@ void setup() {
             Serial.printf("\n Connection attempt failed (status: %d)\n", WiFi.status());
         }
     }
-    
+    4
     if (!connected) {
         Serial.println("WiFi connection failed after all retries");
         currentLEDMode = LED_ERROR;
@@ -1798,7 +1798,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         // so use Gemini-specific timer and skip queue-depth check.
         bool noNewPackets = isPlayingAmbient
             ? (millis() - lastGeminiAudioTime) > 3000   // mixed: Gemini-only timer
-            : (millis() - lastAudioChunkTime)  > 2000;  // solo: original timer
+            : (millis() - lastAudioChunkTime)  > 300;   // solo: 300ms matches reduced DMA pipeline (~128ms)
         bool queueDrained = !isPlayingAmbient && queueDepth < 3;  // skip in mixed mode
         
         if (noNewPackets && (queueDrained || isPlayingAmbient)) {
@@ -2205,8 +2205,8 @@ bool initI2SSpeaker() {
  .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
  .communication_format = I2S_COMM_FORMAT_STAND_I2S,
  .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
- .dma_buf_count = 16, // More buffers for smoother streaming
- .dma_buf_len = 1024, // Larger buffer to match our 1KB chunks
+ .dma_buf_count = 6,  // Reduced from 16: 6x512/24000 = ~128ms pipeline (was 682ms)
+ .dma_buf_len = 512,  // Reduced from 1024 to sync LEDs with voice
  .use_apll = true, // Use APLL for more accurate sample rate
  .tx_desc_auto_clear = true,
  .fixed_mclk = 0
@@ -3023,6 +3023,14 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 
 // ============== LED CONTROLLER ==============
 void updateLEDs() {
+    // Seed smoothedAudioLevel immediately when recording starts, bypassing the EMA
+    // ramp-up from zero so the VU meter responds on the very first frame.
+    static LEDMode prevLEDMode = LED_IDLE;
+    if (currentLEDMode == LED_RECORDING && prevLEDMode != LED_RECORDING) {
+        smoothedAudioLevel = (float)currentAudioLevel;
+    }
+    prevLEDMode = currentLEDMode;
+
  // Smooth the audio level with exponential moving average
 // Fast rise (α=0.5, ~43ms time constant) so peaks track speech closely.
         // Decay is handled separately below (0.60× per frame when silent).

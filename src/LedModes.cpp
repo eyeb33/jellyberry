@@ -16,23 +16,23 @@ void renderVUMeter(CRGB* leds, int numRows, uint8_t style) {
             int idx = col * LEDS_PER_COLUMN + row;
             if (idx >= NUM_LEDS) continue;
             if (row < numRows) {
-                float progress = (float)row / (float)LEDS_PER_COLUMN;
+                uint8_t p8 = (uint8_t)((row * 255) / LEDS_PER_COLUMN);
                 switch (style) {
                     case 0: // Recording  green→yellow→red
                     case 2: // Ambient VU (same palette)
-                        if      (progress < 0.50f) leds[idx] = CRGB(0,   255, 0);
-                        else if (progress < 0.83f) leds[idx] = CRGB(255, 255, 0);
-                        else                       leds[idx] = CRGB(255, 0,   0);
+                        if      (p8 < 128) leds[idx] = CRGB(0,   255, 0);
+                        else if (p8 < 212) leds[idx] = CRGB(255, 255, 0);
+                        else               leds[idx] = CRGB(255, 0,   0);
                         break;
                     case 1: // Audio-reactive  blue→cyan→magenta
-                        if      (progress < 0.50f) leds[idx] = CRGB(0,   100, 200);
-                        else if (progress < 0.83f) leds[idx] = CRGB(0,   255, 150);
-                        else                       leds[idx] = CRGB(200, 0,   255);
+                        if      (p8 < 128) leds[idx] = CRGB(0,   100, 200);
+                        else if (p8 < 212) leds[idx] = CRGB(0,   255, 150);
+                        else               leds[idx] = CRGB(200, 0,   255);
                         break;
                     case 3: // Radio teal
                     {
-                        uint8_t g = (uint8_t)(progress * 200);
-                        uint8_t b = (uint8_t)(100 + progress * 155);
+                        uint8_t g = (uint8_t)((uint16_t)p8 * 200 / 255);
+                        uint8_t b = (uint8_t)(100 + (uint16_t)p8 * 155 / 255);
                         leds[idx] = CRGB(0, g, b);
                         break;
                     }
@@ -175,16 +175,38 @@ void renderLedTimer(CRGB* leds) {
         return;
     }
 
-    float progress     = (float)remaining / (float)timerState.totalSeconds;
-    float exactLEDs    = progress * NUM_LEDS;
-    int numLEDs        = (int)exactLEDs;
-    float frac         = exactLEDs - numLEDs;
+    static uint32_t lastStartTime = 0;
+    static uint32_t entryStartMs  = 0;
+    static uint8_t  displayHue    = 96;
+    const  uint32_t ENTRY_MS      = 700;
 
-    uint8_t hue;
-    if      (progress > 0.66f) hue = 96;
-    else if (progress > 0.33f) hue = 64;
-    else if (progress > 0.15f) hue = 32;
-    else                       hue = 0;
+    if (timerState.startTime != lastStartTime) {
+        lastStartTime = timerState.startTime;
+        entryStartMs  = millis();
+        displayHue    = 96;
+    }
+
+    float progress  = (float)remaining / (float)timerState.totalSeconds;
+    float exactLEDs = progress * NUM_LEDS;
+    int   numLEDs   = (int)exactLEDs;
+    float frac      = exactLEDs - numLEDs;
+
+    uint32_t entryAge = millis() - entryStartMs;
+    if (entryAge < ENTRY_MS) {
+        float t     = (float)entryAge / ENTRY_MS;
+        float eased = t * (2.0f - t);
+        numLEDs = (int)(numLEDs * eased);
+        frac    = 0;
+    }
+
+    uint8_t targetHue;
+    if      (progress > 0.66f) targetHue = 96;
+    else if (progress > 0.33f) targetHue = 64;
+    else if (progress > 0.15f) targetHue = 32;
+    else                       targetHue = 0;
+
+    if      (displayHue > targetHue) displayHue -= min((uint8_t)4, (uint8_t)(displayHue - targetHue));
+    else if (displayHue < targetHue) displayHue += min((uint8_t)4, (uint8_t)(targetHue - displayHue));
 
     uint8_t baseBrightness = 255;
     if (progress < 0.15f) {
@@ -193,9 +215,9 @@ void renderLedTimer(CRGB* leds) {
 
     for (int i = 0; i < NUM_LEDS; i++) {
         if (i < numLEDs) {
-            leds[i] = CHSV(hue, 255, baseBrightness);
+            leds[i] = CHSV(displayHue, 255, baseBrightness);
         } else if (i == numLEDs && frac > 0) {
-            leds[i] = CHSV(hue, 255, (uint8_t)(baseBrightness * frac));
+            leds[i] = CHSV(displayHue, 255, (uint8_t)(baseBrightness * frac));
         } else {
             leds[i] = CRGB::Black;
         }

@@ -168,12 +168,8 @@ static void resumeRadioStream();
 
 // Helper function to clear audio buffers and LEDs (called during mode transitions)
 void clearAudioAndLEDs() {
- // Triple clear audio buffer for clean slate
- i2s_zero_dma_buffer(I2S_NUM_1);
- delay(30);
- i2s_zero_dma_buffer(I2S_NUM_1);
- delay(30);
- i2s_zero_dma_buffer(I2S_NUM_1);
+ // Drain audio queue and mutex-guarded zero — replaces old triple-zero workaround
+ drainAudioAndSilence(200);
  
  // Clear LED buffer with mutex protection
  if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
@@ -756,7 +752,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 ambientSound.active = false;
                 ambientSound.name[0] = '\0';
                 ambientSound.sequence++;
-                i2s_zero_dma_buffer(I2S_NUM_1);
+                i2sZeroSafe();
             }
             
             // Clear states
@@ -837,7 +833,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             if (isPlayingAmbient) {
                 isPlayingResponse = false;  // Clear playback flag
                 // Clear I2S buffer to stop audio immediately
-                i2s_zero_dma_buffer(I2S_NUM_1);
+                i2sZeroSafe();
             }
             
             // Clear any active display states (moon, tide, timer)
@@ -884,7 +880,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 }
                 
                 // Clear I2S hardware buffer
-                i2s_zero_dma_buffer(I2S_NUM_1);
+                i2sZeroSafe();
                 
                 // Set drain period to discard any stale packets still in flight
                 ambientSound.drainUntil = millis() + 500;  // 500ms drain window
@@ -917,9 +913,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 DEBUG_PRINTLN(" Mode transition: AMBIENT  RADIO (cleaning up...)");
                 
                 // Clear audio buffer to prevent bleed
-                i2s_zero_dma_buffer(I2S_NUM_1);
-                delay(50);
-                i2s_zero_dma_buffer(I2S_NUM_1);
+                i2sZeroSafe();
                 
                 // Clear LED buffer (with mutex)
                 if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
@@ -942,7 +936,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 ambientSound.active = false;
                 ambientSound.name[0] = '\0';
                 ambientSound.sequence++;
-                i2s_zero_dma_buffer(I2S_NUM_1);
+                i2sZeroSafe();
                 
                 // Enter radio discovery mode
                 radioState.active = true;
@@ -1003,9 +997,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                     AudioChunk dummy;
                     while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {}
                 }
-                i2s_zero_dma_buffer(I2S_NUM_1);
-                delay(50);
-                i2s_zero_dma_buffer(I2S_NUM_1);
+                i2sZeroSafe();
 
                 // Clear LED buffer
                 if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
@@ -1049,12 +1041,8 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 // Set 2-second drain period
                 ambientSound.drainUntil = millis() + 2000;
                 
-                // Zero audio buffer (triple clear for clean slate)
-                i2s_zero_dma_buffer(I2S_NUM_1);
-                delay(30);
-                i2s_zero_dma_buffer(I2S_NUM_1);
-                delay(30);
-                i2s_zero_dma_buffer(I2S_NUM_1);
+                // Zero audio buffer
+                i2sZeroSafe();
                 
                 // Clear LED buffer to remove Pomodoro timer visualization (with mutex)
                 if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
@@ -1087,7 +1075,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                     AudioChunk dummy;
                     while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {}
                 }
-                i2s_zero_dma_buffer(I2S_NUM_1);
+                i2sZeroSafe();
 
                 // Request ROOT chakra audio immediately
                 strlcpy(ambientSound.name, "bell001", sizeof(ambientSound.name));
@@ -1211,7 +1199,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             String stopMsg;
             serializeJson(stopDoc, stopMsg);
             wsSendMessage(stopMsg);
-            i2s_zero_dma_buffer(I2S_NUM_1);
+            i2sZeroSafe();
             
             // If coming from Sea Gooseberry, go to Rain
             if (currentLEDMode == LED_SEA_GOOSEBERRY) {
@@ -1346,7 +1334,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             wsSendMessage(stopMsg);
             
             // Clear I2S hardware buffer
-            i2s_zero_dma_buffer(I2S_NUM_1);
+            i2sZeroSafe();
             
             // Flush the software audio queue (removes buffered packets)
             AudioChunk dummy;
@@ -1396,7 +1384,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 isPlayingResponse = false;
                 
                 // Clear I2S hardware buffer
-                i2s_zero_dma_buffer(I2S_NUM_1);
+                i2sZeroSafe();
                 
                 // Flush software audio queue
                 AudioChunk dummy;
@@ -1448,7 +1436,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             DEBUG_PRINTLN("  Interrupted response - starting new recording");
             responseInterrupted = true;  // Flag to ignore remaining audio chunks
             isPlayingResponse = false;
-            i2s_zero_dma_buffer(I2S_NUM_1);  // Stop audio immediately
+            i2sZeroSafe();  // Mutex-guarded — Gemini speech may be mid-write in audioTask
             tideState.active = false;
             moonState.active = false;
             recordingActive = true;
@@ -1493,7 +1481,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             DEBUG_PRINTLN(" Sent stop alarm request to server");
             
             // Stop I2S output - let buffered audio drain naturally
-            i2s_zero_dma_buffer(I2S_NUM_1);
+            i2sZeroSafe();  // Mutex-guarded — alarm PCM may be mid-write in audioTask
             
             // Don't clear the queue - let audio task handle cleanup naturally
             // (clearing queue while audio task is active causes crashes)
@@ -1569,7 +1557,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             }
             // Drain local audio queue and silence I2S
             { AudioChunk dummy; while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {} }
-            i2s_zero_dma_buffer(I2S_NUM_1);
+            i2sZeroSafe();
             isPlayingAmbient = false;
             isPlayingResponse = false;
             ambientSound.active = false;
@@ -1850,7 +1838,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                     meditationState.phaseStartTime = 0; // Stays 0 until first audio chunk arrives
                     // Flush any residual Gemini audio still in queue
                     { AudioChunk dummy; while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {} }
-                    i2s_zero_dma_buffer(I2S_NUM_1);
+                    i2sZeroSafe();
                     strlcpy(ambientSound.name, "bell001", sizeof(ambientSound.name));
                     ambientSound.active = true;
                     isPlayingAmbient = true;

@@ -17,6 +17,7 @@ extern WebSocketsClient        webSocket;
 extern CRGB                    leds[];
 extern SemaphoreHandle_t       ledMutex;
 extern SemaphoreHandle_t       wsSendMutex;
+extern SemaphoreHandle_t       i2sSpeakerMutex;
 
 extern LEDMode    currentLEDMode;
 
@@ -61,6 +62,15 @@ void handleWebSocketMessage(uint8_t* payload, size_t length);
 // Call after sending stopAmbient to prevent audio tail on voice-commanded stops.
 // windowMs: how long to suppress incoming audio (default 500ms, use 2000ms after radio).
 void drainAudioAndSilence(uint32_t windowMs = 500);
+
+// Mutex-guarded i2s_zero_dma_buffer — prevents DMA race with audioTask's i2s_write.
+// Use instead of bare i2s_zero_dma_buffer(I2S_NUM_1) everywhere outside audioTask.
+static inline void i2sZeroSafe() {
+    if (i2sSpeakerMutex && xSemaphoreTake(i2sSpeakerMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        i2s_zero_dma_buffer(I2S_NUM_1);
+        xSemaphoreGive(i2sSpeakerMutex);
+    }
+}
 
 // Central ConvState transition function — sets universally-required entry actions.
 // Callers still set LEDs and other context-specific flags after calling this.

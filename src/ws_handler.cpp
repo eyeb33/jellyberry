@@ -7,8 +7,7 @@
 void drainAudioAndSilence(uint32_t windowMs) {
     AudioChunk dummy;
     while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {}
-    i2s_zero_dma_buffer(I2S_NUM_1);
-    i2s_zero_dma_buffer(I2S_NUM_1);
+    i2sZeroSafe();
     ambientSound.drainUntil = millis() + windowMs;
 }
 
@@ -717,7 +716,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  {
  AudioChunk dummy;
  while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {}
- i2s_zero_dma_buffer(I2S_NUM_1);
+ i2sZeroSafe();
  }
 
  // Request ambient audio from server immediately
@@ -819,7 +818,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  {
  AudioChunk dummy;
  while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {}
- i2s_zero_dma_buffer(I2S_NUM_1);
+ i2sZeroSafe();
  }
 
  // Set radio state

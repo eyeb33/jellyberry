@@ -105,7 +105,7 @@ AmbientSoundType currentAmbientSoundType = SOUND_RAIN;
 TideState tideState = {"", 0.0, 0, 0, false};
 
 // Timer visualization state
-TimerState timerState = {0, 0, false, false, 0, 0};
+TimerState timerState = {0, 0, false};
 
 // Moon phase visualization state
 MoonState moonState = {"", 0, 0.0, 0, false};
@@ -539,28 +539,6 @@ static void handleFlashAnimations() {
         }
     }
     
-    // Handle non-blocking timer flash animation (triggered by timerExpired WebSocket message).
-    // Runs at 200ms intervals in loop() — WebSocket task is never blocked.
-    if (timerState.flashing && (millis() - timerState.flashStartTime) >= 200) {
-        timerState.flashCount++;
-        timerState.flashStartTime = millis();
-    
-        if (timerState.flashCount >= 6) {
-            // Animation complete (3 on/off cycles = 6 state changes)
-            timerState.flashing = false;
-        } else {
-            // Toggle LEDs green/black
-            if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-                if (timerState.flashCount % 2 == 0) {
-                    fill_solid(leds, NUM_LEDS, CRGB::Green);
-                } else {
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                }
-                FastLED.show();
-                xSemaphoreGive(ledMutex);
-            }
-        }
-    }
 }
 
 static void handlePomodoroTick() {
@@ -1459,7 +1437,13 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         // Interrupt feature: START button during active playback stops audio and starts recording
         // Only interrupt if we've received audio recently (within 500ms) and turn is not complete
         // Note: Pomodoro now allowed - button 1 can interrupt responses during Pomodoro
-        else if (!meditationHandled && currentLEDMode != LED_MEDITATION && startRisingEdge && isPlayingResponse && !turnComplete && 
+        // Guard !isPlayingAmbient: radio/ambient streams set isPlayingResponse=true via the
+        // prebuffer check, but they are NOT interruptible Gemini responses. Without this guard
+        // the interrupt handler fires during radio (if turnComplete==false), calls
+        // i2s_zero_dma_buffer without the i2sSpeakerMutex while audioTask is inside i2s_write,
+        // corrupting the DMA descriptor chain and triggering a Guru Meditation crash.
+        else if (!meditationHandled && currentLEDMode != LED_MEDITATION && startRisingEdge &&
+            isPlayingResponse && !isPlayingAmbient && !turnComplete &&
             (millis() - lastAudioChunkTime) < 500) {
             DEBUG_PRINTLN("  Interrupted response - starting new recording");
             responseInterrupted = true;  // Flag to ignore remaining audio chunks

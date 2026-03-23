@@ -264,23 +264,37 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  return;
  }
  
- // Handle timer expired
+ // Handle timer expired — trigger the same alert as a real alarm
  if (strcmp(msgType, "timerExpired") == 0) {
  Serial.println("Timer expired!");
  timerState.active = false;
- // Trigger non-blocking flash animation (runs in loop() — does NOT block WebSocket task).
- // The old delay(200) loop blocked this task for 1200ms total, causing audio dropouts
- // whenever a timer expired during playback.
- timerState.flashing = true;
- timerState.flashCount = 0;
- timerState.flashStartTime = millis();
- // Do NOT pre-set isPlayingResponse here the standard audio prebuffer path in
- // onWebSocketEvent(WStype_BIN) will set it once enough packets have buffered.
- // Forcing it here caused the LED to switch before audio arrived (visual glitch)
- // and the 300ms delay was blocking the WebSocket task.
- // Clear waiting guard so the thinking animation doesn't fire for the timer-expiry response
+
+ // Save current state so the dismiss handler can restore it (same pattern as checkAlarms())
+ alarmState.previousMode = currentLEDMode;
+ alarmState.wasRecording = recordingActive;
+ alarmState.wasPlayingResponse = isPlayingResponse;
+
+ // Start alarm visual
+ alarmState.ringing = true;
+ alarmState.ringStartTime = millis();
+ alarmState.pulseStartTime = millis();
+ alarmState.pulseRadius = 0.0f;
+ currentLEDMode = LED_ALARM;
+
+ // Start alarm sound (server loops alarm audio until it receives "stopAlarm")
+ isPlayingAlarm = true;
+ isPlayingResponse = true;
+ firstAudioChunk = true;
+ lastAudioChunkTime = millis();
+ JsonDocument alarmDoc;
+ alarmDoc["action"] = "requestAlarm";
+ String alarmMsg;
+ serializeJson(alarmDoc, alarmMsg);
+ wsSendMessage(alarmMsg);
+
+ // Suppress thinking animation — timer-expiry Gemini notification should not show waiting state
  transitionConvState(ConvState::IDLE);
- Serial.println("Timer expired - waiting for Gemini audio notification...");
+ Serial.println("Timer expired - alarm alert active, press button to dismiss");
  return;
  }
  

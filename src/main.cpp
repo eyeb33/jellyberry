@@ -2073,9 +2073,9 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             // It sets conversationVADDetected = true when amplitude exceeds threshold.
             // We just need to check that flag here.
             
-            // Guard: ignore VAD for first 800ms after window opens to let speaker resonance die down.
-            // Without this, the tail of Gemini's audio playback can false-trigger a new recording.
-            const uint32_t VAD_GUARD_MS = 800;
+            // Guard: ignore VAD for first 1200ms after window opens to let speaker resonance die down.
+            // Threshold raised to 900 below provides backup EMI protection; keep guard short for responsiveness.
+            const uint32_t VAD_GUARD_MS = 1200;
             
             // Safety: don't start recording if alarm is active
             if (isPlayingAlarm) {

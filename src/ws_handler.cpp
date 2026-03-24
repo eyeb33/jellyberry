@@ -637,6 +637,9 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  lampDoc["color"] = colorName;
  }
 
+ // Volume (0-100%)
+ stateDoc["volume"] = (int)roundf(volumeMultiplier * 100.0f);
+
  // Radio state
  JsonObject radioDoc = stateDoc["radio"].to<JsonObject>();
  radioDoc["active"] = radioState.active;

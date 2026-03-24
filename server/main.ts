@@ -1066,10 +1066,10 @@ async function handleStopRadio(_args: FuncArgs, conn: ClientConnection): Promise
 async function handleSetVolumeLevel(args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
   const level = Math.max(1, Math.min(10, ((args.level as number) || 5)));
   console.log(`[${conn.deviceId}] set_volume_level: ${level}`);
-  // Use pendingModeMessage so the command arrives AFTER Gemini finishes speaking.
-  // If sent immediately during a response, the radio duck/restore path would overwrite it.
-  conn.pendingModeMessage = { type: "functionCall", name: "set_volume_level", args: { level } };
-  return { success: true, message: `Volume set to level ${level}` };
+  // Send immediately so the volume is applied before Gemini speaks its confirmation —
+  // the user hears the confirmation at the new level, not the old one.
+  conn.socket.send(JSON.stringify({ type: "functionCall", name: "set_volume_level", args: { level } }));
+  return { success: true, message: `Volume set to level ${level} (${level * 10}%)` };
 }
 
 // Maps Gemini funcName → handler. Unknown tools return { success: false, error: ... }.
@@ -1875,7 +1875,7 @@ Device self-awareness: before answering any question about what the device is cu
  },
  {
  name: "set_volume_level",
- description: "Set the device volume on a scale of 1 to 10. 1 is very quiet, 5 is moderate, 10 is full volume. Works in all modes.",
+ description: "Set the device volume on a scale of 1 to 10. 1 is very quiet (10%), 5 is moderate (50%), 10 is full volume (100%). Default is level 3 (30%). Works in all modes. After calling this, confirm to the user with natural phrasing e.g. 'Volume is now at level 3' or 'Done, turned it down to level 2'.",
  parameters: {
  type: "OBJECT",
  properties: {

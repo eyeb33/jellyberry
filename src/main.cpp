@@ -60,7 +60,7 @@ uint32_t webSocketSendFailures = 0; // Count send failures
 // NOTE: lastWiFiCheck is declared as a static local inside loop() - no global needed.
 int32_t lastRSSI = 0; // Track signal strength changes
 bool firstAudioChunk = true;
-volatile float volumeMultiplier = 0.25f;  // Volume control - volatile: read by audioTask, written by main/WS task
+volatile float volumeMultiplier = 0.30f;  // Volume control - volatile: read by audioTask, written by main/WS task
 volatile int32_t currentAudioLevel = 0;  // Current audio amplitude - volatile: written by audioTask, read by ledTask
 volatile float smoothedAudioLevel = 0.0f;  // Smoothed audio level - volatile: written by ledTask
 volatile bool conversationMode = false;  // Track if we're in conversation window

@@ -195,7 +195,8 @@ async function fetchTideData() {
  
  console.log(" Fetching tide data from StormGlass...");
  const response = await fetch(url, {
- headers: { 'Authorization': STORMGLASS_API_KEY }
+ headers: { 'Authorization': STORMGLASS_API_KEY },
+ signal: AbortSignal.timeout(8000)
  });
  
  if (!response.ok) {
@@ -546,7 +547,7 @@ async function fetchWeatherData() {
  // Using Brighton coordinates (same as tide data)
  const url = `https://api.open-meteo.com/v1/forecast?latitude=${BRIGHTON_LAT}&longitude=${BRIGHTON_LNG}&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,rain,weather_code,wind_speed_10m&hourly=temperature_2m,precipitation_probability,weather_code&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,weather_code,sunrise,sunset&timezone=Europe/London&forecast_days=3`;
  
- const response = await fetch(url);
+ const response = await fetch(url, { signal: AbortSignal.timeout(8000) });
  
  if (!response.ok) {
  throw new Error(`Open-Meteo API returned ${response.status}`);

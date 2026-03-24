@@ -709,8 +709,9 @@ void loop() {
     static uint32_t lastDebounceTime = 0;
 const uint32_t debounceDelay = DEBOUNCE_DELAY_MS;  // TTP223 has hardware debounce
     
-    // Button 2 long-press detection
+    // Button 1 and 2 long-press detection
     static uint32_t button2PressStart = 0;
+    static uint32_t button1PressStart = 0;
 const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
     
     if (millis() > bootIgnoreTime && (millis() - lastDebounceTime) > debounceDelay) {
@@ -728,10 +729,13 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         startPressed = startTouch;
         stopPressed = stopTouch;
         
-        // Detect button 2 press start
+        // Track press start times
         if (stopRisingEdge) {
             button2PressStart = millis();
             Serial.println("Button 2 pressed (start)");
+        }
+        if (startRisingEdge) {
+            button1PressStart = millis();
         }
         
         // Button 2 long-press: Return to IDLE and start Gemini recording (from any mode)
@@ -741,6 +745,10 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                          millis() - button2PressStart);
             
             // Stop any active mode
+            if (isPlayingResponse) {
+                responseInterrupted = true;
+                isPlayingResponse = false;
+            }
             if (isPlayingAmbient) {
                 JsonDocument stopDoc;
                 stopDoc["action"] = "stopAmbient";
@@ -752,6 +760,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 ambientSound.active = false;
                 ambientSound.name[0] = '\0';
                 ambientSound.sequence++;
+                { AudioChunk dummy; while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {} }
                 i2sZeroSafe();
             }
             
@@ -807,12 +816,90 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             recordingActive = true;
             recordingStartTime = millis();
             lastVoiceActivityTime = millis();
+            transitionConvState(ConvState::RECORDING);
             currentLEDMode = LED_RECORDING;
-            DEBUG_PRINTLN(" Recording started via long-press");
+            DEBUG_PRINTLN(" Recording started via button 2 long-press");
             
             stopPressed = stopTouch;
             lastDebounceTime = millis();
             return;  // Skip normal button handling
+        }
+        
+        // Button 1 long-press: Universal escape from any active mode → enter chat/recording
+        // Short presses in mode-specific handlers (ambient cycle, meditation chakra etc.) fire on
+        // the rising edge before this falling-edge check, which is fine — the escape cancels any
+        // audio they requested.
+        if (startFallingEdge && (millis() - button1PressStart) >= LONG_PRESS_MS) {
+            Serial.printf("Button 1 long-press (%lu ms): escaping to chat mode\n",
+                         millis() - button1PressStart);
+            
+            // Interrupt any active Gemini response
+            if (isPlayingResponse) {
+                responseInterrupted = true;
+                isPlayingResponse = false;
+            }
+            
+            // Stop any active ambient/radio audio
+            if (isPlayingAmbient || radioState.active || ambientSound.active) {
+                JsonDocument stopDoc;
+                stopDoc["action"] = "stopAmbient";
+                String stopMsg;
+                serializeJson(stopDoc, stopMsg);
+                wsSendMessage(stopMsg);
+                AudioChunk dummy;
+                while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {}
+                i2sZeroSafe();
+                isPlayingAmbient = false;
+                ambientSound.active = false;
+                ambientSound.name[0] = '\0';
+                ambientSound.sequence++;
+            }
+            
+            // Clear all active mode states
+            moonState.active = false;
+            tideState.active = false;
+            timerState.active = false;
+            isAmbientVUMode = false;
+            
+            if (pomodoroState.active) {
+                pomodoroState.active = false;
+                pomodoroState.paused = false;
+                pomodoroState.startTime = 0;
+                pomodoroState.pausedTime = 0;
+            }
+            if (meditationState.active) {
+                meditationState.active = false;
+                meditationState.phaseStartTime = 0;
+                meditationState.streaming = false;
+                volumeMultiplier = meditationState.savedVolume;
+                Serial.printf("Volume restored to %.0f%%\n", volumeMultiplier * 100);
+            }
+            if (lampState.active) {
+                lampState.active = false;
+                lampState.fullyLit = false;
+            }
+            if (radioState.active) {
+                if (radioState.savedVolume > 0.05f) volumeMultiplier = radioState.savedVolume;
+                radioState.active = false;
+                radioState.streaming = false;
+                radioState.stationName[0] = '\0';
+                radioState.streamUrl[0] = '\0';
+            }
+            
+            // Start recording. If Pomodoro already started one on the rising edge, keep it.
+            if (!recordingActive) {
+                responseInterrupted = false;
+                conversationRecording = false;
+                recordingActive = true;
+                recordingStartTime = millis();
+                lastVoiceActivityTime = millis();
+                transitionConvState(ConvState::RECORDING);
+            }
+            currentLEDMode = LED_RECORDING;
+            Serial.println("Button 1 long-press: entering chat recording mode");
+            
+            lastDebounceTime = millis();
+            return;
         }
         
         // STOP button short press: Cycle through modes
@@ -1248,18 +1335,10 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             }
         }
         
-        // Pomodoro mode: Button 1 long press = pause/resume, short press = Gemini
-        // Button 2 cycles modes as usual
-        static uint32_t button1PressStart = 0;
-        static uint32_t lastPomodoroAction = 0;
-        const uint32_t LONG_PRESS_DURATION = LONG_PRESS_MS;  // 2 seconds
-        const uint32_t ACTION_DEBOUNCE = 500;  // 500ms between actions
-        
+        // Pomodoro mode: Button 1 short press starts recording immediately for VU feedback.
+        // Long press is handled by the universal Button 1 long-press handler above.
         if (currentLEDMode == LED_POMODORO && pomodoroState.active) {
-            // Detect button 1 press start -> immediately start recording so VU meter shows while talking
             if (startRisingEdge && !recordingActive && !isPlayingResponse && !isPlayingAmbient && !conversationMode && !alarmState.ringing) {
-                button1PressStart = millis();
-                // Start recording immediately for visual VU feedback; long press will cancel it below
                 responseInterrupted = false;
                 conversationRecording = false;
                 tideState.active = false;
@@ -1270,46 +1349,6 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 lastVoiceActivityTime = millis();
                 currentLEDMode = LED_RECORDING;
                 DEBUG_PRINTLN("Pomodoro button pressed - recording + VU active");
-            } else if (startRisingEdge) {
-                // Track press start even when recording couldn't start (e.g. response playing)
-                button1PressStart = millis();
-            }
-            
-            // On button 1 release, check duration
-            if (startFallingEdge && (millis() - lastPomodoroAction) > ACTION_DEBOUNCE) {
-                uint32_t pressDuration = millis() - button1PressStart;
-                
-                if (pressDuration >= LONG_PRESS_DURATION) {
-                    // Long press: cancel any recording started on press, then toggle pause/resume
-                    if (recordingActive) {
-                        recordingActive = false;
-                        currentLEDMode = LED_POMODORO;
-                        DEBUG_PRINTLN("Long press - cancelled recording, toggling pause/resume");
-                    }
-                    if (pomodoroState.paused) {
-                        // Resume from paused state
-                        // Use the totalSeconds already stored when the session started.
-                        // Do NOT re-derive from focusDuration etc.  those may have been changed
-                        // by voice command between when the session started and when it was paused.
-                        int timeAlreadyElapsed = pomodoroState.totalSeconds - pomodoroState.pausedTime;
-                        pomodoroState.startTime = millis() - (timeAlreadyElapsed * 1000);
-                        pomodoroState.pausedTime = 0;
-                        pomodoroState.paused = false;
-                        
-                        DEBUG_PRINT("  Pomodoro resumed from %d seconds remaining (long press)\n", pomodoroState.totalSeconds - timeAlreadyElapsed);
-                        // No sound on resume - user will source alternative
-                    } else {
-                        // Pause and save current position
-                        uint32_t elapsed = (millis() - pomodoroState.startTime) / 1000;
-                        pomodoroState.pausedTime = max(0, pomodoroState.totalSeconds - (int)elapsed);
-                        pomodoroState.startTime = 0;
-                        pomodoroState.paused = true;
-                        DEBUG_PRINT("  Pomodoro paused at %d seconds remaining (long press)\n", pomodoroState.pausedTime);
-                        // No sound on pause - user will source alternative
-                    }
-                    lastPomodoroAction = millis();
-                }
-                // Short press: recording already started on press, continues naturally
             }
         }
         

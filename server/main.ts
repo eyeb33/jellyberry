@@ -161,6 +161,12 @@ interface ClientConnection {
  turnCompleteFired?: boolean; // True once the turn-complete event has been handled; prevents duplicate fires (generationComplete + turnComplete)
  pendingRenewal?: boolean; // Renewal requested while a turn was in-flight; fire on next turnComplete
  sessionRenewalTimer?: ReturnType<typeof setTimeout>; // Handle to cancel if session closes early
+ softRenewalTimer?: ReturnType<typeof setTimeout>; // Fires at 7 min for between-turn renewal
+ softRenewalArmed?: boolean; // True when soft renewal is waiting for next turnComplete
+
+ // Rolling session memory — Jellyberry's spoken text, carried forward into next session
+ sessionTranscript?: string; // Accumulates text parts from current session (capped at 2000 chars)
+ sessionMemory?: string; // Last session's transcript, injected into next session's system instruction
 }
 
 const connections = new Map<string, ClientConnection>();
@@ -173,6 +179,14 @@ const IDLE_RECONNECT_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
 // Proactively renew the Gemini session before the 600s hard deadline.
 // 540s gives a 60s buffer — enough headroom for any in-flight response.
 const GEMINI_SESSION_RENEWAL_MS = 9 * 60 * 1000;
+
+// Soft renewal fires 2 min earlier — ensures renewal happens cleanly between turns,
+// not mid-sentence, even if a turn is in progress at the 9-min mark.
+const GEMINI_SOFT_RENEWAL_MS = 7 * 60 * 1000;
+
+// Deno KV — persists session memory across server restarts, keyed by deviceId.
+// Supports multiple simultaneous users automatically.
+const kv = await Deno.openKv();
 
 // Fetch tide data from StormGlass API
 async function fetchTideData() {
@@ -1513,6 +1527,19 @@ Deno.serve({ port: 8000, hostname: "0.0.0.0" }, (req: Request) => {
 });
 
 // Connect to Gemini Live API
+// Snapshot transcript → sessionMemory, persist to KV, then close the socket for renewal
+async function performRenewal(connection: ClientConnection) {
+ if (!connection.geminiSocket || connection.geminiSocket.readyState !== WebSocket.OPEN) return;
+ if (connection.sessionTranscript) {
+ connection.sessionMemory = connection.sessionTranscript;
+ connection.sessionTranscript = "";
+ console.log(`[${connection.deviceId}] [memory] Carrying forward (${connection.sessionMemory.length} chars):`);
+ console.log(connection.sessionMemory);
+ await kv.set(["sessionMemory", connection.deviceId], connection.sessionMemory);
+ }
+ connection.geminiSocket.close(1000, "Proactive session renewal");
+}
+
 function proactiveRenew(connection: ClientConnection) {
  if (!connection.geminiSocket || connection.geminiSocket.readyState !== WebSocket.OPEN) return;
  if (connection.geminiTurnActive) {
@@ -1520,7 +1547,7 @@ function proactiveRenew(connection: ClientConnection) {
  connection.pendingRenewal = true;
  } else {
  console.log(`[${connection.deviceId}] [proactiveRenew] Renewing session (idle between turns)`);
- connection.geminiSocket.close(1000, "Proactive session renewal");
+ performRenewal(connection);
  }
 }
 
@@ -1536,7 +1563,7 @@ function connectToGemini(connection: ClientConnection) {
  
  connection.geminiSocket = new WebSocket(wsUrl);
  
- connection.geminiSocket.onopen = () => {
+ connection.geminiSocket.onopen = async () => {
  connection.geminiConnectedAt = Date.now();
  // Fresh connection — any stale dedup flag from the previous session must not
  // suppress the first generationComplete of this new session.
@@ -1545,13 +1572,28 @@ function connectToGemini(connection: ClientConnection) {
  
  // Raw PCM streaming - no codec initialization needed
  console.log(`[${connection.deviceId}] Audio pipeline: Raw PCM (24kHz, mono, 16-bit)`);
- 
+
+ // Load persisted session memory on first reconnect after a server restart
+ if (!connection.sessionMemory) {
+ const stored = await kv.get<string>(["sessionMemory", connection.deviceId]);
+ if (stored.value) {
+ connection.sessionMemory = stored.value;
+ console.log(`[${connection.deviceId}] [memory] Loaded from KV (${stored.value.length} chars)`);
+ }
+ }
+ const memoryContext = connection.sessionMemory
+ ? `\n\nContext from your previous session (recent conversation):\n${connection.sessionMemory}`
+ : "";
+ if (connection.sessionMemory) {
+ console.log(`[${connection.deviceId}] [memory] Injecting into setup: ${connection.sessionMemory.substring(0, 150)}...`);
+ }
+
  // Send setup message to Gemini with function declarations
  const setupMessage = {
  setup: {
  model: "models/gemini-2.5-flash-native-audio-preview-12-2025",
  generationConfig: {
- responseModalities: ["AUDIO"],
+ responseModalities: ["AUDIO", "TEXT"],
  speechConfig: {
  voiceConfig: {
  prebuiltVoiceConfig: {
@@ -1593,7 +1635,7 @@ The user is in the UK (Europe/London timezone). When you need the current date o
 
 The device also supports: ambient sounds (rain, ocean, rainforest, fire), guided chakra meditation with breathing, lamp mode (white/red/green/blue), Pomodoro timers, alarms, and countdown timers. Use the right function when asked — and do it naturally, as part of the conversation, not as a separate announcement.
 
-Device self-awareness: before answering any question about what the device is currently doing — Pomodoro, meditation, ambient sound, lamp, timers, or alarms — call get_device_state. Do not guess or assume the device state. Use the returned data to respond accurately. This applies to questions like "how long is left?", "what alarms do I have?", "is anything playing?", "what session am I in?", "is the lamp on?", etc.`
+Device self-awareness: before answering any question about what the device is currently doing — Pomodoro, meditation, ambient sound, lamp, timers, or alarms — call get_device_state. Do not guess or assume the device state. Use the returned data to respond accurately. This applies to questions like "how long is left?", "what alarms do I have?", "is anything playing?", "what session am I in?", "is the lamp on?", etc.${memoryContext}`
  }]
  },
  tools: [{
@@ -1859,6 +1901,19 @@ Device self-awareness: before answering any question about what the device is cu
 
  // Schedule proactive renewal at 9 minutes to avoid the 600s hard deadline
  connection.sessionRenewalTimer = setTimeout(() => proactiveRenew(connection), GEMINI_SESSION_RENEWAL_MS);
+
+ // Soft renewal at 7 min — fires between turns to ensure session never ends mid-sentence
+ connection.softRenewalArmed = false;
+ connection.softRenewalTimer = setTimeout(() => {
+ console.log(`[${connection.deviceId}] [softRenewal] 7-min mark reached`);
+ if (!connection.geminiTurnActive) {
+ console.log(`[${connection.deviceId}] [softRenewal] Idle — renewing immediately`);
+ performRenewal(connection);
+ } else {
+ console.log(`[${connection.deviceId}] [softRenewal] Turn active — armed for next turnComplete`);
+ connection.softRenewalArmed = true;
+ }
+ }, GEMINI_SOFT_RENEWAL_MS);
  };
  
  connection.geminiSocket.onmessage = async (event) => {
@@ -2020,9 +2075,13 @@ Device self-awareness: before answering any question about what the device is cu
  connection.turnAudioBytes = (connection.turnAudioBytes || 0) + totalBytesSent;
  }
  
- // Thoughts are logged server-side only; regular response text is dropped (delivered as audio).
+ // Thoughts are logged server-side only; spoken text accumulates as session transcript.
  if (part.thought && part.text) {
  console.log(`[${connection.deviceId}] [Thought] ${part.text}`);
+ } else if (part.text) {
+ // Accumulate Jellyberry's spoken words for rolling session memory
+ const entry = `Jellyberry: ${part.text.trim()}`;
+ connection.sessionTranscript = ((connection.sessionTranscript || "") + "\n" + entry).slice(-2000);
  }
  }
  }
@@ -2049,11 +2108,13 @@ Device self-awareness: before answering any question about what the device is cu
  connection.pendingModeMessage = null;
  }
  connection.socket.send(JSON.stringify({ type: "turnComplete" }));
- // Fire any deferred proactive renewal now that the turn is complete
- if (connection.pendingRenewal) {
+ // Fire any deferred soft or proactive renewal now that the turn is complete
+ if (connection.softRenewalArmed || connection.pendingRenewal) {
+ const reason = connection.softRenewalArmed ? "softRenewal" : "proactiveRenew";
+ connection.softRenewalArmed = false;
  connection.pendingRenewal = false;
- console.log(`[${connection.deviceId}] [proactiveRenew] Firing deferred renewal after turnComplete`);
- connection.geminiSocket?.close(1000, "Proactive session renewal");
+ console.log(`[${connection.deviceId}] [${reason}] Firing deferred renewal after turnComplete`);
+ performRenewal(connection);
  }
  }
  }
@@ -2097,13 +2158,18 @@ Device self-awareness: before answering any question about what the device is cu
  
  connection.geminiSocket = null;
 
- // Cancel pending renewal timer for this session
+ // Cancel pending renewal timers for this session
  if (connection.sessionRenewalTimer) {
  clearTimeout(connection.sessionRenewalTimer);
  connection.sessionRenewalTimer = undefined;
  }
+ if (connection.softRenewalTimer) {
+ clearTimeout(connection.softRenewalTimer);
+ connection.softRenewalTimer = undefined;
+ }
  connection.geminiTurnActive = false;
  connection.pendingRenewal = false;
+ connection.softRenewalArmed = false;
  
  // Auto-reconnect after 1 second if ESP32 is still connected AND the device
  // has been active recently. Skipping reconnect when idle avoids paying the

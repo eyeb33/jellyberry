@@ -917,7 +917,8 @@ async function handleGetDeviceState(_args: FuncArgs, conn: ClientConnection): Pr
   const timerOverlay = serverTimer
     ? { active: true, secondsRemaining: Math.max(0, Math.round((serverTimer.endTime - Date.now()) / 1000)) }
     : { active: false };
-  const result = { success: true, ...rawState, timer: timerOverlay };
+  const volumeLevel = typeof rawState.volume === "number" ? Math.round(rawState.volume / 10) : undefined;
+  const result = { success: true, ...rawState, volumeLevel, timer: timerOverlay };
   console.log(`[${conn.deviceId}] Device state:`, JSON.stringify(result).substring(0, 300));
   return result;
 }
@@ -1661,7 +1662,7 @@ Device self-awareness: before answering any question about what the device is cu
  },
  {
  name: "get_device_state",
- description: "Get the complete current state of the device — Pomodoro timer (session, time left, paused), meditation, ambient sound, lamp, countdown timers, full alarm list, and current volume level (0-100%). Call this FIRST before answering any question about what the device is currently doing. Do not guess or assume device state.",
+ description: "Get the complete current state of the device — Pomodoro timer (session, time left, paused), meditation, ambient sound, lamp, countdown timers, full alarm list, and current volume. The response includes both 'volume' (percentage) and 'volumeLevel' (1-10 scale). Always report volume to the user as 'level X' (e.g. 'level 3'), not as a percentage. Call this FIRST before answering any question about what the device is currently doing. Do not guess or assume device state.",
  parameters: {
  type: "OBJECT",
  properties: {},

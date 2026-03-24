@@ -1410,6 +1410,7 @@ Deno.serve({ port: 8000, hostname: "0.0.0.0" }, (req: Request) => {
  deviceId,
  geminiMessageCount: 0,
  audioChunkCount: 0,
+ lastUserActivity: Date.now(), // Treat fresh connection as active so idle check doesn't fire on first disconnect
  };
  
  connections.set(deviceId, connection);
@@ -1593,7 +1594,7 @@ function connectToGemini(connection: ClientConnection) {
  setup: {
  model: "models/gemini-2.5-flash-native-audio-preview-12-2025",
  generationConfig: {
- responseModalities: ["AUDIO", "TEXT"],
+ responseModalities: ["AUDIO"],
  speechConfig: {
  voiceConfig: {
  prebuiltVoiceConfig: {
@@ -1607,7 +1608,10 @@ function connectToGemini(connection: ClientConnection) {
  // complex turns, negligible on simple ones where the model skips thinking.
  thinkingConfig: {
  thinkingBudget: 1024
- }
+ },
+ // Request text transcription of Jellyberry's audio output.
+ // Arrives as serverContent.outputTranscription.text — used for session memory.
+ outputAudioTranscription: {}
  },
  realtimeInputConfig: {
   automaticActivityDetection: { disabled: true }
@@ -2075,15 +2079,18 @@ Device self-awareness: before answering any question about what the device is cu
  connection.turnAudioBytes = (connection.turnAudioBytes || 0) + totalBytesSent;
  }
  
- // Thoughts are logged server-side only; spoken text accumulates as session transcript.
+ // Thoughts are logged server-side only; regular response text is dropped (delivered as audio).
  if (part.thought && part.text) {
  console.log(`[${connection.deviceId}] [Thought] ${part.text}`);
- } else if (part.text) {
- // Accumulate Jellyberry's spoken words for rolling session memory
- const entry = `Jellyberry: ${part.text.trim()}`;
+ }
+ }
+ }
+
+ // Handle output audio transcription — arrives as a separate message from native audio models.
+ // This is Jellyberry's spoken words as text, used for rolling session memory.
+ if (json.serverContent?.outputTranscription?.text) {
+ const entry = `Jellyberry: ${json.serverContent.outputTranscription.text.trim()}`;
  connection.sessionTranscript = ((connection.sessionTranscript || "") + "\n" + entry).slice(-2000);
- }
- }
  }
  
  // Handle turn complete (generationComplete is Gemini's newer equivalent of turnComplete).

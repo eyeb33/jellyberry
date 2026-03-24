@@ -1608,10 +1608,7 @@ function connectToGemini(connection: ClientConnection) {
  // complex turns, negligible on simple ones where the model skips thinking.
  thinkingConfig: {
  thinkingBudget: 1024
- },
- // Request text transcription of Jellyberry's audio output.
- // Arrives as serverContent.outputTranscription.text — used for session memory.
- outputAudioTranscription: {}
+ }
  },
  realtimeInputConfig: {
   automaticActivityDetection: { disabled: true }

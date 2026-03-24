@@ -1067,10 +1067,10 @@ async function handleStopRadio(_args: FuncArgs, conn: ClientConnection): Promise
 async function handleSetVolumeLevel(args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
   const level = Math.max(1, Math.min(10, ((args.level as number) || 5)));
   console.log(`[${conn.deviceId}] set_volume_level: ${level}`);
-  // Send immediately so the volume is applied before Gemini speaks its confirmation —
-  // the user hears the confirmation at the new level, not the old one.
-  conn.socket.send(JSON.stringify({ type: "functionCall", name: "set_volume_level", args: { level } }));
-  return { success: true, message: `Volume set to level ${level} (${level * 10}%)` };
+  // Defer until after Gemini finishes speaking to avoid mid-sentence volume jumps.
+  // Audio chunks for the current response may already be streaming when this fires.
+  conn.pendingModeMessage = { type: "functionCall", name: "set_volume_level", args: { level } };
+  return { success: true, message: `Volume set to level ${level} (${level * 10}%). Confirm to the user.` };
 }
 
 // Maps Gemini funcName → handler. Unknown tools return { success: false, error: ... }.
@@ -1637,7 +1637,9 @@ The user is in the UK (Europe/London timezone). When you need the current date o
 
 The device also supports: ambient sounds (rain, ocean, rainforest, fire), guided chakra meditation with breathing, lamp mode (white/red/green/blue), Pomodoro timers, alarms, and countdown timers. Use the right function when asked — and do it naturally, as part of the conversation, not as a separate announcement.
 
-Device self-awareness: before answering any question about what the device is currently doing — Pomodoro, meditation, ambient sound, lamp, timers, alarms, or volume level — call get_device_state. Do not guess or assume the device state. Use the returned data to respond accurately. This applies to questions like "how long is left?", "what alarms do I have?", "is anything playing?", "what session am I in?", "is the lamp on?", "what volume am I at?", etc.${memoryContext}`
+Device self-awareness: before answering any question about what the device is currently doing — Pomodoro, meditation, ambient sound, lamp, timers, alarms, or volume level — call get_device_state. Do not guess or assume the device state. Use the returned data to respond accurately. This applies to questions like "how long is left?", "what alarms do I have?", "is anything playing?", "what session am I in?", "is the lamp on?", "what volume am I at?", etc.
+
+Volume control: when the user asks to change volume in ANY way ("louder", "quieter", "volume four", "turn it down", "set volume to 7" etc.), you MUST call set_volume_level. Never verbally confirm a volume change without having called the function — saying it without calling it has no effect on the hardware.${memoryContext}`
  }]
  },
  tools: [{

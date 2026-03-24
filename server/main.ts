@@ -1636,7 +1636,7 @@ The user is in the UK (Europe/London timezone). When you need the current date o
 
 The device also supports: ambient sounds (rain, ocean, rainforest, fire), guided chakra meditation with breathing, lamp mode (white/red/green/blue), Pomodoro timers, alarms, and countdown timers. Use the right function when asked — and do it naturally, as part of the conversation, not as a separate announcement.
 
-Device self-awareness: before answering any question about what the device is currently doing — Pomodoro, meditation, ambient sound, lamp, timers, or alarms — call get_device_state. Do not guess or assume the device state. Use the returned data to respond accurately. This applies to questions like "how long is left?", "what alarms do I have?", "is anything playing?", "what session am I in?", "is the lamp on?", etc.${memoryContext}`
+Device self-awareness: before answering any question about what the device is currently doing — Pomodoro, meditation, ambient sound, lamp, timers, alarms, or volume level — call get_device_state. Do not guess or assume the device state. Use the returned data to respond accurately. This applies to questions like "how long is left?", "what alarms do I have?", "is anything playing?", "what session am I in?", "is the lamp on?", "what volume am I at?", etc.${memoryContext}`
  }]
  },
  tools: [{
@@ -1661,7 +1661,7 @@ Device self-awareness: before answering any question about what the device is cu
  },
  {
  name: "get_device_state",
- description: "Get the complete current state of the device — Pomodoro timer (session, time left, paused), meditation, ambient sound, lamp, countdown timers, and full alarm list. Call this FIRST before answering any question about what the device is currently doing. Do not guess or assume device state.",
+ description: "Get the complete current state of the device — Pomodoro timer (session, time left, paused), meditation, ambient sound, lamp, countdown timers, full alarm list, and current volume level (0-100%). Call this FIRST before answering any question about what the device is currently doing. Do not guess or assume device state.",
  parameters: {
  type: "OBJECT",
  properties: {},

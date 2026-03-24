@@ -2076,18 +2076,15 @@ Device self-awareness: before answering any question about what the device is cu
  connection.turnAudioBytes = (connection.turnAudioBytes || 0) + totalBytesSent;
  }
  
- // Thoughts are logged server-side only; regular response text is dropped (delivered as audio).
+ // Thoughts are logged and accumulated for session memory.
+ // Native audio models don't expose output transcription, but thought parts
+ // contain rich contextual summaries of every turn — ideal for carry-forward context.
  if (part.thought && part.text) {
  console.log(`[${connection.deviceId}] [Thought] ${part.text}`);
- }
- }
- }
-
- // Handle output audio transcription — arrives as a separate message from native audio models.
- // This is Jellyberry's spoken words as text, used for rolling session memory.
- if (json.serverContent?.outputTranscription?.text) {
- const entry = `Jellyberry: ${json.serverContent.outputTranscription.text.trim()}`;
+ const entry = part.text.trim();
  connection.sessionTranscript = ((connection.sessionTranscript || "") + "\n" + entry).slice(-2000);
+ }
+ }
  }
  
  // Handle turn complete (generationComplete is Gemini's newer equivalent of turnComplete).

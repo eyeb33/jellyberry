@@ -65,7 +65,6 @@ volatile int32_t currentAudioLevel = 0;  // Current audio amplitude - volatile: 
 volatile float smoothedAudioLevel = 0.0f;  // Smoothed audio level - volatile: written by ledTask
 volatile bool conversationMode = false;  // Track if we're in conversation window
 uint32_t conversationWindowStart = 0;  // Timestamp when conversation window opened
-bool conversationRecording = false;  // Track if current recording was triggered from conversation mode
 volatile bool recordingStartSent = false;    // Track if recordingStart state message has been sent for current recording
 
 // ---- I2S_NUM_0 ownership ----
@@ -830,7 +829,6 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 if (!recordingActive) {
                     responseInterrupted = false;
-                    conversationRecording = false;
                     tideState.active = false;  // New question - clear viz state
                     moonState.active = false;
                     recordingActive = true;
@@ -913,7 +911,6 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 if (!recordingActive) {
                     responseInterrupted = false;
-                    conversationRecording = false;
                     recordingActive = true;
                     recordingStartTime = millis();
                     lastVoiceActivityTime = millis();
@@ -1342,6 +1339,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             
             // Update state
             ambientSound.sequence++;
+            ambientSound.drainUntil = 0;  // Clear drain timer — new sound is intentional, not stale
             isPlayingAmbient = true;
             isPlayingResponse = false;
             firstAudioChunk = true;
@@ -1369,7 +1367,6 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                     if (!recordingActive) {
                         responseInterrupted = false;
-                        conversationRecording = false;
                         tideState.active = false;
                         moonState.active = false;
                         if (ambientSound.drainUntil > 0) { ambientSound.drainUntil = 0; }
@@ -1656,7 +1653,6 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             // Start recording (mutex-protected)
             if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 responseInterrupted = false;
-                conversationRecording = false;
                 tideState.active = false;
                 moonState.active = false;
                 recordingActive = true;
@@ -1686,7 +1682,6 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             
             // Clear all previous state
             responseInterrupted = false;
-            conversationRecording = false;  // Button press = normal recording timeout
             tideState.active = false;
             moonState.active = false;
             // DON'T clear timer or Pomodoro - let them run in background and return after interaction
@@ -1747,7 +1742,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
     if (recordingActive && (millis() - lastVoiceActivityTime) > VAD_SILENCE_MS) {
         if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             recordingActive = false;
-            conversationRecording = false;  // Reset flag for next recording
+            recordingStartSent = false;  // Clear flag to ensure next recording sends state
             xSemaphoreGive(recordingMutex);
         }
         wsSendMessage("{\"type\":\"recordingStop\"}");
@@ -1861,7 +1856,10 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
     // ambientComplete messages — not via this drain timer. Using the Gemini-only timer
     // (lastGeminiAudioTime) in those states causes an immediate drain cycle because
     // lastGeminiAudioTime is never updated by ambient/radio (0xA5 0x5A) packets.
-    if (isPlayingResponse && !(isPlayingAmbient &&
+    // CRITICAL: Skip drain entirely when radio is active (prevents stale lastGeminiAudioTime
+    // from triggering immediate drain when radio resumes after Gemini response).
+    bool skipDrainCheck = isPlayingAmbient && radioState.active;
+    if (isPlayingResponse && !skipDrainCheck && !(isPlayingAmbient &&
             convState != ConvState::WAITING && convState != ConvState::PLAYING)) {
         // Transition to PLAYING as soon as audio is confirmed active (cancels thinking animation)
         if (convState == ConvState::WAITING) {
@@ -2184,7 +2182,8 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             
             // Guard: ignore VAD for first 1200ms after window opens to let speaker resonance die down.
             // Threshold raised to 900 below provides backup EMI protection; keep guard short for responsiveness.
-            const uint32_t VAD_GUARD_MS = 1200;
+            // Extended to 3000ms when radio is active (speaker continuously playing, higher EMI risk).
+            const uint32_t VAD_GUARD_MS = radioState.active ? 3000 : 1200;
             
             // Safety: don't start recording if alarm is active
             if (isPlayingAlarm) {
@@ -2199,7 +2198,6 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 
                 // Exit conversation mode and start recording
                 conversationMode = false;
-                conversationRecording = true;
                 tideState.active = false;   // New question - clear viz state so it doesn't re-display
                 moonState.active = false;
                 if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {

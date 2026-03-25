@@ -1274,7 +1274,13 @@ async function handleActionRequestRadio(data: Record<string, unknown>, conn: Cli
         console.log(`[${conn.deviceId}] Radio stream ended: ${stationName} (${totalChunks} chunks)`);
         conn.socket.send(JSON.stringify({ type: "radioEnded", stationName }));
       }
-    } else { console.log(`[${conn.deviceId}] Radio stream cancelled: ${stationName} (${totalChunks} chunks)`); }
+    } else {
+      console.log(`[${conn.deviceId}] Radio stream cancelled: ${stationName} (${totalChunks} chunks)`);
+      // Send radioEnded on cancellation so firmware clears radio state
+      if (conn.socket.readyState === WebSocket.OPEN) {
+        conn.socket.send(JSON.stringify({ type: "radioEnded", stationName }));
+      }
+    }
     conn.radioStreamCancel = null; conn.radioProcess = null;
   } catch (err) {
     console.error(`[${conn.deviceId}] Radio stream error:`, err);
@@ -1328,6 +1334,9 @@ async function handleTypeFunctionResponse(data: Record<string, unknown>, conn: C
 }
 
 async function handleTypeRecordingStart(data: Record<string, unknown>, conn: ClientConnection): Promise<void> {
+  // Always reset the dedup flag at the start of a new turn to prevent stale-true from
+  // suppressing generationComplete if the previous turn never completed cleanly.
+  conn.turnCompleteFired = false;
   conn.deviceState = data as Record<string, unknown>;
   conn.lastUserActivity = Date.now();
   if (!conn.geminiSocket || conn.geminiSocket.readyState !== WebSocket.OPEN) {

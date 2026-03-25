@@ -47,7 +47,7 @@ volatile bool isPlayingResponse = false;
 volatile bool isPlayingAmbient = false; // Track ambient sound playback separately
 bool isPlayingAlarm = false; // Track alarm sound playback
 volatile bool turnComplete = false; // Track when Gemini has finished its turn
-bool responseInterrupted = false; // Flag to ignore audio after interrupt
+volatile bool responseInterrupted = false; // Flag to ignore audio after interrupt - volatile: read by audio/websocket tasks
 bool shutdownSoundPlayed = false; // Flag to prevent repeated shutdown sounds during reconnection
 uint32_t recordingStartTime = 0;
 uint32_t lastVoiceActivityTime = 0;
@@ -119,6 +119,9 @@ SemaphoreHandle_t i2sSpeakerMutex = NULL;
 // WebSocket send mutex - serialises all sendTXT calls across websocketTask, audioTask, and loop()
 // Without this, concurrent sends from different tasks corrupt the TCP frame buffer and cause disconnects.
 SemaphoreHandle_t wsSendMutex = NULL;
+
+// Recording state mutex - prevents race conditions on recordingActive flag between main loop and audioTask VAD
+SemaphoreHandle_t recordingMutex = NULL;
 
 // Ambient sound state
 AmbientSound ambientSound = {"", false, 0, 0, 0};
@@ -271,6 +274,13 @@ void setup() {
  wsSendMutex = xSemaphoreCreateMutex();
  if (wsSendMutex == NULL) {
  Serial.println("FATAL: Failed to create WS send mutex - halting!");
+ while (true) { delay(1000); }
+ }
+
+ // Create recording state mutex to prevent race conditions between button handlers and VAD
+ recordingMutex = xSemaphoreCreateMutex();
+ if (recordingMutex == NULL) {
+ Serial.println("FATAL: Failed to create recording mutex - halting!");
  while (true) { delay(1000); }
  }
 
@@ -729,6 +739,13 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         startPressed = startTouch;
         stopPressed = stopTouch;
         
+        // Guard against simultaneous button press (user error or hardware glitch)
+        if (startRisingEdge && stopRisingEdge) {
+            Serial.println("Both buttons pressed simultaneously - ignoring");
+            lastDebounceTime = millis();
+            return;
+        }
+        
         // Track press start times
         if (stopRisingEdge) {
             button2PressStart = millis();
@@ -739,8 +756,9 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         }
         
         // Button 2 long-press: Return to IDLE and start Gemini recording (from any mode)
+        // Use signed arithmetic to handle millis() overflow after 49 days uptime
         if (stopFallingEdge && !recordingActive && 
-            (millis() - button2PressStart) >= BUTTON2_LONG_PRESS) {
+            ((int32_t)(millis() - button2PressStart)) >= BUTTON2_LONG_PRESS) {
             Serial.printf("Button 2 long-press (%lu ms): Returning to IDLE + starting recording\n",
                          millis() - button2PressStart);
             
@@ -808,19 +826,23 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             // Return to IDLE and start recording immediately
             currentLEDMode = LED_IDLE;
             
-            // Start Gemini recording
-            responseInterrupted = false;
-            conversationRecording = false;
-            tideState.active = false;  // New question - clear viz state
-            moonState.active = false;
-            recordingActive = true;
-            recordingStartTime = millis();
-            lastVoiceActivityTime = millis();
-            transitionConvState(ConvState::RECORDING);
-            currentLEDMode = LED_RECORDING;
-            DEBUG_PRINTLN(" Recording started via button 2 long-press");
+            // Start Gemini recording (mutex-protected to prevent race with VAD/PREBUF)
+            if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                if (!recordingActive) {
+                    responseInterrupted = false;
+                    conversationRecording = false;
+                    tideState.active = false;  // New question - clear viz state
+                    moonState.active = false;
+                    recordingActive = true;
+                    recordingStartTime = millis();
+                    lastVoiceActivityTime = millis();
+                    transitionConvState(ConvState::RECORDING);
+                    currentLEDMode = LED_RECORDING;
+                    DEBUG_PRINTLN(" Recording started via button 2 long-press");
+                }
+                xSemaphoreGive(recordingMutex);
+            }
             
-            stopPressed = stopTouch;
             lastDebounceTime = millis();
             return;  // Skip normal button handling
         }
@@ -829,7 +851,8 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         // Short presses in mode-specific handlers (ambient cycle, meditation chakra etc.) fire on
         // the rising edge before this falling-edge check, which is fine — the escape cancels any
         // audio they requested.
-        if (startFallingEdge && (millis() - button1PressStart) >= LONG_PRESS_MS) {
+        // Use signed arithmetic to handle millis() overflow after 49 days uptime
+        if (startFallingEdge && ((int32_t)(millis() - button1PressStart)) >= LONG_PRESS_MS) {
             Serial.printf("Button 1 long-press (%lu ms): escaping to chat mode\n",
                          millis() - button1PressStart);
             
@@ -887,13 +910,16 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             }
             
             // Start recording. If Pomodoro already started one on the rising edge, keep it.
-            if (!recordingActive) {
-                responseInterrupted = false;
-                conversationRecording = false;
-                recordingActive = true;
-                recordingStartTime = millis();
-                lastVoiceActivityTime = millis();
-                transitionConvState(ConvState::RECORDING);
+            if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                if (!recordingActive) {
+                    responseInterrupted = false;
+                    conversationRecording = false;
+                    recordingActive = true;
+                    recordingStartTime = millis();
+                    lastVoiceActivityTime = millis();
+                    transitionConvState(ConvState::RECORDING);
+                }
+                xSemaphoreGive(recordingMutex);
             }
             currentLEDMode = LED_RECORDING;
             Serial.println("Button 1 long-press: entering chat recording mode");
@@ -907,14 +933,14 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         // Allow during ambient modes, block only during Gemini responses (non-ambient)
 
         // Radio streaming: short press toggles VU visualizer, doesn't cycle mode
-        bool radioVisualToggled = false;
         if (stopRisingEdge && !recordingActive && currentLEDMode == LED_RADIO && radioState.active && radioState.streaming) {
             radioState.visualsActive = !radioState.visualsActive;
             Serial.printf("Radio VU visuals: %s\n", radioState.visualsActive ? "ON" : "OFF");
-            radioVisualToggled = true;
+            lastDebounceTime = millis();
+            return;  // Early return to prevent mode cycle handler from also firing
         }
 
-        if (!radioVisualToggled && stopRisingEdge && !recordingActive &&
+        if (stopRisingEdge && !recordingActive &&
             !(isPlayingResponse && !isPlayingAmbient)) {
             // Stop any current ambient playback
             if (isPlayingAmbient) {
@@ -1271,13 +1297,14 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         // Display-only modes: Button 1 disabled (button 2 advances to next mode)
         if ((currentLEDMode == LED_AMBIENT_VU || currentLEDMode == LED_SEA_GOOSEBERRY || currentLEDMode == LED_EYES) && startRisingEdge) {
             DEBUG_PRINTLN("Button 1 disabled in this mode - use button 2 to advance");
-            // Do nothing - button 1 is disabled in display-only modes
+            return;  // Early return for consistency
         }
         // Ambient mode: Button 1 cycles to ambient sounds
         else {
             static uint32_t lastAmbientCycle = 0;
+            // Longer debounce (500ms) to prevent accidental double-tap when user wants to cycle sounds
             if (currentLEDMode == LED_AMBIENT && startRisingEdge &&
-                (millis() - lastAmbientCycle) > 500) {  // 500ms debounce
+                (millis() - lastAmbientCycle) > AMBIENT_CYCLE_DEBOUNCE_MS) {
             lastAmbientCycle = millis();
             
             // Stop current audio (if any)
@@ -1338,17 +1365,22 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         // Pomodoro mode: Button 1 short press starts recording immediately for VU feedback.
         // Long press is handled by the universal Button 1 long-press handler above.
         if (currentLEDMode == LED_POMODORO && pomodoroState.active) {
-            if (startRisingEdge && !recordingActive && !isPlayingResponse && !isPlayingAmbient && !conversationMode && !alarmState.ringing) {
-                responseInterrupted = false;
-                conversationRecording = false;
-                tideState.active = false;
-                moonState.active = false;
-                if (ambientSound.drainUntil > 0) { ambientSound.drainUntil = 0; }
-                recordingActive = true;
-                recordingStartTime = millis();
-                lastVoiceActivityTime = millis();
-                currentLEDMode = LED_RECORDING;
-                DEBUG_PRINTLN("Pomodoro button pressed - recording + VU active");
+            if (startRisingEdge && !isPlayingResponse && !isPlayingAmbient && !conversationMode && !alarmState.ringing) {
+                if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    if (!recordingActive) {
+                        responseInterrupted = false;
+                        conversationRecording = false;
+                        tideState.active = false;
+                        moonState.active = false;
+                        if (ambientSound.drainUntil > 0) { ambientSound.drainUntil = 0; }
+                        recordingActive = true;
+                        recordingStartTime = millis();
+                        lastVoiceActivityTime = millis();
+                        currentLEDMode = LED_RECORDING;
+                        DEBUG_PRINTLN("Pomodoro button pressed - recording + VU active");
+                    }
+                    xSemaphoreGive(recordingMutex);
+                }
             }
         }
         
@@ -1462,7 +1494,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             }
         }
         // Interrupt feature: START button during active playback stops audio and starts recording
-        // Only interrupt if we've received audio recently (within 500ms) and turn is not complete
+        // Only interrupt if we've received audio recently (INTERRUPT_AUDIO_TIMEOUT_MS) and turn is not complete
         // Note: Pomodoro now allowed - button 1 can interrupt responses during Pomodoro
         // Guard !isPlayingAmbient: radio/ambient streams set isPlayingResponse=true via the
         // prebuffer check, but they are NOT interruptible Gemini responses. Without this guard
@@ -1471,22 +1503,28 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         // corrupting the DMA descriptor chain and triggering a Guru Meditation crash.
         else if (!meditationHandled && currentLEDMode != LED_MEDITATION && startRisingEdge &&
             isPlayingResponse && !isPlayingAmbient && !turnComplete &&
-            (millis() - lastAudioChunkTime) < 500) {
+            (millis() - lastAudioChunkTime) < INTERRUPT_AUDIO_TIMEOUT_MS) {
             DEBUG_PRINTLN("  Interrupted response - starting new recording");
             responseInterrupted = true;  // Flag to ignore remaining audio chunks
             isPlayingResponse = false;
             i2sZeroSafe();  // Mutex-guarded — Gemini speech may be mid-write in audioTask
             tideState.active = false;
             moonState.active = false;
-            recordingActive = true;
-            recordingStartTime = millis();
-            lastVoiceActivityTime = millis();
-            transitionConvState(ConvState::RECORDING);
+            if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                recordingActive = true;
+                recordingStartTime = millis();
+                lastVoiceActivityTime = millis();
+                transitionConvState(ConvState::RECORDING);
+                xSemaphoreGive(recordingMutex);
+            }
             currentLEDMode = LED_RECORDING;
             DEBUG_PRINT(" Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
+            lastDebounceTime = millis();
+            return;  // Early return for consistency
         }
         // ALARM MODE: Button 1 or 2 dismisses alarm
-        else if (currentLEDMode == LED_ALARM && alarmState.ringing && (startRisingEdge || stopRisingEdge)) {
+        // Guard: don't dismiss if meditation is handling button 1 (prevents double-action)
+        else if (!meditationHandled && currentLEDMode == LED_ALARM && alarmState.ringing && (startRisingEdge || stopRisingEdge)) {
             DEBUG_PRINTLN(" Alarm dismissed");
             
             // Clear alarm from memory
@@ -1533,7 +1571,10 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             
             // Restore recording state if it was active
             if (alarmState.wasRecording) {
-                recordingActive = true;
+                if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    recordingActive = true;
+                    xSemaphoreGive(recordingMutex);
+                }
                 DEBUG_PRINTLN("  Resuming recording");
             }
             
@@ -1584,6 +1625,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         // Pausing (not just ducking) avoids mixed-mode drain complexity and lets the
         // user ask Gemini to change station freely. Stream resumes after turn completes.
         // Guard convState==IDLE: don't re-record while already waiting for Gemini's response.
+        // Early return after recording start for consistency
         else if (!meditationHandled && currentLEDMode == LED_RADIO && radioState.active &&
                  startRisingEdge && !recordingActive && !conversationMode && convState == ConvState::IDLE) {
             // Stop the server-side stream
@@ -1605,17 +1647,22 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             radioState.streaming = false;   // clear stale flag — prevents volume restore logic
                                             // from reverting a set_volume_level change at resume
             Serial.println("Radio: stream paused for voice command");
-            // Start recording
-            responseInterrupted = false;
-            conversationRecording = false;
-            tideState.active = false;
-            moonState.active = false;
-            recordingActive = true;
-            recordingStartTime = millis();
-            lastVoiceActivityTime = millis();
-            transitionConvState(ConvState::RECORDING);
+            // Start recording (mutex-protected)
+            if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                responseInterrupted = false;
+                conversationRecording = false;
+                tideState.active = false;
+                moonState.active = false;
+                recordingActive = true;
+                recordingStartTime = millis();
+                lastVoiceActivityTime = millis();
+                transitionConvState(ConvState::RECORDING);
+                xSemaphoreGive(recordingMutex);
+            }
             currentLEDMode = LED_RECORDING;
             DEBUG_PRINT(" Radio recording started...\n");
+            lastDebounceTime = millis();
+            return;  // Early return for consistency
         }
         // Start recording on rising edge (normal case - not interrupting)
         // Block if: recording active, playing response, OR in ambient sound mode, OR conversation window is open,
@@ -1654,18 +1701,25 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
 
             tideState.active = false;  // New question - clear viz state so it doesn't re-display
             moonState.active = false;
-            recordingActive = true;
-            recordingStartTime = millis();
-            lastVoiceActivityTime = millis();
-            transitionConvState(ConvState::RECORDING);
+            if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                recordingActive = true;
+                recordingStartTime = millis();
+                lastVoiceActivityTime = millis();
+                transitionConvState(ConvState::RECORDING);
+                xSemaphoreGive(recordingMutex);
+            }
             currentLEDMode = LED_RECORDING;
             DEBUG_PRINT(" Recording started... (START=%d, STOP=%d)\n", startTouch, stopTouch);
             }  // End of shouldStartRecording block
         }
         
         // Stop recording only on timeout (manual stop removed - rely on VAD)
+        // Mutex-protected to prevent race with button handlers starting new recording
         if (recordingActive && (millis() - recordingStartTime) > MAX_RECORDING_DURATION_MS) {
-            recordingActive = false;
+            if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                recordingActive = false;
+                xSemaphoreGive(recordingMutex);
+            }
             wsSendMessage("{\"type\":\"recordingStop\"}");
             Serial.println("[WS] recordingStop sent");
             if (radioState.active) {
@@ -1683,11 +1737,15 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
     }
     
     // Auto-stop on silence (VAD)
+    // Mutex-protected to prevent race with button handlers
     if (recordingActive && (millis() - lastVoiceActivityTime) > VAD_SILENCE_MS) {
-        recordingActive = false;
+        if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            recordingActive = false;
+            conversationRecording = false;  // Reset flag for next recording
+            xSemaphoreGive(recordingMutex);
+        }
         wsSendMessage("{\"type\":\"recordingStop\"}");
         Serial.println("[WS] recordingStop sent");
-        conversationRecording = false;  // Reset flag for next recording
         if (radioState.active) {
             // Radio: return to radio display while waiting for Gemini
             currentLEDMode = LED_RADIO;
@@ -2132,10 +2190,13 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 conversationRecording = true;
                 tideState.active = false;   // New question - clear viz state so it doesn't re-display
                 moonState.active = false;
-                recordingActive = true;
-                recordingStartTime = millis();
-                lastVoiceActivityTime = millis();
-                transitionConvState(ConvState::RECORDING);
+                if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    recordingActive = true;
+                    recordingStartTime = millis();
+                    lastVoiceActivityTime = millis();
+                    transitionConvState(ConvState::RECORDING);
+                    xSemaphoreGive(recordingMutex);
+                }
                 currentLEDMode = LED_RECORDING;
                 lastDebounceTime = millis();
                 
@@ -2927,10 +2988,13 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 // was always 0 and isPlayingResponse was never set for zen bell / ambient
                 // streams that arrive near their consumption rate.
                 if (!isPlayingResponse) {
-                    // CRITICAL: Stop recording immediately when response arrives
+                    // CRITICAL: Stop recording immediately when response arrives (mutex-protected)
                     if (recordingActive) {
                         Serial.println("Stopping recording - response arriving");
-                        recordingActive = false;
+                        if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                            recordingActive = false;
+                            xSemaphoreGive(recordingMutex);
+                        }
                     }
 
                     uint32_t queueDepth = uxQueueMessagesWaiting(audioOutputQueue);
@@ -2950,7 +3014,10 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                         // for short responses like the boot greeting). Instead, turnComplete is
                         // reset at recordingStart (when the user begins a new turn).
 
-                        recordingActive = false;  // Ensure recording is stopped
+                        if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                            recordingActive = false;  // Ensure recording is stopped
+                            xSemaphoreGive(recordingMutex);
+                        }
 
                         // Show VU meter during Gemini playback, keep current mode for ambient/alarm
                         if (!ambientSound.active && !isPlayingAlarm) {

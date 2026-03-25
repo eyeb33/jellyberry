@@ -22,7 +22,7 @@ extern SemaphoreHandle_t       i2sSpeakerMutex;
 extern LEDMode    currentLEDMode;
 
 extern volatile bool turnComplete;
-extern bool     responseInterrupted;
+extern volatile bool responseInterrupted;
 extern bool     firstAudioChunk;
 extern bool     isPlayingAlarm;
 extern volatile bool  recordingActive;

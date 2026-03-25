@@ -19,7 +19,7 @@ extern SemaphoreHandle_t       ledMutex;
 extern SemaphoreHandle_t       wsSendMutex;
 extern SemaphoreHandle_t       i2sSpeakerMutex;
 
-extern LEDMode    currentLEDMode;
+extern volatile LEDMode    currentLEDMode;
 
 extern volatile bool turnComplete;
 extern volatile bool responseInterrupted;

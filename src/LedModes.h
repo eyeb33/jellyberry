@@ -7,7 +7,7 @@
 
 // ── Globals defined in main.cpp that LED mode renderers read ──
 extern CRGB                    leds[];
-extern LEDMode                 currentLEDMode;
+extern volatile LEDMode        currentLEDMode;
 extern volatile float          smoothedAudioLevel;
 extern volatile int32_t        currentAudioLevel;
 extern volatile int32_t        ambientMicRows;

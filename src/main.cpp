@@ -66,7 +66,7 @@ volatile float smoothedAudioLevel = 0.0f;  // Smoothed audio level - volatile: w
 volatile bool conversationMode = false;  // Track if we're in conversation window
 uint32_t conversationWindowStart = 0;  // Timestamp when conversation window opened
 bool conversationRecording = false;  // Track if current recording was triggered from conversation mode
-bool recordingStartSent = false;    // Track if recordingStart state message has been sent for current recording
+volatile bool recordingStartSent = false;    // Track if recordingStart state message has been sent for current recording
 
 // ---- I2S_NUM_0 ownership ----
 // audioTask is the SOLE caller of i2s_read(I2S_NUM_0). Other tasks must NOT call it directly.
@@ -95,7 +95,7 @@ QueueHandle_t audioOutputQueue; // Queue for playback audio
 // Tuning: Increase for more buffer (higher latency), decrease for lower latency (more underruns)
 // AUDIO_QUEUE_SIZE is defined in Config.h
 
-LEDMode currentLEDMode = LED_IDLE;  // Start directly in idle mode
+volatile LEDMode currentLEDMode = LED_IDLE;  // Start directly in idle mode
 bool isAmbientVUMode = false;  // Toggle for ambient sound VU meter mode
 
 // Ambient sound type (for cycling within AMBIENT mode)
@@ -1638,6 +1638,12 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             }
             // Drain local audio queue and silence I2S
             { AudioChunk dummy; while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {} }
+            // Early check: if recording started during stopAmbient send, skip pause
+            if (recordingActive) {
+                Serial.println("Radio: recording started before pause - skipping");
+                lastDebounceTime = millis();
+                return;
+            }
             i2sZeroSafe();
             isPlayingAmbient = false;
             isPlayingResponse = false;
@@ -2574,7 +2580,10 @@ void audioTask(void * parameter) {
                     int32_t avgAmp = sumAbs / samples;
                     if (avgAmp > VAD_CONVERSATION_THRESHOLD) {
                         currentAudioLevel = avgAmp;
-                        conversationVADDetected = true;  // loop() checks this flag
+                        // Atomic test-and-set: prevents double-set if loop() hasn't cleared yet
+                        if (!conversationVADDetected) {
+                            conversationVADDetected = true;  // loop() checks this flag
+                        }
                     }
                 }
                 
@@ -3115,13 +3124,16 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 
 // ============== LED CONTROLLER ==============
 void updateLEDs() {
+    // Snapshot currentLEDMode early to prevent tearing if loop() changes mode mid-render
+    LEDMode mode = currentLEDMode;
+    
     // Seed smoothedAudioLevel immediately when recording starts, bypassing the EMA
     // ramp-up from zero so the VU meter responds on the very first frame.
     static LEDMode prevLEDMode = LED_IDLE;
-    if (currentLEDMode == LED_RECORDING && prevLEDMode != LED_RECORDING) {
+    if (mode == LED_RECORDING && prevLEDMode != LED_RECORDING) {
         smoothedAudioLevel = (float)currentAudioLevel;
     }
-    prevLEDMode = currentLEDMode;
+    prevLEDMode = mode;
 
  // Smooth the audio level with exponential moving average
 // Fast rise (α=0.5, ~43ms time constant) so peaks track speech closely.
@@ -3138,17 +3150,17 @@ void updateLEDs() {
  }
  }
  
- // When transitioning away from AUDIO_REACTIVE, quickly fade out any residual levels
- if (currentLEDMode != LED_AUDIO_REACTIVE && currentLEDMode != LED_RECORDING && 
- currentLEDMode != LED_AMBIENT_VU && smoothedAudioLevel > 0) {
- smoothedAudioLevel *= 0.4f; // Very rapid fade
- if (smoothedAudioLevel < 5) {
- smoothedAudioLevel = 0;
- currentAudioLevel = 0;
- }
- }
+    // When transitioning away from AUDIO_REACTIVE, quickly fade out any residual levels
+    if (mode != LED_AUDIO_REACTIVE && mode != LED_RECORDING && 
+        mode != LED_AMBIENT_VU && smoothedAudioLevel > 0) {
+        smoothedAudioLevel *= 0.4f; // Very rapid fade
+        if (smoothedAudioLevel < 5) {
+            smoothedAudioLevel = 0;
+            currentAudioLevel = 0;
+        }
+    }
 
-    switch(currentLEDMode) {
+    switch(mode) {
         case LED_BOOT:            renderLedBoot(leds);              break;
         case LED_IDLE:            renderLedIdle(leds);              break;
         case LED_RECORDING:       renderLedRecording(leds);         break;

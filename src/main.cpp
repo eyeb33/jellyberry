@@ -2067,13 +2067,15 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             } else {
                 // Same persistent-mode guard as the PLAYING path — prevents spurious
                 // conversation windows popping up over radio/meditation/lamp.
+                // Check both LED mode AND underlying state flags (LED can be transient).
                 bool isPersistentMode = (currentLEDMode == LED_MEDITATION ||
                                          currentLEDMode == LED_AMBIENT   ||
                                          currentLEDMode == LED_RADIO     ||
                                          currentLEDMode == LED_LAMP      ||
                                          currentLEDMode == LED_POMODORO  ||
-                                         radioState.active              ||
-                                         meditationState.active         ||
+                                         ambientSound.active              ||  // Ambient may be in VU mode during confirmation
+                                         radioState.active                ||  // Radio may be in AUDIO_REACTIVE during Gemini response
+                                         meditationState.active           ||
                                          lampState.active);
                 if (isPersistentMode) {
                     Serial.printf("turnComplete in WAITING state - persistent mode %d, skipping window\n", currentLEDMode);
@@ -2100,13 +2102,15 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             // turnComplete arrived after audio already drained (device stayed in PLAYING).
             // Decide whether to open a conversation window or return to a persistent mode.
             LEDMode effectiveMode = currentLEDMode;
+            // Check both LED mode AND underlying state flags (LED can be transient).
             bool isPersistentMode = (effectiveMode == LED_MEDITATION ||
                                      effectiveMode == LED_AMBIENT   ||
                                      effectiveMode == LED_RADIO     ||
                                      effectiveMode == LED_LAMP      ||
                                      effectiveMode == LED_POMODORO  ||
-                                     radioState.active              ||  // Radio discovery mode (LED may be PROCESSING)
-                                     meditationState.active         ||
+                                     ambientSound.active              ||  // Ambient may show LED_AUDIO_REACTIVE during confirmation
+                                     radioState.active                ||  // Radio discovery mode (LED may be PROCESSING)
+                                     meditationState.active           ||
                                      lampState.active);
             if (!isPersistentMode) {
                 Serial.printf("turnComplete in PLAYING state (LED=%d) - opening conversation window\n", effectiveMode);
@@ -2154,6 +2158,8 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
     }
     
     // Conversation window monitoring
+    // Guard: don't expire window while audio is actively playing — the window should
+    // wait until audio finishes draining before evaluating timeout.
     if (conversationMode && !isPlayingResponse && !recordingActive && !alarmState.ringing) {
         uint32_t elapsed = millis() - conversationWindowStart;
         
@@ -3069,6 +3075,15 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                          disconnectCount, isPlayingResponse, recordingActive, millis()/1000);
             isWebSocketConnected = false;
             
+            // Clear Gemini session state to prevent stale flags from previous session
+            turnComplete = false;  // Prevent spurious conversation window on reconnect
+            transitionConvState(ConvState::IDLE);  // Reset conversation state machine
+            
+            // Clear session-scoped visualizations (tide/moon/timer persist across reconnects)
+            tideState.active = false;
+            moonState.active = false;
+            // Note: Keep timer and alarm state — those should persist across reconnections
+            
             // Pause ambient playback but keep mode state for resume on reconnect
             if (isPlayingAmbient || ambientSound.active) {
                 Serial.printf("Pausing ambient sound due to disconnect: %s (will resume)\n", ambientSound.name);
@@ -3138,6 +3153,7 @@ void updateLEDs() {
         case LED_IDLE:            renderLedIdle(leds);              break;
         case LED_RECORDING:       renderLedRecording(leds);         break;
         case LED_PROCESSING:      renderLedProcessing(leds);        break;
+        case LED_RECONNECTING:    renderLedReconnecting(leds);      break;
         case LED_AMBIENT_VU:      renderLedAmbientVU(leds);         break;
         case LED_AUDIO_REACTIVE:  renderLedAudioReactive(leds);     break;
         case LED_TIDE:            renderLedTide(leds);              break;

@@ -20,6 +20,7 @@ void transitionConvState(ConvState newState) {
         case ConvState::RECORDING:
             waitingEnteredAt = 0;
             turnComplete = false;  // prevent stale-flag window open before first mic DMA chunk
+            responseInterrupted = false;  // Clear stale interrupt flag from previous turn
             break;
         case ConvState::WAITING:
             waitingEnteredAt = millis();
@@ -64,13 +65,14 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
  
  // Handle lazy-reconnect in-progress signal: Gemini was idle and is reconnecting.
- // Show LED_PROCESSING so the user knows the device is working, not frozen.
- // convState stays IDLE (the button press that triggered this was dropped);
- // the user just needs to press again once reconnectComplete arrives.
+ // Show LED_RECONNECTING with distinct animation so the user knows the device is
+ // reconnecting, not processing their request. The button press that triggered
+ // this was dropped; the user just needs to press again once reconnectComplete arrives.
  if (strcmp(msgType, "reconnecting") == 0) {
- Serial.println("Gemini reconnecting after idle — showing connecting animation");
- currentLEDMode = LED_PROCESSING;
+ Serial.println("Gemini reconnecting after idle — showing reconnecting animation");
+ currentLEDMode = LED_RECONNECTING;
  transitionConvState(ConvState::IDLE);
+ turnComplete = false;  // Clear stale flag from previous session
  return;
  }
 
@@ -117,15 +119,12 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  Serial.println("Turn complete");
  }
  turnComplete = true; // Mark turn as finished
+ // Don't clear responseInterrupted here — it must persist until the user
+ // explicitly starts a new recording. Otherwise late-arriving audio chunks
+ // after the interrupt can leak into the new session.
  // Don't change LED mode here - let the audio finish playing naturally
  // isPlayingResponse will be set to false when audio actually stops
  // Conversation window will open after audio completes
- 
- // Clear interrupt flag - old turn is done, ready for new response
- if (responseInterrupted) {
- Serial.println("Old turn complete, cleared interrupt flag");
- responseInterrupted = false;
- }
  return;
  }
  

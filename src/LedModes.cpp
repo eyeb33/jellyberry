@@ -108,6 +108,19 @@ void renderLedProcessing(CRGB* leds) {
 }
 
 // ============================================================
+// LED_RECONNECTING (slow magenta pulse to indicate reconnection)
+// ============================================================
+void renderLedReconnecting(CRGB* leds) {
+    // Slow breathing pulse (3 second cycle)
+    float phase = (millis() % 3000) / 3000.0f;  // 0.0 to 1.0
+    float brightness = (sin(phase * TWO_PI - HALF_PI) + 1.0f) / 2.0f;  // 0.0 to 1.0 sine wave
+    uint8_t val = (uint8_t)(brightness * 180);  // Dim magenta (max 180/255)
+    
+    CRGB magenta = CRGB(val, 0, val);
+    fill_solid(leds, NUM_LEDS, magenta);
+}
+
+// ============================================================
 // LED_AMBIENT_VU  (green→yellow→red using mic rows computed by audioTask)
 // ============================================================
 void renderLedAmbientVU(CRGB* leds) {

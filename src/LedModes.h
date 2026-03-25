@@ -35,6 +35,7 @@ void renderLedBoot(CRGB* leds);
 void renderLedIdle(CRGB* leds);
 void renderLedRecording(CRGB* leds);
 void renderLedProcessing(CRGB* leds);
+void renderLedReconnecting(CRGB* leds);
 void renderLedAmbientVU(CRGB* leds);
 void renderLedAudioReactive(CRGB* leds);
 void renderLedTide(CRGB* leds);

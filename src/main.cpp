@@ -164,6 +164,7 @@ void playZenBell();
 void playShutdownSound();
 void playVolumeChime();
 void clearAudioAndLEDs();  // Helper to clear audio buffers and LEDs
+void escapeToIdle();          // Universal long-press teardown: stop all modes, start recording
 // Loop sub-tasks (defined just before loop())
 static void checkAlarms();
 static void handleFlashAnimations();
@@ -188,6 +189,77 @@ void clearAudioAndLEDs() {
  xSemaphoreGive(ledMutex);
  
  delay(50); // Let everything settle
+}
+
+// Universal long-press teardown: stop any active mode, return to IDLE, start recording.
+// Called by both PAD1 and PAD2 long-press handlers.
+void escapeToIdle() {
+    // Stop any active Gemini response
+    if (isPlayingResponse) {
+        responseInterrupted = true;
+        isPlayingResponse = false;
+    }
+
+    // Stop any active ambient/radio audio
+    if (isPlayingAmbient || radioState.active || ambientSound.active) {
+        JsonDocument stopDoc;
+        stopDoc["action"] = "stopAmbient";
+        String stopMsg;
+        serializeJson(stopDoc, stopMsg);
+        wsSendMessage(stopMsg);
+        AudioChunk dummy;
+        while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {}
+        i2sZeroSafe();
+        isPlayingAmbient = false;
+        ambientSound.active = false;
+        ambientSound.name[0] = '\0';
+        ambientSound.sequence++;
+    }
+
+    // Clear all active mode states
+    moonState.active = false;
+    tideState.active = false;
+    timerState.active = false;
+    isAmbientVUMode = false;
+
+    if (pomodoroState.active) {
+        pomodoroState.active = false;
+        pomodoroState.paused = false;
+        pomodoroState.startTime = 0;
+        pomodoroState.pausedTime = 0;
+    }
+    if (meditationState.active) {
+        meditationState.active = false;
+        meditationState.phaseStartTime = 0;
+        meditationState.streaming = false;
+        volumeMultiplier = meditationState.savedVolume;
+        Serial.printf("Volume restored to %.0f%%\n", volumeMultiplier * 100);
+    }
+    if (lampState.active) {
+        lampState.active = false;
+        lampState.fullyLit = false;
+    }
+    if (radioState.active) {
+        if (radioState.savedVolume > 0.05f) volumeMultiplier = radioState.savedVolume;
+        radioState.active = false;
+        radioState.streaming = false;
+        radioState.stationName[0] = '\0';
+        radioState.streamUrl[0] = '\0';
+    }
+
+    // Start recording (mutex-protected to prevent race with VAD/prebuffer)
+    currentLEDMode = LED_IDLE;
+    if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        if (!recordingActive) {
+            responseInterrupted = false;
+            recordingActive = true;
+            recordingStartTime = millis();
+            lastVoiceActivityTime = millis();
+            transitionConvState(ConvState::RECORDING);
+        }
+        xSemaphoreGive(recordingMutex);
+    }
+    currentLEDMode = LED_RECORDING;
 }
 
 // ============== DAY/NIGHT BRIGHTNESS CONTROL ==============
@@ -907,87 +979,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             ((int32_t)(millis() - button2PressStart)) >= BUTTON2_LONG_PRESS) {
             Serial.printf("Button 2 long-press (%lu ms): Returning to IDLE + starting recording\n",
                          millis() - button2PressStart);
-            
-            // Stop any active mode
-            if (isPlayingResponse) {
-                responseInterrupted = true;
-                isPlayingResponse = false;
-            }
-            if (isPlayingAmbient) {
-                JsonDocument stopDoc;
-                stopDoc["action"] = "stopAmbient";
-                String stopMsg;
-                serializeJson(stopDoc, stopMsg);
-                wsSendMessage(stopMsg);
-                isPlayingResponse = false;
-                isPlayingAmbient = false;
-                ambientSound.active = false;
-                ambientSound.name[0] = '\0';
-                ambientSound.sequence++;
-                { AudioChunk dummy; while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {} }
-                i2sZeroSafe();
-            }
-            
-            // Clear states
-            moonState.active = false;
-            tideState.active = false;
-            timerState.active = false;
-            isAmbientVUMode = false;
-            
-            // Clear Pomodoro
-            if (pomodoroState.active) {
-                pomodoroState.active = false;
-                pomodoroState.paused = false;
-                pomodoroState.startTime = 0;
-                pomodoroState.pausedTime = 0;
-            }
-            
-            // Clear Meditation
-            if (meditationState.active) {
-                Serial.println("CLEARING meditation state (button 2 long press)");
-                meditationState.active = false;
-                meditationState.phaseStartTime = 0;
-                meditationState.streaming = false;
-                volumeMultiplier = meditationState.savedVolume;  // Restore volume
-                Serial.printf("Volume restored to %.0f%%\n", volumeMultiplier * 100);
-            }
-            
-            // Clear Lamp
-            if (lampState.active) {
-                lampState.active = false;
-                lampState.fullyLit = false;
-            }
-            
-            // Clear Radio
-            if (radioState.active) {
-                if (radioState.savedVolume > 0.05f) {
-                    volumeMultiplier = radioState.savedVolume;
-                }
-                radioState.active = false;
-                radioState.streaming = false;
-                radioState.stationName[0] = '\0';
-                radioState.streamUrl[0] = '\0';
-            }
-            
-            // Return to IDLE and start recording immediately
-            currentLEDMode = LED_IDLE;
-            
-            // Start Gemini recording (mutex-protected to prevent race with VAD/PREBUF)
-            if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                if (!recordingActive) {
-                    responseInterrupted = false;
-                    tideState.active = false;  // New question - clear viz state
-                    moonState.active = false;
-                    recordingActive = true;
-                    recordingStartTime = millis();
-                    lastVoiceActivityTime = millis();
-                    transitionConvState(ConvState::RECORDING);
-                    currentLEDMode = LED_RECORDING;
-                    DEBUG_PRINTLN(" Recording started via button 2 long-press");
-                }
-                xSemaphoreGive(recordingMutex);
-            }
-            
+            escapeToIdle();
             lastDebounceTime = millis();
             return;  // Skip normal button handling
         }
@@ -1000,74 +992,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         if (startFallingEdge && ((int32_t)(millis() - button1PressStart)) >= LONG_PRESS_MS) {
             Serial.printf("Button 1 long-press (%lu ms): escaping to chat mode\n",
                          millis() - button1PressStart);
-            
-            // Interrupt any active Gemini response
-            if (isPlayingResponse) {
-                responseInterrupted = true;
-                isPlayingResponse = false;
-            }
-            
-            // Stop any active ambient/radio audio
-            if (isPlayingAmbient || radioState.active || ambientSound.active) {
-                JsonDocument stopDoc;
-                stopDoc["action"] = "stopAmbient";
-                String stopMsg;
-                serializeJson(stopDoc, stopMsg);
-                wsSendMessage(stopMsg);
-                AudioChunk dummy;
-                while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {}
-                i2sZeroSafe();
-                isPlayingAmbient = false;
-                ambientSound.active = false;
-                ambientSound.name[0] = '\0';
-                ambientSound.sequence++;
-            }
-            
-            // Clear all active mode states
-            moonState.active = false;
-            tideState.active = false;
-            timerState.active = false;
-            isAmbientVUMode = false;
-            
-            if (pomodoroState.active) {
-                pomodoroState.active = false;
-                pomodoroState.paused = false;
-                pomodoroState.startTime = 0;
-                pomodoroState.pausedTime = 0;
-            }
-            if (meditationState.active) {
-                meditationState.active = false;
-                meditationState.phaseStartTime = 0;
-                meditationState.streaming = false;
-                volumeMultiplier = meditationState.savedVolume;
-                Serial.printf("Volume restored to %.0f%%\n", volumeMultiplier * 100);
-            }
-            if (lampState.active) {
-                lampState.active = false;
-                lampState.fullyLit = false;
-            }
-            if (radioState.active) {
-                if (radioState.savedVolume > 0.05f) volumeMultiplier = radioState.savedVolume;
-                radioState.active = false;
-                radioState.streaming = false;
-                radioState.stationName[0] = '\0';
-                radioState.streamUrl[0] = '\0';
-            }
-            
-            // Start recording. If Pomodoro already started one on the rising edge, keep it.
-            if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                if (!recordingActive) {
-                    responseInterrupted = false;
-                    recordingActive = true;
-                    recordingStartTime = millis();
-                    lastVoiceActivityTime = millis();
-                    transitionConvState(ConvState::RECORDING);
-                }
-                xSemaphoreGive(recordingMutex);
-            }
-            currentLEDMode = LED_RECORDING;
-            Serial.println("Button 1 long-press: entering chat recording mode");
-            
+            escapeToIdle();
             lastDebounceTime = millis();
             return;
         }

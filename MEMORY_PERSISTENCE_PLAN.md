@@ -1,6 +1,6 @@
 # Memory Persistence Plan
 
-> **Status: Deferred** — implement as an isolated sprint once hardware assembly is stable and end-to-end device is reliable. All changes are server-only (`server/main.ts`), no firmware touchpoints.
+> **Status: Complete** — all phases implemented and pushed (commit `3e215de`, 26 Mar 2026). All changes were server-only (`server/main.ts`, `server/deno.json`), no firmware touchpoints.
 
 ---
 
@@ -70,29 +70,11 @@ We cannot extend the session, so instead we rebuild context on every reconnect b
 
 ## Implementation Steps
 
-### Phase 1 — Storage layer (foundation for all phases)
-1. Add Deno KV init: `const kv = await Deno.openKv()`
-2. `readHotMemory(): Promise<string>` — reads facts object, formats as bullets, caps at ~600 chars
-3. `updateFact(category, value)` — upserts into `["memory", "facts"]`
-4. `readColdMemory(daysBack: number): Promise<string>` — reads last N days of session summaries
-
-### Phase 2 — Context injection *(depends on Phase 1)*
-5. In `connectToGemini()`, call `readHotMemory()` before building `setupMessage`
-6. If non-empty, append as `"Memory:"` block in `systemInstruction`
-
-### Phase 3 — `store_memory` tool *(parallel with Phase 2)*
-7. Add `store_memory` to tool registry in `setupMessage`
-8. Add handler to `toolHandlers` map
-9. Update system prompt: instruct Jellyberry to call it naturally for persistent facts, not transient state
-
-### Phase 4 — `recall_sessions` tool *(parallel with Phase 2/3)*
-10. Add `recall_sessions` to tool registry
-11. Add handler calling `readColdMemory()`
-
-### Phase 5 — Session summary generation *(depends on Phase 1)*
-12. Add transcript log (text from `modelTurn` parts) to server session state
-13. In `proactiveRenew()`: summarise via Gemini REST if session had user speech
-14. Store in cold tier KV, prune >7 days old
+### Phase 1 — Storage layer ✅
+### Phase 2 — Context injection ✅
+### Phase 3 — `store_memory` tool ✅
+### Phase 4 — `recall_sessions` tool ✅
+### Phase 5 — Session summary generation ✅
 
 ---
 

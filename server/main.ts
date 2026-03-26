@@ -1718,17 +1718,36 @@ Deno.serve({ port: 8000, hostname: "0.0.0.0" }, (req: Request) => {
 });
 
 // Connect to Gemini Live API
-// Snapshot transcript → sessionMemory, persist to KV, then close the socket for renewal
+// Snapshot transcript → sessionMemory, generate cold-tier summary, persist to KV, then close socket
 async function performRenewal(connection: ClientConnection) {
- if (!connection.geminiSocket || connection.geminiSocket.readyState !== WebSocket.OPEN) return;
- if (connection.sessionTranscript) {
- connection.sessionMemory = connection.sessionTranscript;
- connection.sessionTranscript = "";
- console.log(`[${connection.deviceId}] [memory] Carrying forward (${connection.sessionMemory.length} chars):`);
- console.log(connection.sessionMemory);
- await kv.set(["sessionMemory", connection.deviceId], connection.sessionMemory);
- }
- connection.geminiSocket.close(1000, "Proactive session renewal");
+  if (!connection.geminiSocket || connection.geminiSocket.readyState !== WebSocket.OPEN) return;
+
+  if (connection.sessionTranscript) {
+    // Hot-tier carry-forward: injected into next session's system prompt
+    connection.sessionMemory = connection.sessionTranscript;
+    connection.sessionTranscript = "";
+    console.log(`[${connection.deviceId}] [memory] Carrying forward (${connection.sessionMemory.length} chars)`);
+    await kv.set(["sessionMemory", connection.deviceId], connection.sessionMemory);
+
+    // Cold-tier summary: only if the user actually spoke this session
+    if (connection.userSpokeThisTurn) {
+      console.log(`[${connection.deviceId}] [memory] Generating session summary...`);
+      const summary = await generateSessionSummary(connection.sessionMemory);
+      if (summary) {
+        const dateKey = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
+        await kv.set(["memory", "sessions", connection.deviceId, dateKey], summary);
+        console.log(`[${connection.deviceId}] [memory] Cold-tier saved (${dateKey}): ${summary.substring(0, 100)}...`);
+        // Prune entries older than 7 days — fire and forget
+        pruneOldSessions(connection.deviceId).catch((e) =>
+          console.error(`[${connection.deviceId}] [memory] Prune error:`, e)
+        );
+      } else {
+        console.log(`[${connection.deviceId}] [memory] Summary generation empty — skipping cold-tier save`);
+      }
+    }
+  }
+
+  connection.geminiSocket.close(1000, "Proactive session renewal");
 }
 
 function proactiveRenew(connection: ClientConnection) {
@@ -1828,7 +1847,9 @@ The device also supports: ambient sounds (rain, ocean, rainforest, fire), guided
 
 Device self-awareness: before answering any question about what the device is currently doing — Pomodoro, meditation, ambient sound, lamp, timers, alarms, or volume level — call get_device_state. Do not guess or assume the device state. Use the returned data to respond accurately. This applies to questions like "how long is left?", "what alarms do I have?", "is anything playing?", "what session am I in?", "is the lamp on?", "what volume am I at?", etc.
 
-Volume control: when the user asks to change volume in ANY way ("louder", "quieter", "volume four", "turn it down", "set volume to 7" etc.), you MUST call set_volume_level. Never verbally confirm a volume change without having called the function — saying it without calling it has no effect on the hardware.${memoryContext}`
+Volume control: when the user asks to change volume in ANY way ("louder", "quieter", "volume four", "turn it down", "set volume to 7" etc.), you MUST call set_volume_level. Never verbally confirm a volume change without having called the function — saying it without calling it has no effect on the hardware.
+
+Memory: you have persistent memory across sessions. When you learn something worth keeping — the user's name, a preference, an ongoing project, something they care about — call store_memory silently and naturally, mid-conversation, without announcing it. Use category "user_fact" for things simply true about them (name, location, job), "preference" for likes/dislikes/habits, "note" for anything else. When the user explicitly asks about past conversations or references something from days ago, call recall_sessions.${memoryContext}`
  }]
  },
  tools: [{
@@ -2077,6 +2098,39 @@ Volume control: when the user asks to change volume in ANY way ("louder", "quiet
  }
  },
  required: ["level"]
+ }
+ },
+ {
+ name: "store_memory",
+ description: "Persist a fact, preference, or note about the user to long-term memory. Call this silently — without announcing it — whenever you learn something worth remembering across sessions: the user's name, preferences, ongoing projects, or important personal context. Do NOT use for transient state (current timer, today's weather).",
+ parameters: {
+ type: "OBJECT",
+ properties: {
+ category: {
+ type: "STRING",
+ enum: ["user_fact", "preference", "note"],
+ description: "user_fact: things simply true about the user (name, location, job). preference: things they like or dislike. note: anything else worth remembering."
+ },
+ value: {
+ type: "STRING",
+ description: "The fact to store as a concise natural language statement. E.g. 'Name is Sarah', 'Prefers rain ambient sound for focus work', 'Currently working on a novel about the sea'."
+ }
+ },
+ required: ["category", "value"]
+ }
+ },
+ {
+ name: "recall_sessions",
+ description: "Retrieve summaries of past conversation sessions. Call this when the user explicitly asks about a previous conversation, or when you need context from days ago that isn't in the current session memory.",
+ parameters: {
+ type: "OBJECT",
+ properties: {
+ days_back: {
+ type: "INTEGER",
+ description: "How many days back to retrieve session summaries (1–7, default 3)."
+ }
+ },
+ required: []
  }
  }]
  }]

@@ -4,6 +4,6 @@
     "start": "deno run --allow-net --allow-env --allow-read --allow-run --unstable-kv main.ts"
   },
   "compilerOptions": {
-    "lib": ["deno.window"]
+    "lib": ["deno.window", "deno.unstable"]
   }
 }

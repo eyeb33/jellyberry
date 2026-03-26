@@ -160,6 +160,7 @@ interface ClientConnection {
  geminiTurnActive?: boolean; // True while Gemini is generating a response (activityEnd → turnComplete)
  turnCompleteFired?: boolean; // True once the turn-complete event has been handled; prevents duplicate fires (generationComplete + turnComplete)
  pendingRenewal?: boolean; // Renewal requested while a turn was in-flight; fire on next turnComplete
+ ghostRenewal?: boolean;   // True when renewal was triggered by a ghost turn (0 audio); send reconnectComplete after reconnect
  sessionRenewalTimer?: ReturnType<typeof setTimeout>; // Handle to cancel if session closes early
  softRenewalTimer?: ReturnType<typeof setTimeout>; // Fires at 7 min for between-turn renewal
  softRenewalArmed?: boolean; // True when soft renewal is waiting for next turnComplete
@@ -2152,6 +2153,14 @@ Memory: you have persistent memory across sessions. When you learn something wor
  message: "Connected to Gemini Live API" 
  }));
 
+ // Ghost turn renewal: firmware is in LED_RECONNECTING state (set before session closed).
+ // Send reconnectComplete so it restores its LED mode and returns to IDLE.
+ if (connection.ghostRenewal) {
+ connection.ghostRenewal = false;
+ console.log(`[${connection.deviceId}] Ghost renewal complete — sending reconnectComplete`);
+ connection.socket.send(JSON.stringify({ type: "reconnectComplete" }));
+ }
+
  // Schedule proactive renewal at 9 minutes to avoid the 600s hard deadline
  connection.sessionRenewalTimer = setTimeout(() => proactiveRenew(connection), GEMINI_SESSION_RENEWAL_MS);
 
@@ -2348,12 +2357,24 @@ Memory: you have persistent memory across sessions. When you learn something wor
  console.log(`[${connection.deviceId}] Ignoring duplicate turn-complete signal`);
  } else {
  connection.turnCompleteFired = true;
+ const audioChunks = connection.turnAudioChunks || 0;
+ const wasUserTurn = connection.userSpokeThisTurn ?? false;
  const audioMs = ((connection.turnAudioBytes || 0) / 2 / 24000 * 1000).toFixed(0);
- console.log(`[${connection.deviceId}] Turn complete audio: ${connection.turnAudioChunks || 0} chunks, ${audioMs}ms`);
+ console.log(`[${connection.deviceId}] Turn complete audio: ${audioChunks} chunks, ${audioMs}ms`);
  connection.turnAudioChunks = 0;
  connection.turnAudioBytes = 0;
  connection.userSpokeThisTurn = false; // Ready for next turn
  connection.geminiTurnActive = false;
+ // Ghost turn: user spoke but Gemini returned 0 audio (false VAD trigger, echo, or stale session).
+ // Sending turnComplete here would open a conversation window which re-triggers the same
+ // condition in a feedback loop. Instead: tell firmware to return to IDLE and refresh session.
+ if (wasUserTurn && audioChunks === 0) {
+ console.log(`[${connection.deviceId}] Ghost turn detected (user spoke, 0 audio) — resetting to IDLE and refreshing session`);
+ connection.ghostRenewal = true;
+ connection.socket.send(JSON.stringify({ type: "reconnecting" }));
+ performRenewal(connection);
+ return;
+ }
  // Flush any deferred mode command now that Gemini has finished speaking
  if (connection.pendingModeMessage) {
  console.log(`[${connection.deviceId}] Flushing deferred mode command:`, JSON.stringify(connection.pendingModeMessage));

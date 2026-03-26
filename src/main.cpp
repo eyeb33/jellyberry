@@ -822,9 +822,9 @@ void loop() {
         if (currentLEDMode != lastLoggedMode) {
             const char* modeNames[] = {
                 "BOOT", "IDLE", "RECORDING", "PROCESSING", "AUDIO_REACTIVE",
-                "CONNECTED", "ERROR", "TIDE", "TIMER", "MOON",
+                "CONNECTED", "ERROR", "RECONNECTING", "TIDE", "TIMER", "MOON",
                 "AMBIENT_VU", "AMBIENT", "RADIO", "POMODORO", "MEDITATION",
-                "LAMP", "SEA_GOOSEBERRY", "EYES", "ALARM", "CONVERSATION"
+                "LAMP", "SEA_GOOSEBERRY", "EYES", "ALARM", "CONVERSATION_WINDOW"
             };
             int idx = (int)currentLEDMode;
             const char* name = (idx >= 0 && idx < (int)(sizeof(modeNames)/sizeof(modeNames[0])))
@@ -1926,13 +1926,13 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         }
     }
     
-    // Show thinking animation once we've been WAITING long enough.
+    // Go dark (LED_PROCESSING) once we've been WAITING long enough.
     // Guard on !isPlayingResponse: once audio starts arriving the VU meter must win.
     if (convState == ConvState::WAITING &&
         !isPlayingResponse &&
         (int32_t)(millis() - waitingEnteredAt) > THINKING_ANIMATION_DELAY_MS) {
         currentLEDMode = LED_PROCESSING;
-        DEBUG_PRINTLN(" Response delayed - showing thinking animation");
+        DEBUG_PRINTLN(" Response delayed - LEDs off (processing)");
     }
 
     // Hard timeout: Gemini never responded (accommodates 40+ second tool calls).

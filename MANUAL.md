@@ -25,7 +25,7 @@ Tap PAD1 from Idle or any display mode. LEDs go red immediately.
 You don't need to press anything to stop. After about 1.5 seconds of silence, the device detects you've finished speaking, stops recording, and sends the audio to Gemini. Mid-sentence pauses won't cut you off — it waits for a clear silence.
 
 ### The follow-up window
-After every response, a 10-second window opens automatically (cyan pulsing LEDs). Speak naturally during this window — the device starts recording on its own when it hears you. If you stay silent, the window closes and Jellyberry returns to its previous mode.
+After every response, a 10-second window opens automatically (blue countdown bar LEDs). Speak naturally during this window — the device starts recording on its own when it hears you. If you stay silent, the window closes and Jellyberry returns to its previous mode.
 
 ### Interrupting a response
 Tap PAD1 while Jellyberry is speaking. Playback stops immediately and recording starts.

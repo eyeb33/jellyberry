@@ -1560,6 +1560,12 @@ async function handleTypeRecordingStop(_data: Record<string, unknown>, conn: Cli
   // swallow the generationComplete handler on the next reconnected turn.
   conn.turnCompleteFired = false;
   if (conn.geminiSocket?.readyState === WebSocket.OPEN) {
+    // Guard: firmware can emit duplicate recordingStop messages (VAD + timeout race).
+    // If we already sent activityEnd for this turn, suppress the duplicate.
+    if (conn.geminiTurnActive) {
+      console.log(`[${conn.deviceId}] activityEnd suppressed (duplicate recordingStop — turn already active)`);
+      return;
+    }
     conn.geminiSocket.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
     conn.userSpokeThisTurn = true;
     conn.geminiTurnActive = true;

@@ -1873,10 +1873,44 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         // Stop recording only on timeout (manual stop removed - rely on VAD)
         // Mutex-protected to prevent race with button handlers starting new recording
         if (recordingActive && (int32_t)(millis() - recordingStartTime) > MAX_RECORDING_DURATION_MS) {
+            bool stopped = false;
             if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 recordingActive = false;
+                recordingStartSent = false;
                 xSemaphoreGive(recordingMutex);
+                stopped = true;
             }
+            if (stopped) {
+                wsSendMessage("{\"type\":\"recordingStop\"}");
+                Serial.println("[WS] recordingStop sent");
+                if (radioState.active) {
+                    // Radio: return to radio display while waiting for Gemini
+                    currentLEDMode = LED_RADIO;
+                    transitionConvState(ConvState::WAITING);
+                } else if (!ambientSound.active) {
+                    currentLEDMode = LED_PROCESSING;
+                    transitionConvState(ConvState::WAITING);
+                }
+                DEBUG_PRINT("  Recording stopped - Duration: %dms (max duration reached)\n", millis() - recordingStartTime);
+            }
+        }
+        
+        lastDebounceTime = millis();
+    }
+    
+    // Auto-stop on silence (VAD)
+    // Mutex-protected to prevent race with button handlers.
+    // Only send recordingStop if mutex was acquired — prevents double-fire if mutex times out
+    // and recordingActive is not cleared, which would cause a second VAD trigger next iteration.
+    if (recordingActive && (int32_t)(millis() - lastVoiceActivityTime) > VAD_SILENCE_MS) {
+        bool stopped = false;
+        if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            recordingActive = false;
+            recordingStartSent = false;  // Clear flag to ensure next recording sends state
+            xSemaphoreGive(recordingMutex);
+            stopped = true;
+        }
+        if (stopped) {
             wsSendMessage("{\"type\":\"recordingStop\"}");
             Serial.println("[WS] recordingStop sent");
             if (radioState.active) {
@@ -1884,35 +1918,12 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 currentLEDMode = LED_RADIO;
                 transitionConvState(ConvState::WAITING);
             } else if (!ambientSound.active) {
+                // Don't change LED mode if ambient sound is already active
                 currentLEDMode = LED_PROCESSING;
                 transitionConvState(ConvState::WAITING);
             }
-            DEBUG_PRINT("  Recording stopped - Duration: %dms (max duration reached)\n", millis() - recordingStartTime);
+            DEBUG_PRINTLN("  Recording stopped - Silence detected");
         }
-        
-        lastDebounceTime = millis();
-    }
-    
-    // Auto-stop on silence (VAD)
-    // Mutex-protected to prevent race with button handlers
-    if (recordingActive && (int32_t)(millis() - lastVoiceActivityTime) > VAD_SILENCE_MS) {
-        if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            recordingActive = false;
-            recordingStartSent = false;  // Clear flag to ensure next recording sends state
-            xSemaphoreGive(recordingMutex);
-        }
-        wsSendMessage("{\"type\":\"recordingStop\"}");
-        Serial.println("[WS] recordingStop sent");
-        if (radioState.active) {
-            // Radio: return to radio display while waiting for Gemini
-            currentLEDMode = LED_RADIO;
-            transitionConvState(ConvState::WAITING);
-        } else if (!ambientSound.active) {
-            // Don't change LED mode if ambient sound is already active
-            currentLEDMode = LED_PROCESSING;
-            transitionConvState(ConvState::WAITING);
-        }
-        DEBUG_PRINTLN("  Recording stopped - Silence detected");
     }
     
     // Show thinking animation once we've been WAITING long enough.

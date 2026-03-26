@@ -44,10 +44,12 @@ async function searchRadioStations(query: string, tag: string, limit: number): P
  params.set("order", "votes");
  params.set("reverse", "true");
 
+ if (radioStationCache.size > 500) radioStationCache.clear();
+
  const url = `https://all.api.radio-browser.info/json/stations/search?${params}`;
  console.log(`[Radio] Searching: ${url}`);
 
- const resp = await fetch(url, { headers: { "User-Agent": "Jellyberry/1.0" } });
+ const resp = await fetch(url, { signal: AbortSignal.timeout(8000), headers: { "User-Agent": "Jellyberry/1.0" } });
  if (!resp.ok) throw new Error(`Radio Browser API error: ${resp.status}`);
  const stations = await resp.json() as any[];
 
@@ -279,9 +281,10 @@ async function readColdMemory(deviceId: string, daysBack: number): Promise<strin
 async function generateSessionSummary(transcript: string): Promise<string> {
   try {
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
       {
         method: "POST",
+        signal: AbortSignal.timeout(10000),
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contents: [{

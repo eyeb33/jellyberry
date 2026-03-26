@@ -140,14 +140,14 @@ IP: 192.168.1.XXX
 
 | State | Colour / Pattern | Description |
 |---|---|---|
-| BOOT | Blue pulse | Startup sequence |
+| BOOT | Orange pulse | Startup sequence |
 | IDLE | Slow blue wave | Ready — waiting for input |
-| RECORDING | Red pulse | Capturing voice input |
-| PROCESSING | Purple/magenta pulse | Audio sent, awaiting Gemini |
-| AUDIO_REACTIVE | Blue-green VU bars | Gemini response playing |
-| CONVERSATION_WINDOW | Cyan pulse | Follow-up window open (10s) |
-| CONNECTED | Cyan solid | WebSocket established |
-| RECONNECTING | White fade | Reconnecting to server |
+| RECORDING | Green→yellow→red VU | Capturing voice input |
+| PROCESSING | All off (dark) | Audio sent, awaiting Gemini |
+| AUDIO_REACTIVE | Blue→magenta VU bars | Gemini response playing |
+| CONVERSATION_WINDOW | Blue countdown bar | Follow-up window open (10s) |
+| CONNECTED | Solid green | WebSocket established |
+| RECONNECTING | Magenta pulse | Reconnecting to server |
 | ERROR | Red flash | Init or connection failure |
 | AMBIENT / AMBIENT_VU | Green→yellow→red VU | Ambient sound playing |
 | SEA_GOOSEBERRY | Rainbow downward waves | Bio-accurate comb jelly animation |

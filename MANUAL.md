@@ -6,13 +6,13 @@ Jellyberry is a voice-first AI companion powered by Google Gemini. Speak to it n
 
 ## Quick Start
 
-1. **Power on** — LEDs pulse blue briefly, then settle to a slow blue wave (Idle)
-2. **Wait for connection** — a brief cyan flash indicates the server is ready; the blue wave returns once connected
-3. **Tap PAD1** (left touch pad) — LEDs turn red, recording starts
+1. **Power on** — LEDs pulse orange briefly, then settle to a slow blue wave (Idle)
+2. **Wait for connection** — a brief green flash indicates the server is ready; the blue wave returns once connected
+3. **Tap PAD1** (left touch pad) — a green→yellow→red VU meter lights up as recording starts
 4. **Speak** — ask anything; when you pause, the device detects silence and stops recording automatically
-5. **Wait** — LEDs go purple (processing), then blue-green bars animate as the response plays back through the speaker
+5. **Wait** — LEDs go dark (processing), then blue→magenta VU bars animate as the response plays back through the speaker
 
-A 10-second follow-up window opens after each response (cyan pulsing LEDs). Speak during this window to continue the conversation — no button needed.
+A 10-second follow-up window opens after each response (blue pulsing LEDs). Speak during this window to continue the conversation — no button needed.
 
 ---
 
@@ -88,7 +88,7 @@ A transition display mode — no audio, just the visualiser. Press PAD2 to conti
 ---
 
 ### Sea Gooseberry
-**LEDs:** Downward-travelling rainbow waves (blue → cyan → green → magenta) on 8 glowing comb rows, with a slow 25-second brightness cycle
+**LEDs:** Downward-travelling rainbow waves (blue → cyan → green → magenta) on 12 glowing comb rows, with a slow 25-second brightness cycle
 
 A bio-accurate comb jelly animation. All voice functions work normally — tap PAD1 to speak.
 
@@ -223,12 +223,12 @@ A playful visual mode. PAD2 returns to Idle.
 | Colour / Pattern | State | Meaning |
 |---|---|---|
 | Slow blue wave | Idle | Ready — tap PAD1 to speak |
-| Red pulse | Recording | Capturing your voice |
-| Purple/magenta pulse | Processing | Audio sent, waiting for Gemini |
-| Blue-green VU bars | Audio Reactive | Jellyberry is speaking |
-| Cyan pulse | Conversation Window | Follow-up window open (10 seconds) |
-| Cyan solid | Connected | Server connection active |
-| White fade in/out | Reconnecting | Re-establishing server connection |
+| Green→yellow→red VU | Recording | Capturing your voice |
+| All off / dark | Processing | Audio sent, waiting for Gemini |
+| Blue→magenta VU bars | Audio Reactive | Jellyberry is speaking |
+| Blue countdown bar | Conversation Window | Follow-up window open (10 seconds) |
+| Solid green | Connected | Server connection active |
+| Magenta pulse | Reconnecting | Re-establishing server connection |
 | Green→yellow→red VU | Ambient / Ambient VU | Ambient sound playing |
 | Teal VU bars | Radio | Internet radio streaming |
 | Countdown bar (red/green/blue) | Pomodoro | Focus or break timer active |
@@ -240,7 +240,7 @@ A playful visual mode. PAD2 returns to Idle.
 | Orange countdown bar | Timer | Countdown timer active |
 | Yellow outward pulse | Alarm | Alarm triggered — tap PAD1 or PAD2 to dismiss |
 | Red fast flash | Error | Connection or initialisation failure |
-| Blue pulse | Boot | Starting up |
+| Orange pulse | Boot | Starting up |
 
 ---
 
@@ -248,7 +248,7 @@ A playful visual mode. PAD2 returns to Idle.
 
 **Long-press escape**: Hold either pad for 2 seconds to exit any active mode and return to Idle. Works from anywhere — use it if Jellyberry seems stuck or you want to switch topics quickly.
 
-**Volume scale**: 1–10, default is level 3 (~30%). Levels 6–8 work well in most rooms. Say *"set volume to X"* at any time, in any mode.
+**Volume scale**: 1–10, default is level 3 (~30%). Level 4 works well in most rooms. Say *"set volume to X"* at any time, in any mode.
 
 **Conversation window timing**: The follow-up window ignores the first 1.2 seconds after it opens, to let the speaker stop resonating. If you speak immediately after a response ends and nothing happens, wait a moment and try again.
 
@@ -256,4 +256,4 @@ A playful visual mode. PAD2 returns to Idle.
 
 **Memory**: Jellyberry stores facts silently — no special phrase needed. Just mention things naturally: *"My name is Alex"*, *"I prefer ocean sounds when I'm working"*. It will remember for next time.
 
-**If Jellyberry stops responding**: Long-press either pad to reset to Idle, then try again. White pulsing LEDs mean it is reconnecting and will be ready within a few seconds.
+**If Jellyberry stops responding**: Long-press either pad to reset to Idle, then try again. Magenta pulsing LEDs mean it is reconnecting and will be ready within a few seconds.

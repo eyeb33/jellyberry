@@ -62,15 +62,37 @@ curl http://localhost:8000/health
 ## Architecture
 
 ```
-ESP32 Device
-    ↓ WebSocket (/ws endpoint)
-Deno Edge Server (this server)
-    ↓ WebSocket (Gemini Live API)
-Google Gemini API
+ESP32 Device  →  WebSocket (/ws)  →  Deno Edge Server  →  Gemini Live API
 ```
 
 The server:
-1. Accepts WebSocket connections from ESP32 devices
-2. Establishes connection to Gemini Live API
-3. Forwards audio/messages bidirectionally
-4. Handles setup, errors, and reconnection
+1. Accepts WebSocket connections from multiple ESP32 devices simultaneously (identified by `deviceId`)
+2. Establishes and manages a Gemini Live API session per device (9-min proactive renewal, 7-min soft renewal between turns)
+3. Forwards audio bidirectionally — ESP32 mic PCM to Gemini, Gemini TTS PCM back to ESP32
+4. Handles ghost turn recovery (0-audio responses that would otherwise loop)
+5. Dispatches 15+ tool calls on behalf of Gemini:
+
+| Tool | Description |
+|---|---|
+| `get_tide_status` | Brighton tide state, level, and next change time |
+| `get_moon_phase` | Current lunar phase and illumination |
+| `get_weather_forecast` | Current conditions and multi-day forecast |
+| `get_current_time` | Current time in Europe/London |
+| `get_device_state` | Full firmware state snapshot |
+| `set_volume_level` | Hardware volume (1–10 scale) |
+| `start_ambient_sound` | Play rain/ocean/rainforest/fire loops |
+| `stop_ambient_sound` | Stop ambient playback |
+| `search_radio_stations` | Find internet radio stations by query |
+| `play_radio_station` | Stream a station to the device |
+| `stop_radio` | Stop radio stream |
+| `start_pomodoro` | Start a Pomodoro session with custom durations |
+| `stop_pomodoro` | End the current Pomodoro |
+| `set_alarm` | Schedule a persistent alarm (survives reboot) |
+| `start_meditation` | Begin guided chakra meditation |
+| `store_memory` | Persist a user fact/preference to long-term memory |
+| `recall_sessions` | Retrieve past session summaries (up to 7 days) |
+
+6. Deno KV memory persistence:
+   - **Hot tier**: curated facts injected into every new session's system prompt
+   - **Cold tier**: 7-day rolling session summaries, retrieved on demand via `recall_sessions`
+   - **Session carry-forward**: raw transcript from the last turn, always included in the next session

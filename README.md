@@ -2,15 +2,15 @@
 
 **A production-ready Gemini 2.5 Flash conversational AI device for ESP32-S3 with real-time audio I/O, WebSocket communication, and FastLED visualization.**
 
-*Powered by `gemini-2.5-flash-native-audio-preview-12-2025` for fast, low-latency audio generation.*
+*Powered by `gemini-2.5-flash-native-audio-dialog` for fast, low-latency audio generation.*
 
 ## Features
 
 - **Real-Time Conversational AI** - Powered by Google Gemini 2.5 Realtime API
 - **Native Audio Streaming** - 16kHz PCM audio via I2S (no Whisper transcription overhead)
 - **Dual-Core Processing** - FreeRTOS tasks optimized for ESP32-S3 cores
-- **144 WS2812B LED Strip** - Sea-gooseberry visualization with audio-reactive animations
-- **Touch-Based Interface** - PAD1 to start recording, PAD2 to stop
+- **144 WS2812B LED Strip** - 20+ LED animation modes including audio-reactive VU, ambient, tide, moon, pomodoro, meditation, and more
+- **Touch-Based Interface** - PAD1 starts recording (silence auto-stops via VAD), PAD2 cycles modes; long-press either pad to escape any mode
 - **Low Latency** - 8-10 second end-to-end response time (realistic minimum)
 - **Production Ready** - Error handling, WiFi reconnection, graceful degradation
 
@@ -21,7 +21,19 @@
 - **MAX98357A** I2S Class-D amplifier with 8Ω 5W speaker
 - **144x WS2812B** addressable RGB LEDs (single data line)
 - **2x TTP223** capacitive touch pads
-- **5V power supply** (minimum 2A for LEDs + audio)
+- **5V power supply** (3A minimum; LEDs at operating brightness draw ~2.5A)
+
+## Bill of Materials
+
+| Component | Part | Qty | Notes |
+|---|---|---|---|
+| Microcontroller | ESP32-S3-DevKitC-1 | 1 | PSRAM variant recommended |
+| Microphone | INMP441 MEMS I2S | 1 | 3.3V, omnidirectional |
+| Amplifier | MAX98357A I2S Class-D | 1 | 3W/4Ω or 1.4W/8Ω output |
+| Speaker | 8Ω 5W full-range | 1 | |
+| LED Strip | WS2812B 144-LED, 1m | 1 | 5V, single data line |
+| Touch Pads | TTP223 capacitive module | 2 | |
+| Power Supply | 5V 3A+ regulated | 1 | USB-C or barrel jack |
 
 ## GPIO Pin Assignments
 
@@ -115,36 +127,61 @@ IP: 192.168.1.XXX
 
 ## Operation
 
-1. **Press PAD1** (GPIO 3) to start recording
-2. **Speak your question/command** (hold or release - tap pattern)
-3. **Press PAD2** (GPIO 4) to stop recording
-4. System processes audio via Gemini 2.5 Realtime
-5. **Response plays through speaker** while LEDs animate
-6. Green LED pulse indicates AI responding
-7. Cyan solid when WebSocket connected
-8. Red pulse when recording
+1. **Tap PAD1** (GPIO 2) — LEDs turn red, recording starts
+2. **Speak** — silence is detected automatically after ~1.5s (VAD); no button press needed to stop
+3. **LEDs turn purple** — audio is processing
+4. **Response plays** through speaker with blue-green VU animation
+5. **Cyan LEDs pulse** — 10-second follow-up window opens; speak again without pressing anything, or wait for it to close
+6. **PAD1 during playback** — interrupts response and starts a new recording immediately
+7. **PAD2 short press** — cycles display modes: Idle → Ambient VU → Sea Gooseberry → Ambient Sounds → Radio → Pomodoro → Meditation → Lamp → Eyes → Idle
+8. **Long-press either pad (2s)** — exits any active mode and returns to Idle
 
-## LED Animations
+## LED States
 
-- **BOOT** (Blue pulse) - Initial startup
-- **IDLE** (Dim blue breathing) - Ready state
-- **RECORDING** (Red pulse) - Recording audio
-- **PROCESSING** (Yellow rotate) - Sending to Gemini
-- **AUDIO_REACTIVE** (Green pulse) - AI responding
-- **CONNECTED** (Cyan solid) - WebSocket active
-- **ERROR** (Red flash) - Connection or init failure
+| State | Colour / Pattern | Description |
+|---|---|---|
+| BOOT | Blue pulse | Startup sequence |
+| IDLE | Slow blue wave | Ready — waiting for input |
+| RECORDING | Red pulse | Capturing voice input |
+| PROCESSING | Purple/magenta pulse | Audio sent, awaiting Gemini |
+| AUDIO_REACTIVE | Blue-green VU bars | Gemini response playing |
+| CONVERSATION_WINDOW | Cyan pulse | Follow-up window open (10s) |
+| CONNECTED | Cyan solid | WebSocket established |
+| RECONNECTING | White fade | Reconnecting to server |
+| ERROR | Red flash | Init or connection failure |
+| AMBIENT / AMBIENT_VU | Green→yellow→red VU | Ambient sound playing |
+| SEA_GOOSEBERRY | Rainbow downward waves | Bio-accurate comb jelly animation |
+| RADIO | Teal VU bars | Internet radio streaming |
+| POMODORO | Countdown bar (red/green/blue) | Focus or break timer |
+| MEDITATION | Chakra colour, breathing | Guided breathing session |
+| LAMP | White/Red/Green/Blue solid | Ambient lighting |
+| EYES | Animated eye expressions | Eye visualiser |
+| TIDE | Blue level fill | Tide status display |
+| MOON | White level fill | Moon phase display |
+| TIMER | Orange countdown bar | Countdown timer |
+| ALARM | Yellow outward pulse | Alarm triggered |
 
 ## Architecture
 
-**Core 1 (WebSocket & Audio Streaming)**
-- WebSocket connection lifecycle
-- Audio buffer management
-- Bidirectional audio streaming to Gemini
+```
+ESP32 Firmware  →  WebSocket (/ws)  →  Deno Edge Server  →  Gemini Live API
+```
 
-**Core 0 (LEDs & Sensors)**
+**Firmware — Core 1 (WebSocket & Audio)**
+- WebSocket connection lifecycle and reconnection
+- Bidirectional audio streaming (mic PCM → Gemini, TTS PCM → speaker)
+- Tool call dispatch (timers, alarms, ambient, radio, Pomodoro, tide, moon, weather)
+
+**Firmware — Core 0 (LEDs & Input)**
 - FastLED animation updates (20 FPS)
-- Touch pad polling
-- System health monitoring
+- Touch pad polling and button state machine
+- Ambient sound and radio audio playback
+
+**Edge Server (`server/main.ts`)**
+- Accepts ESP32 WebSocket connections, proxies to Gemini Live API
+- Manages session renewal (9-min proactive, 7-min soft) and ghost turn recovery
+- Handles 15+ tool calls server-side (tide, moon, weather, radio, alarms, timers, volume, memory)
+- Deno KV memory persistence: hot-tier facts injected into every session, cold-tier session summaries, raw transcript carry-forward
 
 ## Performance Targets
 
@@ -160,7 +197,7 @@ IP: 192.168.1.XXX
 ### LEDs not lighting or showing wrong colors
 - **CRITICAL**: Verify GND connection between ESP32 and LED power supply
 - Check GPIO 1 data line connection to LED strip DIN
-- Confirm 5V power supply adequate (LEDs draw ~100mA at max brightness)
+- Confirm 5V power supply meets 3A minimum (firmware limits brightness but peak draw can reach 2.5A+)
 - Optional: Use 3.3V→5V level shifter on data line for better signal integrity
 - Test with FastLED example first
 
@@ -181,21 +218,14 @@ IP: 192.168.1.XXX
 
 ## Future Enhancements
 
-- [ ] Tide level visualization on LED strip
-- [ ] Weather color patterns (blue=rain, yellow=sun)
-- [ ] Moon phase display
+- [ ] Wake word detection (always-on trigger without button press)
+- [ ] Battery power management and sleep modes
+- [ ] PCB design for production enclosure
 - [ ] Multi-language support
-- [ ] Local voice synthesis (TensorFlow Lite)
-- [ ] Battery power management
-- [ ] PCB design for production
 
 ## License
 
 MIT - Feel free to fork, modify, and build!
-
-## Credits
-
-Built as a gift device for a teenage son. Combines conversational AI, real-time audio processing, and visual feedback into a polished, gift-ready experience.
 
 ---
 

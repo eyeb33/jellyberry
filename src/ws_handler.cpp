@@ -49,13 +49,26 @@ bool wsSendMessage(const String& msg) {
 }
 
 void handleWebSocketMessage(uint8_t* payload, size_t length) {
- JsonDocument doc;
- DeserializationError error = deserializeJson(doc, payload, length);
- 
- if (error) {
- Serial.printf("JSON parse error: %s\n", error.c_str());
- return;
- }
+  // Validate payload size before parsing
+  if (length > MAX_JSON_SIZE) {
+    Serial.printf("[JSON] Rejected oversized message: %u bytes (max %d)\n", length, MAX_JSON_SIZE);
+    return;
+  }
+  
+  // Check heap availability before allocating JsonDocument
+  size_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < MIN_HEAP_FOR_JSON) {
+    Serial.printf("[JSON] Insufficient heap: %u bytes free (need %d)\n", freeHeap, MIN_HEAP_FOR_JSON);
+    return;
+  }
+  
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, payload, length);
+  
+  if (error) {
+    Serial.printf("[JSON] Parse error: %s (size: %u, heap: %u)\n", error.c_str(), length, freeHeap);
+    return;
+  }
  const char* msgType = doc["type"] | "";
 
  // Handle server ready message
@@ -165,7 +178,11 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  // Handle tide data from server
  if (strcmp(msgType, "tideData") == 0) {
  Serial.println("Received tide data - storing for display after speech");
- strlcpy(tideState.state, doc["state"] | "", sizeof(tideState.state));
+ const char* stateStr = doc["state"] | "";
+ if (strlen(stateStr) >= sizeof(tideState.state)) {
+ Serial.printf("ERROR: Tide state string too long (%d chars), truncating\n", strlen(stateStr));
+ }
+ strlcpy(tideState.state, stateStr, sizeof(tideState.state));
  tideState.waterLevel = doc["waterLevel"].as<float>();
  tideState.nextChangeMinutes = doc["nextChangeMinutes"].as<int>();
  tideState.active = true;
@@ -246,6 +263,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  
  Serial.printf("Alarm set: ID=%u, time=%s (slot %d)\n", alarmID, timeStr, slot);
  alarmState.active = true;
+ saveAlarmsToNVS();  // Persist to NVS
  } else {
  Serial.println("No alarm slots available!");
  }
@@ -284,6 +302,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  isPlayingResponse = true;
  firstAudioChunk = true;
  lastAudioChunkTime = millis();
+ if (ESP.getFreeHeap() < MIN_HEAP_FOR_JSON) { Serial.printf("[JSON] Low heap for alarm: %u\n", ESP.getFreeHeap()); return; }
  JsonDocument alarmDoc;
  alarmDoc["action"] = "requestAlarm";
  String alarmMsg;
@@ -317,6 +336,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  }
  Serial.printf("Cancelled %d alarm(s)\n", cancelledCount);
  alarmState.active = false;
+ saveAlarmsToNVS();  // Persist to NVS
  } else {
  // Cancel next alarm (earliest one)
  time_t earliestTime = 0;
@@ -359,6 +379,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  if (!hasActiveAlarms) {
  alarmState.active = false;
  }
+ saveAlarmsToNVS();  // Persist to NVS
  } else {
  Serial.println("No active alarms to cancel");
  }
@@ -376,6 +397,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  time_t now = mktime(&timeinfo);
  
  // Build alarm list
+ if (ESP.getFreeHeap() < MIN_HEAP_FOR_JSON) { Serial.printf("[JSON] Low heap for alarmList: %u\n", ESP.getFreeHeap()); return; }
  JsonDocument responseDoc;
  responseDoc["type"] = "alarmList";
  JsonArray alarmArray = responseDoc["alarms"].to<JsonArray>();
@@ -412,7 +434,11 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  // Handle moon data
  if (strcmp(msgType, "moonData") == 0) {
  Serial.println("Received moon data - storing for display after speech");
- strlcpy(moonState.phaseName, doc["phaseName"] | "", sizeof(moonState.phaseName));
+ const char* phaseStr = doc["phaseName"] | "";
+ if (strlen(phaseStr) >= sizeof(moonState.phaseName)) {
+ Serial.printf("ERROR: Moon phase name too long (%d chars), truncating\n", strlen(phaseStr));
+ }
+ strlcpy(moonState.phaseName, phaseStr, sizeof(moonState.phaseName));
  moonState.illumination = doc["illumination"].as<int>();
  moonState.moonAge = doc["moonAge"].as<float>();
  moonState.active = true;
@@ -444,6 +470,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  meditationState.phase = MeditationState::HOLD_BOTTOM;
         meditationState.phaseStartTime = 0; // Will sync to first arriving audio chunk
  // Request next chakra sound
+ if (ESP.getFreeHeap() < MIN_HEAP_FOR_JSON) { Serial.printf("[JSON] Low heap for chakra: %u\n", ESP.getFreeHeap()); return; }
  JsonDocument reqDoc;
  reqDoc["action"] = "requestAmbient";
  char nextSound[16];
@@ -545,6 +572,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  if (strcmp(msgType, "pomodoroStatusRequest") == 0) {
  Serial.println("Pomodoro status requested");
  
+ if (ESP.getFreeHeap() < MIN_HEAP_FOR_JSON) { Serial.printf("[JSON] Low heap for pomodoroStatus: %u\n", ESP.getFreeHeap()); return; }
  JsonDocument statusDoc;
  statusDoc["type"] = "pomodoroStatusResponse";
  
@@ -587,6 +615,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  if (strcmp(msgType, "deviceStateRequest") == 0) {
  Serial.println("Device state requested");
 
+ if (ESP.getFreeHeap() < MIN_HEAP_FOR_JSON) { Serial.printf("[JSON] Low heap for deviceState: %u\n", ESP.getFreeHeap()); return; }
  JsonDocument stateDoc;
  stateDoc["type"] = "deviceStateResponse";
 
@@ -679,6 +708,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
 
  // Stop any currently playing ambient
  if (isPlayingAmbient) {
+ if (ESP.getFreeHeap() < MIN_HEAP_FOR_JSON) { Serial.printf("[JSON] Low heap for stopAmbient: %u\n", ESP.getFreeHeap()); return; }
  JsonDocument stopDoc;
  stopDoc["action"] = "stopAmbient";
  String stopMsg;
@@ -723,6 +753,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
 
  // Request ambient audio from server immediately
  {
+ if (ESP.getFreeHeap() < MIN_HEAP_FOR_JSON) { Serial.printf("[JSON] Low heap for requestAmbient: %u\n", ESP.getFreeHeap()); return; }
  JsonDocument ambientDoc;
  ambientDoc["action"] = "requestAmbient";
  ambientDoc["sound"] = ambientSound.name;
@@ -742,6 +773,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
 
  // Stop ambient if playing
  if (isPlayingAmbient) {
+ if (ESP.getFreeHeap() < MIN_HEAP_FOR_JSON) { Serial.printf("[JSON] Low heap for stopAmbient: %u\n", ESP.getFreeHeap()); return; }
  JsonDocument stopDoc;
  stopDoc["action"] = "stopAmbient";
  String stopMsg;
@@ -776,6 +808,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  firstAudioChunk = true;
  lastAudioChunkTime = millis();
  {
+ if (ESP.getFreeHeap() < MIN_HEAP_FOR_JSON) { Serial.printf("[JSON] Low heap for meditation: %u\n", ESP.getFreeHeap()); return; }
  JsonDocument meditationReqDoc;
  meditationReqDoc["action"] = "requestAmbient";
  meditationReqDoc["sound"] = "bell001";
@@ -802,6 +835,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
 
  // Stop any ambient/meditation
  if (isPlayingAmbient) {
+ if (ESP.getFreeHeap() < MIN_HEAP_FOR_JSON) { Serial.printf("[JSON] Low heap for stopAmbient: %u\n", ESP.getFreeHeap()); return; }
  JsonDocument stopDoc;
  stopDoc["action"] = "stopAmbient";
  String stopMsg;
@@ -821,6 +855,15 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  AudioChunk dummy;
  while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {}
  i2sZeroSafe();
+ }
+
+ // Validate input lengths
+ if (strlen(stationName) >= sizeof(radioState.stationName)) {
+ Serial.printf("ERROR: Station name too long (%d chars), truncating\n", strlen(stationName));
+ }
+ if (strlen(streamUrl) >= sizeof(radioState.streamUrl)) {
+ Serial.printf("ERROR: Stream URL too long (%d chars), rejecting radio start\n", strlen(streamUrl));
+ return;  // Radio URLs must fit or connection will fail
  }
 
  // Set radio state
@@ -845,6 +888,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
 
  // Tell server to start streaming
  {
+ if (ESP.getFreeHeap() < MIN_HEAP_FOR_JSON) { Serial.printf("[JSON] Low heap for radio: %u\n", ESP.getFreeHeap()); return; }
  JsonDocument radioReqDoc;
  radioReqDoc["action"] = "requestRadio";
  radioReqDoc["streamUrl"] = radioState.streamUrl;
@@ -894,6 +938,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
 
  // Stop ambient if playing
  if (isPlayingAmbient) {
+ if (ESP.getFreeHeap() < MIN_HEAP_FOR_JSON) { Serial.printf("[JSON] Low heap for stopAmbient: %u\n", ESP.getFreeHeap()); return; }
  JsonDocument stopDoc;
  stopDoc["action"] = "stopAmbient";
  String stopMsg;
@@ -943,6 +988,7 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
 
  // Stop ambient if playing
  if (isPlayingAmbient) {
+ if (ESP.getFreeHeap() < MIN_HEAP_FOR_JSON) { Serial.printf("[JSON] Low heap for stopAmbient: %u\n", ESP.getFreeHeap()); return; }
  JsonDocument stopDoc;
  stopDoc["action"] = "stopAmbient";
  String stopMsg;

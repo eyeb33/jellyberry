@@ -7,6 +7,9 @@
 #include <driver/i2s.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <esp_task_wdt.h>
+#include <esp_heap_caps.h>
+#include <Preferences.h>
 #include <time.h>
 #include "Config.h"
 #include "types.h"
@@ -137,10 +140,12 @@ LampState lampState = {LampState::WHITE, LampState::WHITE, 0, 0, 0, {0}, false, 
 // Radio mode state
 RadioState radioState = {};
 
-// Alarm state
+// Alarm
 Alarm alarms[MAX_ALARMS];
-
 AlarmState alarmState = {false, 0, 0, 0.0f, false, LED_IDLE, false, false};
+
+// NVS storage for alarm persistence
+Preferences alarmPrefs;
 
 // Day/Night brightness control
 DayNightData dayNightData = {false, 0, 0, 0, true, LED_BRIGHTNESS_DAY};
@@ -174,11 +179,13 @@ void clearAudioAndLEDs() {
  drainAudioAndSilence(200);
  
  // Clear LED buffer with mutex protection
- if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
+ if (xSemaphoreTake(ledMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+ Serial.println("CRITICAL: ledMutex deadlock in clearAudioAndLEDs - rebooting");
+ esp_restart();
+ }
  fill_solid(leds, NUM_LEDS, CRGB::Black);
  FastLED.show();
  xSemaphoreGive(ledMutex);
- }
  
  delay(50); // Let everything settle
 }
@@ -249,6 +256,10 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
  }
 }
 
+// Forward declarations for alarm persistence
+void saveAlarmsToNVS();
+void loadAlarmsFromNVS();
+
 // ============== SETUP ==============
 void setup() {
  Serial.begin(SERIAL_BAUD_RATE);
@@ -300,6 +311,29 @@ void setup() {
  fill_solid(leds, NUM_LEDS, CHSV(160, 255, 100));
  FastLED.show();
  Serial.write("LED_INIT_DONE\r\n", 15);
+
+    // GPIO Strapping Pin Check - warn about potential boot issues
+    Serial.println("\n=== GPIO Strapping Pin Check ===");
+    const int STRAPPING_PINS[] = {0, 3, 45, 46};  // ESP32-S3 bootstrap pins
+    const char* STRAPPING_NAMES[] = {"GPIO0 (Boot Mode)", "GPIO3 (JTAG/ROM)", "GPIO45 (VDD_SPI)", "GPIO46 (ROM Msg)"};
+    bool strappingWarning = false;
+    
+    for (int i = 0; i < 4; i++) {
+        int pin = STRAPPING_PINS[i];
+        // Check if strapping pin is used in our configuration
+        if (pin == TOUCH_PAD_START_PIN || pin == TOUCH_PAD_STOP_PIN ||
+            pin == LED_DATA_PIN || pin == I2S_MIC_SCK_PIN || pin == I2S_MIC_WS_PIN || 
+            pin == I2S_MIC_SD_PIN || pin == I2S_SPEAKER_LRC_PIN || pin == I2S_SPEAKER_BCLK_PIN || 
+            pin == I2S_SPEAKER_DIN_PIN) {
+            Serial.printf("WARNING: %s is used (avoid holding at boot!)\n", STRAPPING_NAMES[i]);
+            strappingWarning = true;
+        }
+    }
+    
+    if (!strappingWarning) {
+        Serial.println("OK: No strapping pins in use");
+    }
+    Serial.println("================================\n");
 
     // Create audio queue
     Serial.println("Creating audio queue...");
@@ -369,6 +403,8 @@ void setup() {
     bool connected = false;
     
     while (!connected && retryCount < maxRetries) {
+        esp_task_wdt_reset();  // Feed watchdog before retry attempt
+        
         if (retryCount > 0) {
             Serial.printf("\nRetry attempt %d/%d\n", retryCount + 1, maxRetries);
             WiFi.disconnect();
@@ -394,6 +430,10 @@ void setup() {
             // Configure NTP time sync (GMT timezone)
             configTime(0, 0, "pool.ntp.org", "time.nist.gov");
             Serial.println("NTP time sync configured");
+            
+            // Wait briefly for time sync, then load persisted alarms
+            delay(2000);
+            loadAlarmsFromNVS();
         } else {
             retryCount++;
             Serial.printf("\n Connection attempt failed (status: %d)\n", WiFi.status());
@@ -428,12 +468,114 @@ void setup() {
     // Start FreeRTOS tasks
     // WebSocket needs high priority (3) and larger stack for heavy audio streaming
     xTaskCreatePinnedToCore(websocketTask, "WebSocket", TASK_STACK_WEBSOCKET, NULL, 3, &websocketTaskHandle, CORE_1);
-    xTaskCreatePinnedToCore(ledTask,         "LEDs",      TASK_STACK_LED,       NULL, 0, &ledTaskHandle,       CORE_0);
+    xTaskCreatePinnedToCore(ledTask,         "LEDs",      TASK_STACK_LED,       NULL, 1, &ledTaskHandle,       CORE_0);  // Priority 1 for smooth animation
     xTaskCreatePinnedToCore(audioTask,       "Audio",     TASK_STACK_AUDIO,     NULL, 2, &audioTaskHandle,     CORE_1);
     Serial.println("Tasks created on dual cores");
     
+    // Initialize watchdog timer with 30-second timeout
+    esp_task_wdt_init(30, true);  // 30-second timeout, panic on timeout
+    esp_task_wdt_add(NULL);       // Add current task (setup/loop)
+    Serial.println("Watchdog timer initialized (30s timeout)");
+    
     Serial.printf("=== Initialization Complete ===  [LEDMode: IDLE]\n");
     Serial.println("Touch START pad to begin recording");
+}
+
+// ============================================================
+// Alarm Persistence (NVS)
+// ============================================================
+
+void saveAlarmsToNVS() {
+    if (!alarmPrefs.begin("alarms", false)) {
+        Serial.println("[NVS] Failed to open alarms namespace for write");
+        return;
+    }
+    
+    // Save number of enabled alarms first
+    int enabledCount = 0;
+    for (int i = 0; i < MAX_ALARMS; i++) {
+        if (alarms[i].enabled) enabledCount++;
+    }
+    alarmPrefs.putInt("count", enabledCount);
+    
+    // Save each alarm as a blob (entire struct)
+    for (int i = 0; i < MAX_ALARMS; i++) {
+        if (alarms[i].enabled) {
+            char key[16];
+            snprintf(key, sizeof(key), "alarm_%d", i);
+            alarmPrefs.putBytes(key, &alarms[i], sizeof(Alarm));
+        }
+    }
+    
+    alarmPrefs.end();
+    Serial.printf("[NVS] Saved %d alarm(s) to persistent storage\n", enabledCount);
+}
+
+void loadAlarmsFromNVS() {
+    if (!alarmPrefs.begin("alarms", true)) {  // Read-only mode
+        Serial.println("[NVS] No stored alarms found (first boot)");
+        return;
+    }
+    
+    int storedCount = alarmPrefs.getInt("count", 0);
+    if (storedCount == 0) {
+        alarmPrefs.end();
+        Serial.println("[NVS] No alarms in storage");
+        return;
+    }
+    
+    Serial.printf("[NVS] Loading %d alarm(s) from persistent storage\n", storedCount);
+    
+    // Clear existing alarms
+    for (int i = 0; i < MAX_ALARMS; i++) {
+        alarms[i].enabled = false;
+    }
+    
+    // Load each stored alarm
+    int loadedCount = 0;
+    struct tm timeinfo;
+    bool hasTime = getLocalTime(&timeinfo);
+    time_t now = hasTime ? mktime(&timeinfo) : 0;
+    
+    for (int i = 0; i < MAX_ALARMS; i++) {
+        char key[16];
+        snprintf(key, sizeof(key), "alarm_%d", i);
+        
+        size_t len = alarmPrefs.getBytesLength(key);
+        if (len == sizeof(Alarm)) {
+            Alarm loadedAlarm;
+            alarmPrefs.getBytes(key, &loadedAlarm, sizeof(Alarm));
+            
+            // Validate loaded data
+            if (loadedAlarm.triggerTime > 0 && loadedAlarm.alarmID > 0) {
+                // Skip alarms that are in the past (only if we have valid time)
+                if (hasTime && loadedAlarm.triggerTime < now && !loadedAlarm.snoozed) {
+                    Serial.printf("[NVS] Skipping past alarm ID=%u (expired)\n", loadedAlarm.alarmID);
+                    continue;
+                }
+                
+                alarms[i] = loadedAlarm;
+                loadedCount++;
+                
+                // Format time for logging
+                struct tm alarmTime;
+                localtime_r(&loadedAlarm.triggerTime, &alarmTime);
+                char timeStr[20];
+                strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M", &alarmTime);
+                Serial.printf("[NVS] Loaded alarm ID=%u at %s (slot %d)\n", 
+                             loadedAlarm.alarmID, timeStr, i);
+            }
+        }
+    }
+    
+    alarmPrefs.end();
+    
+    if (loadedCount > 0) {
+        alarmState.active = true;
+        Serial.printf("[NVS] Restored %d valid alarm(s)\n", loadedCount);
+    } else {
+        Serial.println("[NVS] No valid alarms to restore");
+    }
 }
 
 // ============================================================
@@ -443,7 +585,7 @@ void setup() {
 static void checkAlarms() {
     static uint32_t lastAlarmCheck = 0;
     // Check alarms every 10 seconds
-    if (alarmState.active && !alarmState.ringing && millis() - lastAlarmCheck > ALARM_CHECK_INTERVAL_MS) {
+    if (alarmState.active && !alarmState.ringing && (int32_t)(millis() - lastAlarmCheck) > ALARM_CHECK_INTERVAL_MS) {
         struct tm timeinfo;
         if (getLocalTime(&timeinfo)) {
             time_t now = mktime(&timeinfo);
@@ -523,7 +665,7 @@ static void checkAlarms() {
 
 static void handleFlashAnimations() {
     // Handle non-blocking Pomodoro flash animation
-    if (pomodoroState.flashing && (millis() - pomodoroState.flashStartTime) >= 200) {
+    if (pomodoroState.flashing && (int32_t)(millis() - pomodoroState.flashStartTime) >= 200) {
         pomodoroState.flashCount++;
         pomodoroState.flashStartTime = millis();
         
@@ -532,15 +674,17 @@ static void handleFlashAnimations() {
             pomodoroState.flashing = false;
         } else {
             // Toggle LED state
-            if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-                if (pomodoroState.flashCount % 2 == 0) {
-                    fill_solid(leds, NUM_LEDS, CRGB::White);
-                } else {
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                }
-                FastLED.show();
-                xSemaphoreGive(ledMutex);
+            if (xSemaphoreTake(ledMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                Serial.println("CRITICAL: ledMutex deadlock in Pomodoro flash - rebooting");
+                esp_restart();
             }
+            if (pomodoroState.flashCount % 2 == 0) {
+                fill_solid(leds, NUM_LEDS, CRGB::White);
+            } else {
+                fill_solid(leds, NUM_LEDS, CRGB::Black);
+            }
+            FastLED.show();
+            xSemaphoreGive(ledMutex);
         }
     }
     
@@ -665,6 +809,9 @@ static void resumeRadioStream() {
 
 // ============== MAIN LOOP ==============
 void loop() {
+    // Feed watchdog timer at start of every loop iteration
+    esp_task_wdt_reset();
+    
     static uint32_t lastPrint = 0;
     static uint32_t lastWiFiCheck = 0;
     static uint32_t lastBrightnessCheck = 0;
@@ -723,7 +870,7 @@ const uint32_t debounceDelay = DEBOUNCE_DELAY_MS;  // TTP223 has hardware deboun
     static uint32_t button1PressStart = 0;
 const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
     
-    if (millis() > bootIgnoreTime && (millis() - lastDebounceTime) > debounceDelay) {
+    if (millis() > bootIgnoreTime && (int32_t)(millis() - lastDebounceTime) > debounceDelay) {
         bool startTouch = digitalRead(TOUCH_PAD_START_PIN) == HIGH;
         bool stopTouch = digitalRead(TOUCH_PAD_STOP_PIN) == HIGH;
         
@@ -1026,11 +1173,13 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 i2sZeroSafe();
                 
                 // Clear LED buffer (with mutex)
-                if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                    FastLED.show();
-                    xSemaphoreGive(ledMutex);
+                if (xSemaphoreTake(ledMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                    Serial.println("CRITICAL: ledMutex deadlock in AMBIENT->RADIO - rebooting");
+                    esp_restart();
                 }
+                fill_solid(leds, NUM_LEDS, CRGB::Black);
+                FastLED.show();
+                xSemaphoreGive(ledMutex);
                 delay(50);
                 
                 // Stop ambient audio
@@ -1110,11 +1259,13 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 i2sZeroSafe();
 
                 // Clear LED buffer
-                if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                    FastLED.show();
-                    xSemaphoreGive(ledMutex);
+                if (xSemaphoreTake(ledMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                    Serial.println("CRITICAL: ledMutex deadlock in Pomodoro init - rebooting");
+                    esp_restart();
                 }
+                fill_solid(leds, NUM_LEDS, CRGB::Black);
+                FastLED.show();
+                xSemaphoreGive(ledMutex);
                 delay(50);
 
                 // Initialize Pomodoro state if not already active
@@ -1155,17 +1306,19 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 i2sZeroSafe();
                 
                 // Clear LED buffer to remove Pomodoro timer visualization (with mutex)
-                if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-                    if (currentLEDMode == LED_MEDITATION) {
-                        DEBUG_PRINT(" INTERRUPTING meditation: Pomodoro mode transition (2x clear)\n");
-                    }
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                    FastLED.show();
-                    delay(30);
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                    FastLED.show();
-                    xSemaphoreGive(ledMutex);
+                if (xSemaphoreTake(ledMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                    Serial.println("CRITICAL: ledMutex deadlock in meditation - rebooting");
+                    esp_restart();
                 }
+                if (currentLEDMode == LED_MEDITATION) {
+                    DEBUG_PRINT(" INTERRUPTING meditation: Pomodoro mode transition (2x clear)\n");
+                }
+                fill_solid(leds, NUM_LEDS, CRGB::Black);
+                FastLED.show();
+                delay(30);
+                fill_solid(leds, NUM_LEDS, CRGB::Black);
+                FastLED.show();
+                xSemaphoreGive(ledMutex);
                 delay(50);  // Let everything settle
                 
                 // Initialize meditation state
@@ -1257,12 +1410,13 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 lampState.fullyLit = false;
                 
                 // Clear lamp LEDs immediately to prevent a one-frame colour flash
-                if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                    FastLED.show();
-                    xSemaphoreGive(ledMutex);
-                }
-                
+ if (xSemaphoreTake(ledMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+ Serial.println("CRITICAL: ledMutex deadlock in lamp exit - rebooting");
+ esp_restart();
+ }
+ fill_solid(leds, NUM_LEDS, CRGB::Black);
+ FastLED.show();
+ xSemaphoreGive(ledMutex);
                 // Initialize Eye Animation visualizer
                 eyeAnimation.begin();
                 
@@ -1270,12 +1424,13 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             } else if (modeToCheck == LED_EYES) {
                 // Exit Eye Animation and return to IDLE
                 // Clear LED buffer (with mutex)
-                if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                    FastLED.show();
-                    xSemaphoreGive(ledMutex);
-                }
-                
+ if (xSemaphoreTake(ledMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+ Serial.println("CRITICAL: ledMutex deadlock in AMBIENT->RADIO transition - rebooting");
+ esp_restart();
+ }
+ fill_solid(leds, NUM_LEDS, CRGB::Black);
+ FastLED.show();
+ xSemaphoreGive(ledMutex);
                 // Stop audio
                 JsonDocument stopDoc;
                 stopDoc["action"] = "stopAmbient";
@@ -1478,12 +1633,13 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 ambientSound.drainUntil = millis() + 1000;  // Drain for 1s
                 
                 // Clear LEDs (with mutex)
-                if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-                    fill_solid(leds, NUM_LEDS, CRGB::Black);
-                    FastLED.show();
-                    xSemaphoreGive(ledMutex);
-                }
-                
+ if (xSemaphoreTake(ledMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+ Serial.println("CRITICAL: ledMutex deadlock in meditation clear - rebooting");
+ esp_restart();
+ }
+ fill_solid(leds, NUM_LEDS, CRGB::Black);
+ FastLED.show();
+ xSemaphoreGive(ledMutex);
                 Serial.println("Meditation state fully cleared - returning to idle");
                 
                 // Return to idle
@@ -1500,7 +1656,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         // corrupting the DMA descriptor chain and triggering a Guru Meditation crash.
         else if (!meditationHandled && currentLEDMode != LED_MEDITATION && startRisingEdge &&
             isPlayingResponse && !isPlayingAmbient && !turnComplete &&
-            (millis() - lastAudioChunkTime) < INTERRUPT_AUDIO_TIMEOUT_MS) {
+            (int32_t)(millis() - lastAudioChunkTime) < INTERRUPT_AUDIO_TIMEOUT_MS) {
             DEBUG_PRINTLN("  Interrupted response - starting new recording");
             responseInterrupted = true;  // Flag to ignore remaining audio chunks
             isPlayingResponse = false;
@@ -1716,7 +1872,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         
         // Stop recording only on timeout (manual stop removed - rely on VAD)
         // Mutex-protected to prevent race with button handlers starting new recording
-        if (recordingActive && (millis() - recordingStartTime) > MAX_RECORDING_DURATION_MS) {
+        if (recordingActive && (int32_t)(millis() - recordingStartTime) > MAX_RECORDING_DURATION_MS) {
             if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 recordingActive = false;
                 xSemaphoreGive(recordingMutex);
@@ -1739,7 +1895,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
     
     // Auto-stop on silence (VAD)
     // Mutex-protected to prevent race with button handlers
-    if (recordingActive && (millis() - lastVoiceActivityTime) > VAD_SILENCE_MS) {
+    if (recordingActive && (int32_t)(millis() - lastVoiceActivityTime) > VAD_SILENCE_MS) {
         if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             recordingActive = false;
             recordingStartSent = false;  // Clear flag to ensure next recording sends state
@@ -1763,7 +1919,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
     // Guard on !isPlayingResponse: once audio starts arriving the VU meter must win.
     if (convState == ConvState::WAITING &&
         !isPlayingResponse &&
-        (millis() - waitingEnteredAt) > THINKING_ANIMATION_DELAY_MS) {
+        (int32_t)(millis() - waitingEnteredAt) > THINKING_ANIMATION_DELAY_MS) {
         currentLEDMode = LED_PROCESSING;
         DEBUG_PRINTLN(" Response delayed - showing thinking animation");
     }
@@ -1772,7 +1928,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
     // Checked against convState==WAITING, not against currentLEDMode, so visualizations
     // (tide/moon/timer) cannot accidentally reset or suppress the guard.
     if (convState == ConvState::WAITING &&
-        (millis() - waitingEnteredAt) > 60000) {
+        (int32_t)(millis() - waitingEnteredAt) > 60000) {
         Serial.printf("  Gemini response timeout after 60s (LED=%d)\n", currentLEDMode);
         transitionConvState(ConvState::IDLE);
         
@@ -1814,7 +1970,7 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
     if (convState == ConvState::PLAYING &&
         !isPlayingResponse &&
         waitingEnteredAt > 0 &&
-        (millis() - waitingEnteredAt) > 60000) {
+        (int32_t)(millis() - waitingEnteredAt) > 60000) {
         Serial.printf("  PLAYING timeout - turnComplete never arrived after 60s\n");
         transitionConvState(ConvState::IDLE);
         if (pomodoroState.active) {
@@ -1869,8 +2025,8 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         // Mixed mode (radio + Gemini): radio keeps lastAudioChunkTime and queue populated,
         // so use Gemini-specific timer and skip queue-depth check.
         bool noNewPackets = isPlayingAmbient
-            ? (millis() - lastGeminiAudioTime) > 3000   // mixed: Gemini-only timer
-            : (millis() - lastAudioChunkTime)  > 300;   // solo: 300ms matches reduced DMA pipeline (~128ms)
+            ? (int32_t)(millis() - lastGeminiAudioTime) > 3000   // mixed: Gemini-only timer
+            : (int32_t)(millis() - lastAudioChunkTime)  > 300;   // solo: 300ms matches reduced DMA pipeline (~128ms)
         bool queueDrained = !isPlayingAmbient && queueDepth < 3;  // skip in mixed mode
         
         if (noNewPackets && (queueDrained || isPlayingAmbient)) {
@@ -2332,7 +2488,15 @@ bool detectVoiceActivity(int16_t* samples, size_t count) {
 // ============== AUDIO PROCESSING TASK ==============
 void audioTask(void * parameter) {
     int16_t inputBuffer[MIC_FRAME_SIZE];  // For microphone recording (320 samples = 20ms @ 16kHz)
-    static int16_t stereoBuffer[1920];  // For playback stereo conversion (960 samples * 2 channels)
+    // Allocate stereoBuffer on heap to reduce stack pressure
+    static int16_t* stereoBuffer = nullptr;
+    if (!stereoBuffer) {
+        stereoBuffer = (int16_t*)heap_caps_malloc(1920 * sizeof(int16_t), MALLOC_CAP_8BIT);
+        if (!stereoBuffer) {
+            Serial.println("CRITICAL: Failed to allocate stereoBuffer - rebooting");
+            esp_restart();
+        }
+    }
     size_t bytes_read = 0;
     static uint32_t lastDebug = 0;
     AudioChunk playbackChunk;
@@ -2413,9 +2577,14 @@ void audioTask(void * parameter) {
         }
         
         // PRIORITY 2: Recording (only when not playing)
-        if (recordingActive && !isPlayingResponse) {
-            if (i2s_read(I2S_NUM_0, inputBuffer, MIC_FRAME_SIZE * sizeof(int16_t), &bytes_read, 100) == ESP_OK) {
-                if (bytes_read == MIC_FRAME_SIZE * sizeof(int16_t)) {
+        // Hold recordingMutex during entire recording operation to prevent race conditions
+        if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            if (recordingActive && !isPlayingResponse) {
+                static uint32_t i2sReadErrors = 0;
+                esp_err_t readResult = i2s_read(I2S_NUM_0, inputBuffer, MIC_FRAME_SIZE * sizeof(int16_t), &bytes_read, 100);
+                if (readResult == ESP_OK) {
+                    i2sReadErrors = 0;  // Reset error counter on success
+                    if (bytes_read == MIC_FRAME_SIZE * sizeof(int16_t)) {
                     // Apply software gain
                     const int16_t GAIN = 16;
                     for (size_t i = 0; i < MIC_FRAME_SIZE; i++) {
@@ -2532,7 +2701,11 @@ void audioTask(void * parameter) {
                     // to avoid sending audio after activityEnd has already been forwarded.
                     // NOTE: must be `continue` not `break` — `break` exits the outer while(1)
                     // which causes audioTask to return, hitting the ILL trap at line 2490.
-                    if (!recordingActive) continue;
+                    // With recordingMutex held, this re-check is now redundant (kept for documentation).
+                    if (!recordingActive) {
+                        xSemaphoreGive(recordingMutex);
+                        continue;
+                    }
 
                     // Send raw PCM
                     sendAudioChunk((uint8_t*)inputBuffer, bytes_read);
@@ -2540,12 +2713,27 @@ void audioTask(void * parameter) {
                     if (hasVoice) {
                         lastVoiceActivityTime = millis();
                     }
+                }  // Close bytes_read == MIC_FRAME_SIZE check
+            } else {
+                // I2S read error - increment counter and attempt recovery
+                i2sReadErrors++;
+                Serial.printf("I2S microphone read error: %d (count: %u)\\n", readResult, i2sReadErrors);
+                if (i2sReadErrors > 50) {
+                    Serial.println("CRITICAL: I2S microphone persistent failure - reinitializing");
+                    i2s_driver_uninstall(I2S_NUM_0);
+                    delay(100);
+                    initI2SMic();
+                    i2sReadErrors = 0;
                 }
             }
-        } else if (conversationMode || isAmbientVUMode) {
-            recordingStartSent = false;  // Not recording - reset flag for next recording
-            // audioTask is the sole reader of I2S_NUM_0. When the main loop opens a
-            // conversation window, or the LED task needs ambient VU levels, this branch
+        }  // Close if (recordingActive && !isPlayingResponse)
+        xSemaphoreGive(recordingMutex);
+    }  // Close xSemaphoreTake block
+    
+    // PRIORITY 3: Ambient VU meter and conversation VAD (separate from recording mutex)
+    if (conversationMode || isAmbientVUMode) {
+        // audioTask is the sole reader of I2S_NUM_0. When the main loop opens a
+        // conversation window, or the LED task needs ambient VU levels, this branch
             // reads the mic and posts results via the two volatile shared values above.
             // Neither loop() nor ledTask call i2s_read(I2S_NUM_0) directly.
             static int16_t micBuf[MIC_FRAME_SIZE];  // 320 samples = 20ms at 16kHz
@@ -2609,7 +2797,6 @@ void audioTask(void * parameter) {
             vTaskDelay(pdMS_TO_TICKS(5));  // 5 ms = ~200 Hz mic poll rate (plenty for VAD)
         } else {
             // Nothing to do - sleep briefly
-            recordingStartSent = false;  // Not recording - reset flag for next recording
             vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
@@ -2662,10 +2849,12 @@ void playShutdownSound() {
  }
  
  size_t bytes_written;
- if (xSemaphoreTake(i2sSpeakerMutex, portMAX_DELAY) == pdTRUE) {
-     i2s_write(I2S_NUM_1, toneBuffer, numSamples * 4, &bytes_written, pdMS_TO_TICKS(200));
-     xSemaphoreGive(i2sSpeakerMutex);
+ if (xSemaphoreTake(i2sSpeakerMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+     Serial.println("CRITICAL: i2sSpeakerMutex deadlock in playShutdownSound - rebooting");
+     esp_restart();
  }
+ i2s_write(I2S_NUM_1, toneBuffer, numSamples * 4, &bytes_written, pdMS_TO_TICKS(200));
+ xSemaphoreGive(i2sSpeakerMutex);
  }
 }
 
@@ -2778,11 +2967,13 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 Serial.println("Waiting for 'ready' message from server");
                 
                 // Show connection on LEDs (with mutex)
-                if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-                    fill_solid(leds, NUM_LEDS, CRGB::Green);
-                    FastLED.show();
-                    xSemaphoreGive(ledMutex);
+                if (xSemaphoreTake(ledMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                    Serial.println("CRITICAL: ledMutex deadlock in WebSocket connect - rebooting");
+                    esp_restart();
                 }
+                fill_solid(leds, NUM_LEDS, CRGB::Green);
+                FastLED.show();
+                xSemaphoreGive(ledMutex);
                 vTaskDelay(pdMS_TO_TICKS(500));  // Yield properly in FreeRTOS task context
                 
                 // Resume ambient mode if it was active before disconnect
@@ -2889,7 +3080,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                         static uint32_t discardsSinceLog = 0;
                         discardsSinceLog++;
                         
-                        if (millis() - lastDiscardLog > 10000) {
+                        if ((int32_t)(millis() - lastDiscardLog) > 10000) {
                             if (discardsSinceLog > 0) {
                                 Serial.printf("Discarded %u stale ambient chunks in last 10s (seq %d, active=%d, expected=%d)\n", 
                                              discardsSinceLog, chunkSequence, ambientSound.active, ambientSound.sequence);
@@ -2929,7 +3120,7 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 // (e.g. zen bell chunks still in TCP pipeline from previous Pomodoro mode)
                 if (!isAmbientPacket && !isPlayingAlarm && meditationState.active && !isPlayingResponse) {
                     static uint32_t lastStaleLog = 0;
-                    if (millis() - lastStaleLog > 2000) {
+                    if ((int32_t)(millis() - lastStaleLog) > 2000) {
                         Serial.println("Discarding stale non-ambient chunk during meditation");
                         lastStaleLog = millis();
                     }
@@ -2976,20 +3167,34 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     
                     // Block up to 100ms if queue is full (applies backpressure to TCP)
                     // This prevents bursting by slowing down the receive rate
+                    static uint32_t consecutiveDrops = 0;
                     if (xQueueSend(audioOutputQueue, &chunk, pdMS_TO_TICKS(100)) != pdTRUE) {
                         // Only drop if truly stuck (audio system frozen)
+                        consecutiveDrops++;
                         static uint32_t lastDropWarning = 0;
                         static uint32_t dropsince = 0;
                         dropsince++;
-                        if (millis() - lastDropWarning > 2000) {
+                        if ((int32_t)(millis() - lastDropWarning) > 2000) {
                             if (dropsince > 0) {
-                                Serial.printf("Blocked on queue for 100ms+ (%u times, queue=%u/%u) - audio system may be frozen\n", 
-                                             dropsince, queueBefore, AUDIO_QUEUE_SIZE);
+                                Serial.printf("Blocked on queue for 100ms+ (%u times, queue=%u/%u, consecutive=%u) - audio system may be frozen\n", 
+                                             dropsince, queueBefore, AUDIO_QUEUE_SIZE, consecutiveDrops);
                                 dropsince = 0;
                             }
                             lastDropWarning = millis();
                         }
+                        // Persistent queue overflow - audioTask may be deadlocked
+                        if (consecutiveDrops > 20) {
+                            Serial.println("CRITICAL: Audio queue blocked for 20+ packets - setting LED_ERROR and restarting audioTask");
+                            currentLEDMode = LED_ERROR;
+                            // Don't restart task here - just set error LED and clear queue
+                            // Restarting task from ISR context is unsafe
+                            AudioChunk dummy;
+                            while (xQueueReceive(audioOutputQueue, &dummy, 0) == pdTRUE) {}
+                            consecutiveDrops = 0;
+                        }
                         break;  // discard this chunk — queue blocked
+                    } else {
+                        consecutiveDrops = 0;  // Reset counter on successful send
                     }
                 } else {
                     Serial.printf("PCM chunk too large: %d bytes\n", length);
@@ -3043,11 +3248,13 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                         // Clear all LEDs immediately when starting Gemini playback (not for ambient/radio -
                         // clearing LEDs for radio would cause a visible flash every drain/prebuf cycle)
                         if (!isPlayingAmbient && !isPlayingAlarm) {
-                            if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-                                fill_solid(leds, NUM_LEDS, CRGB::Black);
-                                FastLED.show();
-                                xSemaphoreGive(ledMutex);
+                            if (xSemaphoreTake(ledMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                                Serial.println("CRITICAL: ledMutex deadlock in audio start - rebooting");
+                                esp_restart();
                             }
+                            fill_solid(leds, NUM_LEDS, CRGB::Black);
+                            FastLED.show();
+                            xSemaphoreGive(ledMutex);
                         }
                         // Clear delay buffer for clean LED sync
                         for (int i = 0; i < AUDIO_DELAY_BUFFER_SIZE; i++) {
@@ -3066,47 +3273,61 @@ void onWebSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     } else {
                         // Silent prebuffering phase - log once per stream
                         static uint32_t lastPrebufferLog = 0;
-                        if (millis() - lastPrebufferLog > 1000) {
+                        if ((int32_t)(millis() - lastPrebufferLog) > 1000) {
                             Serial.printf("Prebuffering... (%u/%u packets)\n", queueDepth, MIN_PREBUFFER);
                             lastPrebufferLog = millis();
                         }
                     }
-                }
+                }  // Close if (!isPlayingResponse)
             }
             break;
             
         case WStype_DISCONNECTED:
-            disconnectCount++;
-            lastDisconnectTime = millis();
-            Serial.printf("WebSocket Disconnected (#%d) - isPlaying=%d, recording=%d, uptime=%lus\n",
-                         disconnectCount, isPlayingResponse, recordingActive, millis()/1000);
-            isWebSocketConnected = false;
-            
-            // Clear Gemini session state to prevent stale flags from previous session
-            turnComplete = false;  // Prevent spurious conversation window on reconnect
-            transitionConvState(ConvState::IDLE);  // Reset conversation state machine
-            
-            // Clear session-scoped visualizations (tide/moon/timer persist across reconnects)
-            tideState.active = false;
-            moonState.active = false;
-            // Note: Keep timer and alarm state — those should persist across reconnections
-            
-            // Pause ambient playback but keep mode state for resume on reconnect
-            if (isPlayingAmbient || ambientSound.active) {
-                Serial.printf("Pausing ambient sound due to disconnect: %s (will resume)\n", ambientSound.name);
-                isPlayingAmbient = false;
-                isPlayingResponse = false;
-                // Keep ambientSound.active and name to resume on reconnect
-            }
-            
-            // Play shutdown sound only once per disconnect session
-            if (!shutdownSoundPlayed) {
-                playShutdownSound();
-                shutdownSoundPlayed = true;
-            }
-            // Don't set error mode - this is expected during reconnection attempts
-            if (currentLEDMode == LED_CONNECTED) {
-                currentLEDMode = LED_IDLE;
+            {
+                disconnectCount++;
+                lastDisconnectTime = millis();
+                Serial.printf("WebSocket Disconnected (#%d) - isPlaying=%d, recording=%d, uptime=%lus\n",
+                             disconnectCount, isPlayingResponse, recordingActive, millis()/1000);
+                isWebSocketConnected = false;
+                
+                // Save state for potential recovery after reconnect
+                bool hadPomodoro = pomodoroState.active;
+                bool hadMeditation = meditationState.active;
+                bool hadTimer = timerState.active;
+                bool hadAlarm = alarmState.active;
+                
+                // Clear Gemini session state to prevent stale flags from previous session
+                turnComplete = false;  // Prevent spurious conversation window on reconnect
+                transitionConvState(ConvState::IDLE);  // Reset conversation state machine
+                
+                // Clear session-scoped visualizations (tide/moon/timer persist across reconnects)
+                tideState.active = false;
+                moonState.active = false;
+                // Note: Keep timer and alarm state — those should persist across reconnections
+                
+                // Pause ambient playback but keep mode state for resume on reconnect
+                if (isPlayingAmbient || ambientSound.active) {
+                    Serial.printf("Pausing ambient sound due to disconnect: %s (will resume)\n", ambientSound.name);
+                    isPlayingAmbient = false;
+                    isPlayingResponse = false;
+                    // Keep ambientSound.active and name to resume on reconnect
+                }
+                
+                // Log state preservation for recovery
+                if (hadPomodoro || hadMeditation || hadTimer || hadAlarm) {
+                    Serial.printf("[STATE] Preserved: Pomodoro=%d, Meditation=%d, Timer=%d, Alarm=%d\n",
+                                 hadPomodoro, hadMeditation, hadTimer, hadAlarm);
+                }
+                
+                // Play shutdown sound only once per disconnect session
+                if (!shutdownSoundPlayed) {
+                    playShutdownSound();
+                    shutdownSoundPlayed = true;
+                }
+                // Don't set error mode - this is expected during reconnection attempts
+                if (currentLEDMode == LED_CONNECTED) {
+                    currentLEDMode = LED_IDLE;
+                }
             }
             break;
             
@@ -3215,16 +3436,40 @@ void websocketTask(void * parameter) {
             }
             
             // Hourly summary for leak detection
-            uint32_t uptime = (millis() - startTime) / 1000;
+            uint32_t uptime = (uint32_t)max(0, (int32_t)(millis() - startTime)) / 1000;
             if (uptime > 0 && uptime % 3600 == 0) {
+                // Stack watermark monitoring
+                UBaseType_t audioStackHighWater = audioTaskHandle ? uxTaskGetStackHighWaterMark(audioTaskHandle) : 0;
+                UBaseType_t ledStackHighWater = ledTaskHandle ? uxTaskGetStackHighWaterMark(ledTaskHandle) : 0;
+                UBaseType_t wsStackHighWater = uxTaskGetStackHighWaterMark(NULL);  // Current task
+                
+                // Heap fragmentation analysis
+                uint32_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+                uint32_t minFreeHeap = esp_get_minimum_free_heap_size();
+                float fragmentationPercent = freeHeap > 0 ? (1.0f - ((float)largestBlock / (float)freeHeap)) * 100.0f : 0.0f;
+                
                 Serial.printf("\n\n");
                 Serial.printf("HOURLY MEMORY REPORT - %u hours runtime  \n", uptime/3600);
                 Serial.printf("\n");
                 Serial.printf("Current Heap:  %6u KB                \n", freeHeap/1024);
                 Serial.printf("Startup Heap:  %6u KB                \n", startupHeap/1024);
                 Serial.printf("Lowest Heap:   %6u KB                \n", lowestHeap/1024);
+                Serial.printf("Min Free Ever: %6u KB                \n", minFreeHeap/1024);
                 Serial.printf("Heap Lost:     %6u KB                \n", (startupHeap - freeHeap)/1024);
+                Serial.printf("Largest Block: %6u KB                \n", largestBlock/1024);
+                Serial.printf("Fragmentation: %5.1f%%                \n", fragmentationPercent);
                 Serial.printf("PSRAM Free:    %6u KB                \n", freePsram/1024);
+                Serial.printf("\n");
+                Serial.printf("Stack Free - Audio:%u LED:%u WS:%u bytes\n", 
+                             audioStackHighWater, ledStackHighWater, wsStackHighWater);
+                if (audioStackHighWater < 2048) {
+                    Serial.printf("WARNING: audioTask stack nearly exhausted (%u bytes free)\n", audioStackHighWater);
+                }
+                if (fragmentationPercent > 40.0f) {
+                    Serial.printf("WARNING: Heap fragmentation high (%.1f%%) - largest block %u KB\n", 
+                                 fragmentationPercent, largestBlock/1024);
+                }
+                Serial.printf("\n");
                 Serial.printf("Mode: %-30s    \n", 
                     currentLEDMode == LED_IDLE ? "IDLE" :
                     currentLEDMode == LED_AMBIENT ? "AMBIENT" :
@@ -3250,14 +3495,38 @@ void websocketTask(void * parameter) {
         }
         
         // Monitor WiFi connection and attempt reconnection if needed
-        if (millis() - lastConnCheck > 5000) {  // Check every 5s (more frequent)
-            if (WiFi.status() != WL_CONNECTED) {
-                Serial.printf("[WebSocket Task] WiFi disconnected! Status: %d - Attempting reconnect...\n", WiFi.status());
+        if ((int32_t)(millis() - lastConnCheck) > 5000) {  // Check every 5s (more frequent)
+            static uint32_t wifiDisconnectTime = 0;
+            static bool previousWiFiState = true;
+            bool currentWiFiState = (WiFi.status() == WL_CONNECTED);
+            
+            // Detect WiFi disconnect event
+            if (previousWiFiState && !currentWiFiState) {
+                wifiDisconnectTime = millis();
+                Serial.printf("[WiFi] Connection lost (status %d) - RSSI was %d dBm\n", 
+                             WiFi.status(), lastRSSI);
+            }
+            
+            if (!currentWiFiState) {
+                uint32_t disconnectDuration = millis() - wifiDisconnectTime;
+                Serial.printf("[WiFi] Disconnected for %u seconds (status %d) - Attempting reconnect...\n", 
+                             disconnectDuration/1000, WiFi.status());
                 WiFi.reconnect();
+                
+                // After 30 seconds, try full disconnect/reconnect cycle
+                if (disconnectDuration > 30000) {
+                    Serial.println("[WiFi] Long disconnect - performing full restart");
+                    WiFi.disconnect();
+                    delay(1000);
+                    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+                    wifiDisconnectTime = millis();  // Reset timer
+                }
             } else if (!isWebSocketConnected) {
                 int32_t rssi = WiFi.RSSI();
-                Serial.printf("[WebSocket Task] WebSocket not connected. WiFi RSSI: %d dBm\n", rssi);
+                Serial.printf("[WebSocket] Not connected. WiFi RSSI: %d dBm\n", rssi);
             }
+            
+            previousWiFiState = currentWiFiState;
             lastConnCheck = millis();
         }
         
@@ -3281,22 +3550,23 @@ void ledTask(void * parameter) {
         }
         
         // Mutex-protected LED rendering
-        if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
-            // Track updateLEDs calls
-            static uint32_t updateCount = 0;
-            static uint32_t lastUpdateLog = 0;
-            updateCount++;
-            
-            if (millis() - lastUpdateLog > 30000) {
-                // Serial.printf("LED task: %u updates in 30s (expect ~990)\n", updateCount);  // Disabled for clean logging
-                updateCount = 0;
-                lastUpdateLog = millis();
-            }
-            
-            updateLEDs();
-            FastLED.show();
-            xSemaphoreGive(ledMutex);
+        if (xSemaphoreTake(ledMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            Serial.println("CRITICAL: ledMutex deadlock in ledTask - rebooting");
+            esp_restart();
         }
+        static uint32_t updateCount = 0;
+        static uint32_t lastUpdateLog = 0;
+        updateCount++;
+        
+        if (millis() - lastUpdateLog > 30000) {
+            // Serial.printf("LED task: %u updates in 30s (expect ~990)\n", updateCount);  // Disabled for clean logging
+            updateCount = 0;
+            lastUpdateLog = millis();
+        }
+        
+        updateLEDs();
+        FastLED.show();
+        xSemaphoreGive(ledMutex);
         lastLedUpdate = millis();
         
         vTaskDelay(30 / portTICK_PERIOD_MS);  // 33Hz update rate - matches audio chunk timing better

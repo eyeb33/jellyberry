@@ -188,6 +188,151 @@ const GEMINI_SOFT_RENEWAL_MS = 7 * 60 * 1000;
 // Supports multiple simultaneous users automatically.
 const kv = await Deno.openKv();
 
+// ══════════════════════════════════════════════════════════════════════════════
+// Memory Persistence Functions
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Hot Tier Memory — Curated facts always injected into system prompt
+ * Stored at ["memory", "facts", deviceId]
+ * Returns a formatted bullet list capped at ~600 chars
+ */
+async function readHotMemory(deviceId: string): Promise<string> {
+  const result = await kv.get<Record<string, string[]>>(["memory", "facts", deviceId]);
+  if (!result.value) return "";
+  
+  const facts = result.value;
+  const lines: string[] = [];
+  
+  // Format each category's facts as bullets
+  for (const [category, values] of Object.entries(facts)) {
+    if (values.length > 0) {
+      lines.push(`${category}:`);
+      values.forEach(v => lines.push(`  • ${v}`));
+    }
+  }
+  
+  let formatted = lines.join("\n");
+  
+  // Hard cap at 600 chars to prevent token creep
+  if (formatted.length > 600) {
+    formatted = formatted.substring(0, 600) + "...";
+    console.log(`[${deviceId}] [memory] Hot tier truncated to 600 chars`);
+  }
+  
+  return formatted;
+}
+
+/**
+ * Update a fact in hot tier memory
+ * Facts are organized by category (user_fact, preference, note)
+ * Each category stores an array of strings
+ */
+async function updateFact(deviceId: string, category: string, value: string): Promise<void> {
+  const key = ["memory", "facts", deviceId];
+  const result = await kv.get<Record<string, string[]>>(key);
+  
+  const facts = result.value || {};
+  if (!facts[category]) {
+    facts[category] = [];
+  }
+  
+  // Add new fact, keep only last 5 per category to prevent bloat
+  facts[category].push(value);
+  if (facts[category].length > 5) {
+    facts[category] = facts[category].slice(-5);
+  }
+  
+  await kv.set(key, facts);
+  console.log(`[${deviceId}] [memory] Stored ${category}: ${value}`);
+}
+
+/**
+ * Cold Tier Memory — Session summaries stored per day
+ * Stored at ["memory", "sessions", deviceId, ISO_DATE]
+ * Returns formatted summaries from last N days
+ */
+async function readColdMemory(deviceId: string, daysBack: number): Promise<string> {
+  const summaries: string[] = [];
+  const today = new Date();
+  
+  for (let i = 0; i < daysBack; i++) {
+    const date = new Date(today);
+    date.setDate(date.getDate() - i);
+    const dateKey = date.toISOString().split('T')[0]; // YYYY-MM-DD
+    
+    const result = await kv.get<string>(["memory", "sessions", deviceId, dateKey]);
+    if (result.value) {
+      summaries.push(`${dateKey}: ${result.value}`);
+    }
+  }
+  
+  return summaries.length > 0 
+    ? summaries.join("\n") 
+    : "No session summaries found for the requested period.";
+}
+
+/**
+ * Generate a 2-sentence summary of a session transcript using Gemini REST API
+ */
+async function generateSessionSummary(transcript: string): Promise<string> {
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{
+            parts: [{
+              text: `Summarize this conversation in 2 sentences. Focus on key topics discussed and any notable facts about the user:\n\n${transcript}`
+            }]
+          }],
+          generationConfig: {
+            temperature: 0.3,
+            maxOutputTokens: 100
+          }
+        })
+      }
+    );
+    
+    if (!response.ok) {
+      console.error(`Gemini REST API error: ${response.status}`);
+      return "";
+    }
+    
+    const data = await response.json();
+    const summary = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    return summary.trim();
+  } catch (error) {
+    console.error("Failed to generate session summary:", error);
+    return "";
+  }
+}
+
+/**
+ * Prune session summaries older than 7 days
+ */
+async function pruneOldSessions(deviceId: string): Promise<void> {
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() - 7);
+  
+  // List all session entries for this device
+  const prefix = ["memory", "sessions", deviceId];
+  const entries = kv.list({ prefix });
+  
+  for await (const entry of entries) {
+    // Extract date from key: ["memory", "sessions", deviceId, "YYYY-MM-DD"]
+    const dateStr = entry.key[3] as string;
+    const entryDate = new Date(dateStr);
+    
+    if (entryDate < cutoffDate) {
+      await kv.delete(entry.key);
+      console.log(`[${deviceId}] [memory] Pruned old session: ${dateStr}`);
+    }
+  }
+}
+
 // Fetch tide data from StormGlass API
 async function fetchTideData() {
  const now = Date.now();
@@ -1073,6 +1218,39 @@ async function handleSetVolumeLevel(args: FuncArgs, conn: ClientConnection): Pro
   return { success: true, message: `Volume set to level ${level} (${level * 10}%). Confirm to the user.` };
 }
 
+async function handleStoreMemory(args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  const category = (args.category as string) || "note";
+  const value = (args.value as string) || "";
+  
+  if (!value) {
+    return { success: false, error: "No value provided to store" };
+  }
+  
+  console.log(`[${conn.deviceId}] store_memory: ${category} = ${value.substring(0, 50)}...`);
+  
+  try {
+    await updateFact(conn.deviceId, category, value);
+    return { success: true, message: "Memory stored successfully" };
+  } catch (error) {
+    console.error(`[${conn.deviceId}] Failed to store memory:`, error);
+    return { success: false, error: "Failed to store memory" };
+  }
+}
+
+async function handleRecallSessions(args: FuncArgs, conn: ClientConnection): Promise<ToolResult> {
+  const daysBack = Math.max(1, Math.min(7, (args.days_back as number) || 3));
+  
+  console.log(`[${conn.deviceId}] recall_sessions: ${daysBack} days`);
+  
+  try {
+    const summaries = await readColdMemory(conn.deviceId, daysBack);
+    return { success: true, message: summaries };
+  } catch (error) {
+    console.error(`[${conn.deviceId}] Failed to recall sessions:`, error);
+    return { success: false, error: "Failed to recall past sessions" };
+  }
+}
+
 // Maps Gemini funcName → handler. Unknown tools return { success: false, error: ... }.
 const toolHandlers: Record<string, ToolHandler> = {
   get_tide_status:       handleGetTideStatus,
@@ -1092,6 +1270,8 @@ const toolHandlers: Record<string, ToolHandler> = {
   play_radio:            handlePlayRadio,
   stop_radio:            handleStopRadio,
   set_volume_level:      handleSetVolumeLevel,
+  store_memory:          handleStoreMemory,
+  recall_sessions:       handleRecallSessions,
 };
 
 // ── ESP32 action handlers ────────────────────────────────────────────────────

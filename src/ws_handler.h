@@ -78,3 +78,6 @@ void transitionConvState(ConvState newState);
 
 // Safe WebSocket send wrapper — logs on failure, returns sendTXT result.
 bool wsSendMessage(const String& msg);
+
+// Alarm persistence to NVS (defined in main.cpp)
+void saveAlarmsToNVS();

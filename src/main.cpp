@@ -1001,14 +1001,6 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
         // IDLE -> VU Mode -> Sea Jelly -> Ambient -> Radio -> Pomodoro -> Meditation -> Lamp -> Eyes -> IDLE
         // Allow during ambient modes, block only during Gemini responses (non-ambient)
 
-        // Radio streaming: short press toggles VU visualizer, doesn't cycle mode
-        if (stopRisingEdge && !recordingActive && currentLEDMode == LED_RADIO && radioState.active && radioState.streaming) {
-            radioState.visualsActive = !radioState.visualsActive;
-            Serial.printf("Radio VU visuals: %s\n", radioState.visualsActive ? "ON" : "OFF");
-            lastDebounceTime = millis();
-            return;  // Early return to prevent mode cycle handler from also firing
-        }
-
         if (stopRisingEdge && !recordingActive &&
             !(isPlayingResponse && !isPlayingAmbient)) {
             // Stop any current ambient playback
@@ -1125,7 +1117,6 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
                 // Enter radio discovery mode
                 radioState.active = true;
                 radioState.streaming = false;
-                radioState.visualsActive = true;
                 radioState.stationName[0] = '\0';
                 radioState.streamUrl[0] = '\0';
                 volumeMultiplier = RADIO_DEFAULT_VOLUME;
@@ -1676,6 +1667,8 @@ const uint32_t BUTTON2_LONG_PRESS = LONG_PRESS_MS;
             }
             
             playVolumeChime();  // Confirmation beep
+            lastDebounceTime = millis();
+            return;  // Consume button press - don't trigger other handlers
         }
         // LAMP MODE: Button 1 cycles colors (WHITE  RED  GREEN  BLUE)
         else if (!meditationHandled && currentLEDMode == LED_LAMP && lampState.active && startRisingEdge) {

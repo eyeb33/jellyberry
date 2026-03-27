@@ -147,10 +147,15 @@ interface ClientConnection {
  lastMessageType?: string; // Type of last message received
  turnAudioChunks?: number; // Audio chunks in current turn
  turnAudioBytes?: number; // PCM bytes sent in current turn
+ incomingAudioChunks?: number; // Audio chunks sent FROM ESP32 TO Gemini in current turn
 
  // Idle management: timestamp of the last turn the user actually spoke into.
  // Used to suppress Gemini auto-reconnect when the device has been idle a long time.
  lastUserActivity?: number;
+
+ // True while user is actively speaking (activityStart sent but not yet activityEnd/turnComplete).
+ // Guards renewal logic to prevent closing Gemini mid-sentence.
+ userSpeakingActive?: boolean;
 
  // Set to true when a lazy (on-demand) Gemini reconnect is in progress.
  // Causes the next setupComplete to send reconnectComplete to the ESP32
@@ -183,9 +188,10 @@ const IDLE_RECONNECT_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
 // 540s gives a 60s buffer — enough headroom for any in-flight response.
 const GEMINI_SESSION_RENEWAL_MS = 9 * 60 * 1000;
 
-// Soft renewal fires 2 min earlier — ensures renewal happens cleanly between turns,
+// Soft renewal fires 30s earlier — ensures renewal happens cleanly between turns,
 // not mid-sentence, even if a turn is in progress at the 9-min mark.
-const GEMINI_SOFT_RENEWAL_MS = 7 * 60 * 1000;
+// Longer sessions = fewer summaries = better efficiency.
+const GEMINI_SOFT_RENEWAL_MS = 8.5 * 60 * 1000;
 
 // Deno KV — persists session memory across server restarts, keyed by deviceId.
 // Supports multiple simultaneous users automatically.
@@ -1553,6 +1559,8 @@ async function handleTypeRecordingStart(data: Record<string, unknown>, conn: Cli
   } else { parts.push("Timer: inactive"); }
   console.log(`[${conn.deviceId}] Device state: SYSTEM: Current device state ${parts.join(". ")}.`);
   if (conn.geminiSocket?.readyState === WebSocket.OPEN) {
+    conn.incomingAudioChunks = 0; // Reset counter for new turn
+    conn.userSpeakingActive = true;
     conn.geminiSocket.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
     console.log(`[${conn.deviceId}] activityStart → Gemini`);
   }
@@ -1573,6 +1581,7 @@ async function handleTypeRecordingStop(_data: Record<string, unknown>, conn: Cli
     conn.geminiSocket.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
     conn.userSpokeThisTurn = true;
     conn.geminiTurnActive = true;
+    conn.userSpeakingActive = false;
     console.log(`[${conn.deviceId}] activityEnd → Gemini`);
   }
 }
@@ -1665,6 +1674,10 @@ Deno.serve({ port: 8000, hostname: "0.0.0.0" }, (req: Request) => {
  const logData = typeof event.data === "string" ? event.data : `[binary ${event.data.byteLength} bytes]`;
  if (typeof event.data === "string" && event.data.length < 500) {
  console.log(`[${deviceId}] ESP32 Gemini:`, logData);
+ // Track incoming audio chunks (binary data from ESP32)
+ if (typeof event.data !== "string") {
+ connection.incomingAudioChunks = (connection.incomingAudioChunks || 0) + 1;
+ }
  }
  connection.geminiSocket.send(event.data);
  } else {
@@ -1762,7 +1775,7 @@ async function performRenewal(connection: ClientConnection) {
 
 function proactiveRenew(connection: ClientConnection) {
  if (!connection.geminiSocket || connection.geminiSocket.readyState !== WebSocket.OPEN) return;
- if (connection.geminiTurnActive) {
+ if (connection.geminiTurnActive || connection.userSpeakingActive) {
  console.log(`[${connection.deviceId}] [proactiveRenew] Turn in progress — deferring renewal until turnComplete`);
  connection.pendingRenewal = true;
  } else {
@@ -1784,6 +1797,7 @@ function connectToGemini(connection: ClientConnection) {
  connection.geminiSocket = new WebSocket(wsUrl);
  
  connection.geminiSocket.onopen = async () => {
+ connection.incomingAudioChunks = 0; // Clear audio counter for new session
  connection.geminiConnectedAt = Date.now();
  // Fresh connection — any stale dedup flag from the previous session must not
  // suppress the first generationComplete of this new session.
@@ -2171,7 +2185,7 @@ Memory: you have persistent memory across sessions. When you learn something wor
  connection.softRenewalArmed = false;
  connection.softRenewalTimer = setTimeout(() => {
  console.log(`[${connection.deviceId}] [softRenewal] 7-min mark reached`);
- if (!connection.geminiTurnActive) {
+ if (!connection.geminiTurnActive && !connection.userSpeakingActive) {
  console.log(`[${connection.deviceId}] [softRenewal] Idle — renewing immediately`);
  performRenewal(connection);
  } else {
@@ -2357,22 +2371,27 @@ Memory: you have persistent memory across sessions. When you learn something wor
  if (json.serverContent?.turnComplete || json.serverContent?.generationComplete) {
  if (connection.turnCompleteFired) {
  // Duplicate (e.g. turnComplete:true arriving after we already handled generationComplete)
- console.log(`[${connection.deviceId}] Ignoring duplicate turn-complete signal`);
- } else {
+ return;
+ }
  connection.turnCompleteFired = true;
+ 
+ const wasUserTurn = connection.userSpokeThisTurn;
  const audioChunks = connection.turnAudioChunks || 0;
- const wasUserTurn = connection.userSpokeThisTurn ?? false;
+ const incomingChunks = connection.incomingAudioChunks || 0;
  const audioMs = ((connection.turnAudioBytes || 0) / 2 / 24000 * 1000).toFixed(0);
  console.log(`[${connection.deviceId}] Turn complete audio: ${audioChunks} chunks, ${audioMs}ms`);
  connection.turnAudioChunks = 0;
  connection.turnAudioBytes = 0;
+ connection.incomingAudioChunks = 0; // Clear incoming counter
  connection.userSpokeThisTurn = false; // Ready for next turn
  connection.geminiTurnActive = false;
- // Ghost turn: user spoke but Gemini returned 0 audio (false VAD trigger, echo, or stale session).
+ connection.userSpeakingActive = false; // Clear speaking flag
+ // Ghost turn: user spoke AND sent audio but Gemini returned 0 audio (network drop, Gemini crash).
+ // Only reconnect if meaningful audio was actually sent (prevents accidental button presses from triggering reconnect).
  // Sending turnComplete here would open a conversation window which re-triggers the same
  // condition in a feedback loop. Instead: tell firmware to return to IDLE and refresh session.
- if (wasUserTurn && audioChunks === 0) {
- console.log(`[${connection.deviceId}] Ghost turn detected (user spoke, 0 audio) — resetting to IDLE and refreshing session`);
+ if (wasUserTurn && audioChunks === 0 && incomingChunks > 0) {
+ console.log(`[${connection.deviceId}] Ghost turn detected (sent ${incomingChunks} audio chunks, got 0 audio) — resetting to IDLE and refreshing session`);
  connection.ghostRenewal = true;
  connection.socket.send(JSON.stringify({ type: "reconnecting" }));
  performRenewal(connection);
@@ -2392,7 +2411,6 @@ Memory: you have persistent memory across sessions. When you learn something wor
  connection.pendingRenewal = false;
  console.log(`[${connection.deviceId}] [${reason}] Firing deferred renewal after turnComplete`);
  performRenewal(connection);
- }
  }
  }
  

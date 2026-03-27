@@ -98,7 +98,6 @@ struct MeditationState {
 struct RadioState {
     bool active = false;          // Radio mode entered
     bool streaming = false;       // false = discovery phase, true = station playing
-    bool visualsActive = true;    // VU meter on/off toggle (Button 2 while playing)
     bool isHLS = false;           // HLS stream — longer initial buffer wait
     char stationName[64];           // Current station name
     char streamUrl[256];             // Direct stream URL

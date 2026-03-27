@@ -286,9 +286,6 @@ void renderLedRadio(CRGB* leds) {
         float b = 0.25f + 0.20f * sinf(hlsPhase);
         uint8_t bv = (uint8_t)(b * 255);
         fill_solid(leds, NUM_LEDS, CRGB(bv, (uint8_t)(bv * 0.5f), 0));
-    } else if (!radioState.visualsActive) {
-        // Visuals off: static teal 40%
-        fill_solid(leds, NUM_LEDS, CRGB(0, (uint8_t)(0.4f * 180), (uint8_t)(0.4f * 255)));
     } else {
         // VU meter streaming
     int numRows = map(constrain((int)smoothedAudioLevel, 0, AUDIO_REACTIVE_LEVEL_MAX), 0, AUDIO_REACTIVE_LEVEL_MAX, 0, LEDS_PER_COLUMN);

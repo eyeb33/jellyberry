@@ -675,7 +675,6 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  if (radioState.active && radioState.streaming) {
  radioDoc["station"] = radioState.stationName;
  radioDoc["isHLS"] = radioState.isHLS;
- radioDoc["visualsActive"] = radioState.visualsActive;
  }
 
  // Alarm list
@@ -870,7 +869,6 @@ void handleWebSocketMessage(uint8_t* payload, size_t length) {
  radioState.active = true;
  radioState.streaming = false; // will become true after first chunk arrives
  radioState.paused = false;    // clear any pause from a previous conversation
- radioState.visualsActive = true;
  radioState.isHLS = isHLS;
  strlcpy(radioState.stationName, stationName, sizeof(radioState.stationName));
  strlcpy(radioState.streamUrl, streamUrl, sizeof(radioState.streamUrl));
